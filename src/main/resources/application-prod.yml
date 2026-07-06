@@ -1,0 +1,27 @@
+# 生产环境配置
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/knowledge_base}
+    username: ${DB_USERNAME:admin}
+    password: ${DB_PASSWORD:}
+
+# DeepSeek API配置
+deepseek:
+  api-key: ${DEEPSEEK_API_KEY:}
+  base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
+  chat-model: ${DEEPSEEK_CHAT_MODEL:deepseek-v4-flash}
+  embedding-model: ${DEEPSEEK_EMBEDDING_MODEL:deepseek-v4-flash}
+  temperature: ${DEEPSEEK_TEMPERATURE:0.7}
+
+# 文档配置
+document:
+  upload-path: ${DOCUMENT_UPLOAD_PATH:/data/uploads}
+
+# CORS配置（生产环境应限制允许的源）
+cors:
+  allowed-origins: ${CORS_ALLOWED_ORIGINS:*}
+
+logging:
+  level:
+    com.hai.aiknowledgebase: INFO
+    dev.langchain4j: WARN

@@ -4,10 +4,9 @@ server:
 spring:
   application:
     name: ai-knowledge-base
+  profiles:
+    active: dev
   datasource:
-    url: jdbc:postgresql://localhost:5432/knowledge_base
-    username: admin
-    password: admin
     driver-class-name: org.postgresql.Driver
   servlet:
     multipart:
@@ -16,49 +15,18 @@ spring:
 
 # CORS配置
 cors:
-  # 允许的源，多个用逗号分隔，*表示允许所有源
   allowed-origins: "*"
-  # 允许的HTTP方法
   allowed-methods: "GET,POST,PUT,DELETE,OPTIONS"
-  # 允许的请求头
   allowed-headers: "*"
-  # 是否允许携带凭证（如cookies）
   allow-credentials: true
-  # 预检请求缓存时间（秒）
   max-age: 3600
 
-# DeepSeek API配置
-deepseek:
-#  api-key: ${DEEPSEEK_API_KEY:your-api-key-here}
-  # 阿里key sk-ws-H.RXYPERL.FpCX.MEUCIQDZubpbmoI1IMl2LYAS6lIVzF4HEzN9TDmD3J7PA6xvtgIgI4k8PGz1mvXy_aMJ_pyPmWLFnN4tGDHb_Qe_vhwh5M0
-  api-key: sk-f27e7277888d4a5d8a340cba9c142b74
-  base-url: https://api.deepseek.com
-  # DeepSeek聊天模型 - 使用实际可用的模型
-  chat-model: deepseek-v4-flash
-  # DeepSeek嵌入模型 - DeepSeek可能不支持嵌入端点
-  # 暂时使用聊天模型，但可能需要其他解决方案
-  embedding-model: deepseek-v4-flash
-  temperature: 0.7
-
-
 # 向量存储配置
-#vectorstore:
-#  simple:
-#    file-path: E:/porject/ai-knowledge/ai-knowledge-base-python/ai-knowledge-base/data/vector-store.json
-
-
-
 vectorstore:
   pgvector:
     table-name: embeddings
 
 # 文档配置
 document:
-  upload-path: E:/porject/ai-knowledge/ai-knowledge-base-python/ai-knowledge-base/data/uploads
   chunk-size: 500
   chunk-overlap: 50
-
-logging:
-  level:
-    com.hai.aiknowledgebase: DEBUG
-    dev.langchain4j: DEBUG

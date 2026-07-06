@@ -1,5 +1,7 @@
 package com.hai.aiknowledgebase.service;
 
+import com.hai.aiknowledgebase.dto.ChatMessageDTO;
+import com.hai.aiknowledgebase.dto.ChatSessionDTO;
 import com.hai.aiknowledgebase.dto.HaiChatResponse;
 import com.hai.aiknowledgebase.dto.SearchResult;
 import dev.langchain4j.data.embedding.Embedding;
@@ -176,5 +178,86 @@ public class ChatService {
                 match.embedded().metadata().getString("source") == null ? "未知来源" : match.embedded().metadata().getString("source").toString()
             ))
             .collect(Collectors.toList());
+    }
+
+    //获取某个会话的历史消息
+    public List<ChatMessageDTO> getHistory(String sessionId) {
+        String sql = "SELECT role, content, create_time FROM chat_history WHERE session_id = ? ORDER BY create_time ASC";
+        return jdbcTemplate.query(sql, new Object[]{sessionId}, (rs, rowNum) ->
+                new ChatMessageDTO(
+                        rs.getString("role"),
+                        rs.getString("content"),
+                        rs.getTimestamp("create_time").toLocalDateTime()
+                )
+        );
+    }
+
+    // ==================== 会话历史查询方法（新增） ====================
+
+
+    /**
+     * 获取当前用户的所有会话列表
+     * @param userId 如果为 null，则查询所有会话（匿名模式）
+     */
+    public List<ChatSessionDTO> getSessions(String userId) {
+        String sql;
+        Object[] params;
+
+        if (userId == null) {
+            // 匿名模式：查所有会话
+            sql = """
+                    SELECT session_id, 
+                           MAX(create_time) as last_active,
+                           (SELECT content FROM chat_history c2 
+                            WHERE c2.session_id = c1.session_id 
+                            ORDER BY create_time DESC LIMIT 1) as last_content
+                    FROM chat_history c1
+                    GROUP BY session_id
+                    ORDER BY last_active DESC
+                    LIMIT 50
+                    """;
+            params = new Object[]{};
+        } else {
+            // 用户模式：只查该用户的会话
+            sql = """
+                    SELECT session_id, 
+                           MAX(create_time) as last_active,
+                           (SELECT content FROM chat_history c2 
+                            WHERE c2.session_id = c1.session_id 
+                            ORDER BY create_time DESC LIMIT 1) as last_content
+                    FROM chat_history c1
+                    WHERE user_id = ?
+                    GROUP BY session_id
+                    ORDER BY last_active DESC
+                    LIMIT 50
+                    """;
+            params = new Object[]{userId};
+        }
+
+        return jdbcTemplate.query(sql, params, (rs, rowNum) -> {
+            String sessionId = rs.getString("session_id");
+            String lastContent = rs.getString("last_content");
+            String preview = lastContent != null && lastContent.length() > 20
+                    ? lastContent.substring(0, 20) + "..."
+                    : lastContent;
+            return new ChatSessionDTO(
+                    sessionId,
+                    preview != null ? preview : "空会话",
+                    rs.getTimestamp("last_active").toLocalDateTime()
+            );
+        });
+    }
+
+    /**
+     * 删除某个会话及其所有消息
+     */
+    public void deleteSession(String sessionId) {
+        // 删除数据库中的消息
+        jdbcTemplate.update("DELETE FROM chat_history WHERE session_id = ?", sessionId);
+        // 清除内存中的 ChatMemory
+        chatMemoryCache.remove(sessionId);
+        // 清除 ChatMemoryStore 中的记录
+        chatMemoryStore.deleteMessages(sessionId);
+        log.info("已删除会话: {}", sessionId);
     }
 }

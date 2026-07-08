@@ -9,6 +9,6 @@ import lombok.NoArgsConstructor;
 @AllArgsConstructor
 public class DocumentUploadResponse {
     private String filename;
-    private int chunkCount;
+    private Long metaId;
     private String message;
 }

@@ -19,7 +19,7 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class PersistentChatMemoryStore implements ChatMemoryStore {
 
-    private final ChatHistoryMapper chatHistoryMapper;  // ✅ 替换 JdbcTemplate
+    private final ChatHistoryMapper chatHistoryMapper;
 
     // 最大保留消息数量（防止 token 溢出）
     private static final int MAX_HISTORY = 20;

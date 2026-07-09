@@ -16,6 +16,9 @@ public class ChatHistory {
     private String role;
     private String content;
 
+    @TableField("source_info")
+    private String sourceInfo;  // JSON 字符串
+
     @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createTime;
 }

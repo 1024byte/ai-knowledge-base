@@ -1,7 +1,10 @@
 package com.hai.aiknowledgebase.service;
 
+import ai.djl.util.JsonUtils;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.hai.aiknowledgebase.dto.ChatMessageDTO;
 import com.hai.aiknowledgebase.dto.ChatSessionDTO;
 import com.hai.aiknowledgebase.dto.HaiChatResponse;
@@ -10,6 +13,7 @@ import com.hai.aiknowledgebase.entity.ChatHistory;
 import com.hai.aiknowledgebase.mapper.ChatHistoryMapper;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.internal.Json;
 import dev.langchain4j.memory.ChatMemory;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
 import dev.langchain4j.model.chat.response.ChatResponse;
@@ -28,12 +32,12 @@ import dev.langchain4j.store.memory.chat.ChatMemoryStore;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+
 
 @Slf4j
 @Service
@@ -47,6 +51,7 @@ public class ChatService {
     // 缓存每个会话的 ChatMemory 实例
     private final Map<String, ChatMemory> chatMemoryCache = new ConcurrentHashMap<>();
     private final ChatMemoryStore chatMemoryStore;
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private static final String SYSTEM_PROMPT = """
         你是一个知识库助手，基于提供的文档内容回答用户问题。
@@ -119,7 +124,7 @@ public class ChatService {
 
         // 6.使用 MyBatis-Plus 保存消息
         saveMessage(sessionId, "user", question);
-        saveMessage(sessionId, "assistant", answer);
+
 
         // 7. 更新 ChatMemory
         chatMemory.add(UserMessage.from(userPrompt));
@@ -135,6 +140,8 @@ public class ChatService {
                 .distinct()
                 .collect(Collectors.toList());
 
+        saveMessage(sessionId, "assistant", answer,sources);
+
         long processingTime = System.currentTimeMillis() - startTime;
         log.info("回答生成完成，耗时 {} ms", processingTime);
 
@@ -143,17 +150,27 @@ public class ChatService {
 
     // ==================== 消息保存（使用 MyBatis-Plus） ====================
 
+    private void saveMessage(String sessionId, String role, String content) {
+        // 原有方法保持不变，调用重载方法，sourceInfo 传 null
+        saveMessage(sessionId, role, content, null);
+    }
     /**
      * 保存单条消息到数据库
      */
-    private void saveMessage(String sessionId, String role, String content) {
+    private void saveMessage(String sessionId, String role, String content,List<String> sources) {
+        String sourceInfo = null;
+        if (sources != null && !sources.isEmpty()) {
+            sourceInfo = Json.toJson(sources);
+        }
         ChatHistory record = new ChatHistory();
         record.setSessionId(sessionId);
         record.setRole(role);
         record.setContent(content);
+        record.setSourceInfo(sourceInfo);
         // userId 暂时为 null（匿名模式），后续接入用户系统后可设置
         chatHistoryMapper.insert(record);
     }
+
 
     // ==================== 会话历史查询（使用 MyBatis-Plus） ====================
 
@@ -167,15 +184,31 @@ public class ChatService {
 
         List<ChatHistory> list = chatHistoryMapper.selectList(wrapper);
 
+
         return list.stream()
                 .map(record -> new ChatMessageDTO(
                         record.getRole(),
                         record.getContent(),
-                        record.getCreateTime()
+                        record.getCreateTime(),
+                        getStringListFromChat(record)
                 ))
                 .collect(Collectors.toList());
     }
-
+    public static List<String> getStringListFromChat(ChatHistory chatHistory) {
+        if (chatHistory == null) {
+            return Collections.emptyList();
+        }
+        String json = chatHistory.getSourceInfo();
+        if (json == null || json.isBlank()) {
+            return Collections.emptyList();
+        }
+        try {
+            return OBJECT_MAPPER.readValue(json, new TypeReference<List<String>>() {});
+        } catch (Exception e) {
+            // 解析出错返回空集合，避免业务报错
+            return Collections.emptyList();
+        }
+    }
     /**
      * 获取当前用户的所有会话列表
      * @param userId 如果为 null，则查询所有会话（匿名模式）
@@ -226,7 +259,6 @@ public class ChatService {
     }
 
     // ==================== 搜索接口（不变） ====================
-
     public List<SearchResult> search(String query, int topK) {
         log.info("搜索查询: {}", query);
 
@@ -253,7 +285,6 @@ public class ChatService {
     }
 
     // ==================== 辅助方法 ====================
-
     private String buildPrompt(String context, String question) {
         return String.format("""
             基于以下文档内容回答问题：

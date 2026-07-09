@@ -10,29 +10,17 @@ import com.hai.aiknowledgebase.entity.DocumentMetadata;
 import com.hai.aiknowledgebase.exception.BusinessException;
 import com.hai.aiknowledgebase.mapper.CategoryMapper;
 import com.hai.aiknowledgebase.mapper.DocumentMetadataMapper;
-import dev.langchain4j.data.document.Document;
-import dev.langchain4j.data.document.DocumentSplitter;
-import dev.langchain4j.data.document.Metadata;
-import dev.langchain4j.data.document.splitter.DocumentByParagraphSplitter;
-import dev.langchain4j.data.embedding.Embedding;
-import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.model.output.Response;
-import dev.langchain4j.store.embedding.EmbeddingStore;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.web.multipart.MultipartFile;
 
-import java.io.File;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -40,27 +28,25 @@ import java.nio.file.StandardCopyOption;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
-import java.util.*;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
+
+import static com.hai.aiknowledgebase.common.FileUtils.*;
 
 @Slf4j
 @Service
+@RequiredArgsConstructor
 public class DocumentService {
 
-    private final EmbeddingStore<TextSegment> embeddingStore;
-    private final EmbeddingModel embeddingModel;
     private final JdbcTemplate jdbcTemplate; // 仅用于操作 embeddings 表
     private final DocumentMetadataMapper documentMetadataMapper;
     private final CategoryMapper categoryMapper;
+    private final VectorizationService asyncVectorizationService;
 
     @Value("${document.upload-path}")
     private String uploadPath;
-
-    @Value("${document.chunk-size:500}")
-    private int chunkSize;
-
-    @Value("${document.chunk-overlap:50}")
-    private int chunkOverlap;
 
     @Value("${vectorstore.pgvector.table-name:embeddings}")
     private String tableName;
@@ -68,17 +54,6 @@ public class DocumentService {
     @Value("${file.upload.root:./uploads}")
     private String uploadRootPath;
 
-    public DocumentService(EmbeddingStore<TextSegment> embeddingStore,
-                           EmbeddingModel embeddingModel,
-                           JdbcTemplate jdbcTemplate,
-                           DocumentMetadataMapper documentMetadataMapper,
-                           CategoryMapper categoryMapper) {
-        this.embeddingStore = embeddingStore;
-        this.embeddingModel = embeddingModel;
-        this.jdbcTemplate = jdbcTemplate;
-        this.documentMetadataMapper = documentMetadataMapper;
-        this.categoryMapper = categoryMapper;
-    }
 
     /**
      * 上传文档并按分类存储
@@ -137,9 +112,8 @@ public class DocumentService {
                         @Override
                         public void afterCommit() {
                             log.info("主事务已提交，触发异步向量化: docId={}", docId);
-                            processVectorizationAsync(docId, filePath, normalizedCategory);
+                            asyncVectorizationService.processVectorizationAsync(docId, filePath, normalizedCategory);
                         }
-
                         @Override
                         public void afterCompletion(int status) {
                             // 可选：如果事务回滚，记录日志
@@ -154,57 +128,6 @@ public class DocumentService {
         } catch (IOException e) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "文件上传失败");
         }
-    }
-
-    @Async
-    public void processVectorizationAsync(Long docId, Path filePath, String category) {
-        try {
-            // 1. 加载内容、切分、向量化（复用现有逻辑）
-            String content = loadDocumentContent(filePath.toFile(), filePath.getFileName().toString());
-            Document document = Document.from(content, Metadata.from("source", filePath.getFileName().toString())
-                    .put("category", category));
-            DocumentSplitter splitter = new DocumentByParagraphSplitter(chunkSize, chunkOverlap);
-            List<TextSegment> segments = splitter.split(document);
-            for (TextSegment segment : segments) {
-                Embedding embedding = embeddingModel.embed(segment).content();
-                embeddingStore.add(embedding, segment);
-            }
-            // 2. 更新状态为 "active"
-            LambdaUpdateWrapper<DocumentMetadata> wrapper = new LambdaUpdateWrapper<>();
-            wrapper.eq(DocumentMetadata::getId, docId)
-                    .set(DocumentMetadata::getStatus, "active");
-            documentMetadataMapper.update(null, wrapper);
-            log.info("向量化完成: docId={}", docId);
-        } catch (Exception e) {
-            // 更新状态为 "failed"
-            log.error("异步向量化失败: docId={}", docId, e);
-            //向量化失败，更新状态为 failed，记录错误信息（独立事务）
-            updateDocumentStatus(docId, "failed", e.getMessage());
-        }
-    }
-
-    /**
-     * 更新文档状态（独立事务）
-     * 用于异步向量化完成或失败时更新状态
-     */
-    @Transactional
-    public void updateDocumentStatus(Long docId, String status, String errorMessage) {
-        LambdaUpdateWrapper<DocumentMetadata> wrapper = new LambdaUpdateWrapper<>();
-        wrapper.eq(DocumentMetadata::getId, docId)
-                .set(DocumentMetadata::getStatus, status);
-        if (errorMessage != null) {
-            wrapper.set(DocumentMetadata::getErrorMessage, errorMessage);
-        }
-        documentMetadataMapper.update(null, wrapper);
-        log.info("文档状态已更新: docId={}, status={}", docId, status);
-    }
-
-    /**
-     * 生成唯一文件名
-     */
-    private String generateUniqueFilename(String originalFilename) {
-        String uuid = UUID.randomUUID().toString().substring(0, 8);
-        return uuid + "_" + originalFilename;
     }
 
     /**
@@ -273,29 +196,6 @@ public class DocumentService {
         }
     }
 
-    private String getFileExtension(String filename) {
-        int dotIndex = filename.lastIndexOf('.');
-        if (dotIndex > 0 && dotIndex < filename.length() - 1) {
-            return filename.substring(dotIndex + 1).toLowerCase();
-        }
-        return "";
-    }
-
-    private String loadDocumentContent(File file, String filename) throws IOException {
-        String extension = filename.substring(filename.lastIndexOf(".")).toLowerCase();
-
-        switch (extension) {
-            case ".txt":
-            case ".md":
-                return Files.readString(file.toPath(), StandardCharsets.UTF_8);
-            case ".pdf":
-                log.warn("PDF处理暂未完全实现，建议先转换为txt格式");
-                return Files.readString(file.toPath(), StandardCharsets.UTF_8);
-            default:
-                throw new BusinessException(ResultCode.UNSUPPORTED_FILE_TYPE, extension);
-        }
-    }
-
     /**
      * 获取上传目录的绝对路径
      */
@@ -305,29 +205,7 @@ public class DocumentService {
         return path;
     }
 
-    /**
-     * 清理文件名
-     */
-    private String sanitizeFilename(String filename) {
-        if (filename == null || filename.isEmpty()) {
-            return "unknown.txt";
-        }
 
-        String safeName = filename.replaceAll("\\.\\.", "_")
-                .replaceAll("/", "_")
-                .replaceAll("\\\\", "_");
-
-        int lastSeparator = Math.max(safeName.lastIndexOf('/'), safeName.lastIndexOf('\\'));
-        if (lastSeparator >= 0) {
-            safeName = safeName.substring(lastSeparator + 1);
-        }
-
-        if (safeName.isEmpty()) {
-            safeName = "document_" + System.currentTimeMillis() + ".txt";
-        }
-
-        return safeName;
-    }
 
     /**
      * 创建新分类

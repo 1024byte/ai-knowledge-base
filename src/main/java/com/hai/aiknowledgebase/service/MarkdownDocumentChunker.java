@@ -1,6 +1,8 @@
 package com.hai.aiknowledgebase.service;
 
+import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.model.TokenCountEstimator;
+import dev.langchain4j.model.embedding.EmbeddingModel;
 import lombok.extern.slf4j.Slf4j;
 
 import java.text.BreakIterator;
@@ -9,17 +11,18 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * 基于 Markdown 标题层级和段落边界的递归文档切片器。
+ * 基于 Markdown 标题层级、段落边界和语义相似度的智能文档切片器。
  * <p>
  * 核心规则：
  * <ul>
  *   <li>顺着标题层级和段落边界切</li>
  *   <li>标题跟着它管理的内容走</li>
  *   <li>表格尽量整块保留成 Markdown</li>
- *   <li>不拆散内嵌对象</li>
- *   <li>400–8008 token 一块，留 20% 重叠</li>
+ *   <li>不拆散内嵌对象（代码块、表格等）</li>
+ *   <li>400–800 token 一块，留 20% 重叠</li>
  *   <li>上下文不断裂，语义被完整保留</li>
- *   <li>递归切片</li>
+ *   <li>支持基于 Embedding 模型的语义动态切分（在话题转折处自动切开）</li>
+ *   <li>迭代切片（使用显式栈避免递归深度问题）</li>
  * </ul>
  */
 @Slf4j
@@ -30,11 +33,6 @@ public class MarkdownDocumentChunker {
             "(^\\|.+)\\n(\\|?[-:| ]+)\\n((?:\\|.+\\n?)+)",
             Pattern.MULTILINE
     );
-/*    private static final Pattern CODE_BLOCK_PATTERN = Pattern.compile(
-            "(```[\\s\\S]*?```)",
-            Pattern.MULTILINE
-    );*/
-
     private static final Pattern CODE_BLOCK_PATTERN = Pattern.compile(
             "```[a-zA-Z0-9_]*\\s*[\\s\\S]*?```",  // 支持语言标识
             Pattern.MULTILINE
@@ -46,16 +44,26 @@ public class MarkdownDocumentChunker {
     private final int maxTokens;
     /** 重叠比例 */
     private final double overlapRatio;
-    /** Token 计算*/
+    /** Token 估算器（LangChain4j 官方接口） */
     private final TokenCountEstimator tokenEstimator;
+    /** Embedding 模型（用于语义切分，可为 null） */
+    private final EmbeddingModel embeddingModel;
+    /** 语义转折阈值（0.7-0.8 推荐） */
+    private final double semanticThreshold;
 
-
+    /**
+     * 完整构造函数（支持语义切分）
+     */
     public MarkdownDocumentChunker(int minTokens, int maxTokens, double overlapRatio,
-                                   TokenCountEstimator tokenEstimator) {
+                                   TokenCountEstimator tokenEstimator,
+                                   EmbeddingModel embeddingModel,
+                                   double semanticThreshold) {
         this.minTokens = minTokens;
         this.maxTokens = maxTokens;
         this.overlapRatio = overlapRatio;
         this.tokenEstimator = tokenEstimator;
+        this.embeddingModel = embeddingModel;
+        this.semanticThreshold = semanticThreshold;
     }
 
     // ======================== 公开 API ========================
@@ -74,8 +82,8 @@ public class MarkdownDocumentChunker {
         // 1. 解析为 section 树
         List<Section> sections = parseSections(markdown);
 
-        // 2. 递归切片
-        List<Chunk> rawChunks = recursiveChunk(sections, "");
+        // 2. 迭代切片
+        List<Chunk> rawChunks = iterativeChunk(sections, "");
 
         // 3. 添加重叠
         List<Chunk> overlappedChunks = applyOverlap(rawChunks);
@@ -148,12 +156,10 @@ public class MarkdownDocumentChunker {
         List<HeadingInfo> headings = findHeadings(markdown);
 
         if (headings.isEmpty()) {
-            // 无标题，整篇作为一个 level-0 section
             sections.add(new Section(0, "", markdown.strip()));
             return sections;
         }
 
-        // 如果第一个标题前有内容，作为 level-0 section
         int firstHeadingStart = headings.get(0).start;
         if (firstHeadingStart > 0) {
             String preamble = markdown.substring(0, firstHeadingStart).strip();
@@ -162,22 +168,17 @@ public class MarkdownDocumentChunker {
             }
         }
 
-        // 为每个标题构建 section
         for (int i = 0; i < headings.size(); i++) {
             HeadingInfo heading = headings.get(i);
             int contentStart = heading.end;
             int contentEnd = (i + 1 < headings.size()) ? headings.get(i + 1).start : markdown.length();
             String content = markdown.substring(contentStart, contentEnd).strip();
-
-            Section section = new Section(heading.level, heading.fullLine, content);
-            sections.add(section);
+            sections.add(new Section(heading.level, heading.fullLine, content));
         }
 
-        // 构建树形结构：将子 section 挂到父 section 下
         return buildSectionTree(sections);
     }
 
-    /** 标题位置信息 */
     record HeadingInfo(int level, String fullLine, int start, int end) {}
 
     private List<HeadingInfo> findHeadings(String markdown) {
@@ -193,20 +194,14 @@ public class MarkdownDocumentChunker {
         return headings;
     }
 
-    /**
-     * 将扁平 section 列表构建为树形结构。
-     * 规则：每个 section 挂到前面最近的、level 比自己小的 section 下。
-     */
     private List<Section> buildSectionTree(List<Section> flatSections) {
         List<Section> roots = new ArrayList<>();
-        List<Section> stack = new ArrayList<>();  // 当前路径上的祖先
+        List<Section> stack = new ArrayList<>();
 
         for (Section section : flatSections) {
-            // 弹出栈中 level >= 当前 section 的节点
             while (!stack.isEmpty() && stack.get(stack.size() - 1).level >= section.level) {
                 stack.remove(stack.size() - 1);
             }
-
             if (stack.isEmpty()) {
                 roots.add(section);
             } else {
@@ -217,31 +212,20 @@ public class MarkdownDocumentChunker {
         return roots;
     }
 
-    // ======================== 递归切片 ========================
+    // ======================== 迭代切片 ========================
 
     /**
-     * 迭代切片核心逻辑（使用显式栈避免深层嵌套导致的栈溢出）：
-     * - 如果 section 总 token 数 <= maxTokens，整块保留
-     * - 否则，先尝试按子 section 边界切
-     * - 如果单个子 section 仍然过大，继续迭代处理
-     * - 如果无子 section 且直属内容过大，按段落/表格/代码块边界切
-     * <p>
-     * 使用 Deque 模拟递归调用栈。通过哨兵标记栈帧边界，
-     * 确保 mergeSmallChunks 在正确的层级（同一父 section 的子 section 之间）合并。
-     * 每个栈帧拥有独立的 chunk 收集器和上下文前缀，帧结束时合并后汇入父帧。
+     * 迭代切片核心逻辑（使用显式栈避免深层嵌套导致的栈溢出）
      */
-    private List<Chunk> recursiveChunk(List<Section> sections, String contextPrefix) {
-        // 栈帧哨兵：标记一个栈帧的边界，用于在正确的层级执行 mergeSmallChunks
+    private List<Chunk> iterativeChunk(List<Section> sections, String contextPrefix) {
         record FrameMarker(String contextPrefix) {}
 
         Deque<Object> stack = new ArrayDeque<>();
-        // 初始任务：先压入哨兵（帧结束标记），再逆序压入各 section
         stack.push(new FrameMarker(contextPrefix));
         for (int i = sections.size() - 1; i >= 0; i--) {
             stack.push(sections.get(i));
         }
 
-        // 每个栈帧对应一个 chunk 收集器和上下文前缀；栈底为最终结果
         Deque<List<Chunk>> chunkFrameStack = new ArrayDeque<>();
         Deque<String> prefixFrameStack = new ArrayDeque<>();
         chunkFrameStack.push(new ArrayList<>());
@@ -251,7 +235,9 @@ public class MarkdownDocumentChunker {
             Object item = stack.pop();
 
             if (item instanceof FrameMarker marker) {
-                // 帧结束：合并当前帧的 chunk，汇入父帧
+                if (!prefixFrameStack.peek().equals(marker.contextPrefix)) {
+                    log.warn("帧上下文不匹配，预期: {}, 实际: {}", marker.contextPrefix, prefixFrameStack.peek());
+                }
                 List<Chunk> currentFrameChunks = chunkFrameStack.pop();
                 prefixFrameStack.pop();
                 List<Chunk> merged = mergeSmallChunks(currentFrameChunks);
@@ -269,13 +255,11 @@ public class MarkdownDocumentChunker {
             List<Chunk> currentFrameChunks = chunkFrameStack.peek();
 
             if (totalTokens <= maxTokens) {
-                // 整块保留
                 String text = section.fullText();
                 if (!text.isBlank()) {
                     currentFrameChunks.add(new Chunk(text, tokenEstimator.estimateTokenCountInText(text), currentPrefix));
                 }
             } else if (!section.children.isEmpty()) {
-                // 有子 section，按子 section 边界切：压入新的栈帧
                 String childPrefix = buildContextPrefix(currentPrefix, section);
                 stack.push(new FrameMarker(childPrefix));
                 for (int i = section.children.size() - 1; i >= 0; i--) {
@@ -284,7 +268,6 @@ public class MarkdownDocumentChunker {
                 chunkFrameStack.push(new ArrayList<>());
                 prefixFrameStack.push(childPrefix);
             } else {
-                // 无子 section，直属内容过大，按段落边界切
                 currentFrameChunks.addAll(splitLargeSection(section, currentPrefix));
             }
         }
@@ -299,7 +282,6 @@ public class MarkdownDocumentChunker {
         String header = section.title.isEmpty() ? "" : section.title + "\n";
         String content = section.content;
 
-        // 将内容按不可拆分块（表格、代码块）和普通段落拆分
         List<ContentBlock> blocks = splitIntoBlocks(content);
 
         List<Chunk> chunks = new ArrayList<>();
@@ -310,34 +292,27 @@ public class MarkdownDocumentChunker {
             int blockTokens = tokenEstimator.estimateTokenCountInText(block.text);
 
             if (blockTokens > maxTokens && !block.isSplittable) {
-                // 不可拆分块（表格/代码块）超过上限，只能整块保留
                 if (currentChunk.length() > header.length()) {
-                    chunks.add(new Chunk(currentChunk.toString().stripTrailing(),
-                            currentTokens, contextPrefix));
+                    chunks.add(new Chunk(currentChunk.toString().stripTrailing(), currentTokens, contextPrefix));
                 }
                 int headerTokens = tokenEstimator.estimateTokenCountInText(header);
                 int totalChunkTokens = headerTokens + blockTokens;
                 if (totalChunkTokens > maxTokens) {
-                    log.warn("不可拆分块（表格/代码块）token 数 ({}) 超过 maxTokens ({})，"
-                            + "可能导致后续向量化或检索异常，建议缩小该块体积",
+                    log.warn("不可拆分块 token 数 ({}) 超过 maxTokens ({})，可能导致后续向量化或检索异常",
                             totalChunkTokens, maxTokens);
                 }
                 chunks.add(new Chunk(header + block.text, totalChunkTokens, contextPrefix));
                 currentChunk = new StringBuilder(header);
                 currentTokens = headerTokens;
             } else if (blockTokens > maxTokens && block.isSplittable) {
-                // 可拆分块（长段落）按句子再切
                 if (currentChunk.length() > header.length()) {
-                    chunks.add(new Chunk(currentChunk.toString().stripTrailing(),
-                            currentTokens, contextPrefix));
+                    chunks.add(new Chunk(currentChunk.toString().stripTrailing(), currentTokens, contextPrefix));
                 }
                 chunks.addAll(splitLongParagraph(header, block.text, contextPrefix));
                 currentChunk = new StringBuilder(header);
                 currentTokens = tokenEstimator.estimateTokenCountInText(header);
             } else if (currentTokens + blockTokens > maxTokens) {
-                // 加入当前块会超限，先输出当前 chunk
-                chunks.add(new Chunk(currentChunk.toString().stripTrailing(),
-                        currentTokens, contextPrefix));
+                chunks.add(new Chunk(currentChunk.toString().stripTrailing(), currentTokens, contextPrefix));
                 currentChunk = new StringBuilder(header);
                 currentChunk.append(block.text).append("\n");
                 currentTokens = tokenEstimator.estimateTokenCountInText(header) + blockTokens;
@@ -348,8 +323,7 @@ public class MarkdownDocumentChunker {
         }
 
         if (currentChunk.length() > header.length()) {
-            chunks.add(new Chunk(currentChunk.toString().stripTrailing(),
-                    currentTokens, contextPrefix));
+            chunks.add(new Chunk(currentChunk.toString().stripTrailing(), currentTokens, contextPrefix));
         }
 
         return chunks;
@@ -360,8 +334,6 @@ public class MarkdownDocumentChunker {
      */
     private List<ContentBlock> splitIntoBlocks(String content) {
         List<ContentBlock> blocks = new ArrayList<>();
-
-        // 先提取代码块和表格，标记位置
         List<BlockSpan> spans = new ArrayList<>();
 
         Matcher codeMatcher = CODE_BLOCK_PATTERN.matcher(content);
@@ -372,7 +344,6 @@ public class MarkdownDocumentChunker {
 
         Matcher tableMatcher = TABLE_PATTERN.matcher(content);
         while (tableMatcher.find()) {
-            // 检查是否与代码块重叠
             boolean overlaps = spans.stream().anyMatch(s ->
                     s.start < tableMatcher.end() && s.end > tableMatcher.start());
             if (!overlaps) {
@@ -383,13 +354,11 @@ public class MarkdownDocumentChunker {
 
         spans.sort((a, b) -> Integer.compare(a.start, b.start));
 
-        // 填充普通段落
         int cursor = 0;
         for (BlockSpan span : spans) {
             if (span.start > cursor) {
                 String paragraphText = content.substring(cursor, span.start).strip();
                 if (!paragraphText.isEmpty()) {
-                    // 按空行拆分段落
                     String[] paragraphs = paragraphText.split("\\n\\s*\\n");
                     for (String para : paragraphs) {
                         String p = para.strip();
@@ -403,7 +372,6 @@ public class MarkdownDocumentChunker {
             cursor = span.end;
         }
 
-        // 尾部普通段落
         if (cursor < content.length()) {
             String remaining = content.substring(cursor).strip();
             if (!remaining.isEmpty()) {
@@ -417,7 +385,6 @@ public class MarkdownDocumentChunker {
             }
         }
 
-        // 如果没有特殊块，按段落拆分
         if (spans.isEmpty()) {
             blocks.clear();
             String[] paragraphs = content.split("\\n\\s*\\n");
@@ -432,33 +399,152 @@ public class MarkdownDocumentChunker {
         return blocks;
     }
 
+    // ======================== 语义动态切分核心 ========================
+
     /**
-     * 对长段落按句子边界切分。
+     * 对长段落按句子边界切分，利用 Embedding 模型检测语义转折点。
+     * 当相邻句子语义相似度低于阈值时，强制切分，确保每个 chunk 主题聚焦。
+     * <p>
+     * 性能优化：使用增量向量，避免每次重新计算整个累积块的 Embedding。
      */
     private List<Chunk> splitLongParagraph(String header, String paragraph, String contextPrefix) {
         List<Chunk> chunks = new ArrayList<>();
+
+        // 1. 用 BreakIterator 提取句子列表
         BreakIterator iterator = BreakIterator.getSentenceInstance(Locale.CHINESE);
         iterator.setText(paragraph);
-
+        List<String> sentences = new ArrayList<>();
         int start = iterator.first();
         int end = iterator.next();
-        StringBuilder current = new StringBuilder(header);
-        int currentTokens = tokenEstimator.estimateTokenCountInText(header);
-
         while (end != BreakIterator.DONE) {
             String sentence = paragraph.substring(start, end).strip();
             if (!sentence.isEmpty()) {
-                int sTokens = tokenEstimator.estimateTokenCountInText(sentence);
-                if (currentTokens + sTokens > maxTokens && current.length() > header.length()) {
-                    chunks.add(new Chunk(current.toString().stripTrailing(), currentTokens, contextPrefix));
-                    current = new StringBuilder(header);
-                    currentTokens = tokenEstimator.estimateTokenCountInText(header);
-                }
-                current.append(sentence);
-                currentTokens += sTokens;
+                sentences.add(sentence);
             }
             start = end;
             end = iterator.next();
+        }
+
+        if (sentences.isEmpty()) return chunks;
+
+        // 2. 如果没有 EmbeddingModel，回退到纯 Token 数切分
+        if (embeddingModel == null) {
+            return splitLongParagraphByTokenFallback(header, sentences, contextPrefix);
+        }
+
+        // 3. 语义切分核心逻辑（增量向量优化版）
+        StringBuilder currentChunk = new StringBuilder(header);
+        int currentTokens = tokenEstimator.estimateTokenCountInText(header);
+        List<String> currentSentences = new ArrayList<>();
+
+        // 累积向量（当前块的向量表示）
+        float[] accumulatedVector = null;
+
+        for (String sentence : sentences) {
+            int sentenceTokens = tokenEstimator.estimateTokenCountInText(sentence);
+
+            // 如果当前块为空，直接加入
+            if (currentSentences.isEmpty()) {
+                currentSentences.add(sentence);
+                currentChunk.append(sentence);
+                currentTokens += sentenceTokens;
+                // 初始化累积向量
+                accumulatedVector = embeddingModel.embed(sentence).content().vector().clone();
+                continue;
+            }
+
+            // 检查加入新句子后是否超 Token 上限
+            boolean wouldExceedTokens = (currentTokens + sentenceTokens > maxTokens);
+
+            // 检查语义是否转折（用累积向量 vs 新句子向量）
+            boolean isSemanticShift = false;
+            if (!wouldExceedTokens) {
+                // 计算新句子的向量
+                float[] sentenceVec = embeddingModel.embed(sentence).content().vector();
+                double similarity = cosineSimilarity(accumulatedVector, sentenceVec);
+
+                if (similarity < semanticThreshold) {
+                    isSemanticShift = true;
+                    log.debug("语义转折检测: 相似度 {} < 阈值 {}, 在句子处切分: '{}'",
+                            String.format("%.3f", similarity), semanticThreshold,
+                            sentence.substring(0, Math.min(30, sentence.length())));
+                }
+            }
+
+            // 如果超 Token 或语义转折，则切分
+            if (wouldExceedTokens || isSemanticShift) {
+                // 保存当前块
+                if (currentChunk.length() > header.length()) {
+                    chunks.add(new Chunk(currentChunk.toString().stripTrailing(),
+                            currentTokens, contextPrefix));
+                }
+                // 重置新块（包含当前句子）
+                currentChunk = new StringBuilder(header);
+                currentSentences.clear();
+                currentChunk.append(sentence);
+                currentTokens = tokenEstimator.estimateTokenCountInText(header) + sentenceTokens;
+                currentSentences.add(sentence);
+                // 重置累积向量为当前句子的向量
+                accumulatedVector = embeddingModel.embed(sentence).content().vector().clone();
+            } else {
+                // 继续累积：更新累积向量（加权平均）
+                float[] sentenceVec = embeddingModel.embed(sentence).content().vector();
+                int count = currentSentences.size();
+                for (int i = 0; i < accumulatedVector.length; i++) {
+                    // 计算增量平均值：new_avg = (old_avg * n + new_val) / (n + 1)
+                    accumulatedVector[i] = (accumulatedVector[i] * count + sentenceVec[i]) / (count + 1);
+                }
+                currentSentences.add(sentence);
+                currentChunk.append(sentence);
+                currentTokens += sentenceTokens;
+            }
+        }
+
+        // 处理最后一个块
+        if (currentChunk.length() > header.length()) {
+            chunks.add(new Chunk(currentChunk.toString().stripTrailing(),
+                    currentTokens, contextPrefix));
+        }
+
+        return chunks;
+    }
+
+    /**
+     * 计算两个向量的余弦相似度
+     */
+    private double cosineSimilarity(float[] vec1, float[] vec2) {
+        if (vec1 == null || vec2 == null || vec1.length == 0) return 0.0;
+        double dotProduct = 0.0;
+        double norm1 = 0.0;
+        double norm2 = 0.0;
+        for (int i = 0; i < vec1.length; i++) {
+            dotProduct += vec1[i] * vec2[i];
+            norm1 += vec1[i] * vec1[i];
+            norm2 += vec2[i] * vec2[i];
+        }
+        if (norm1 == 0 || norm2 == 0) return 0.0;
+        return dotProduct / (Math.sqrt(norm1) * Math.sqrt(norm2));
+    }
+
+    /**
+     * Fallback：纯 Token 数切分（无语义检测）
+     * 使用已经切好的句子列表，按 Token 累积切分。
+     */
+    private List<Chunk> splitLongParagraphByTokenFallback(String header, List<String> sentences,
+                                                          String contextPrefix) {
+        List<Chunk> chunks = new ArrayList<>();
+        StringBuilder current = new StringBuilder(header);
+        int currentTokens = tokenEstimator.estimateTokenCountInText(header);
+
+        for (String sentence : sentences) {
+            int sTokens = tokenEstimator.estimateTokenCountInText(sentence);
+            if (currentTokens + sTokens > maxTokens && current.length() > header.length()) {
+                chunks.add(new Chunk(current.toString().stripTrailing(), currentTokens, contextPrefix));
+                current = new StringBuilder(header);
+                currentTokens = tokenEstimator.estimateTokenCountInText(header);
+            }
+            current.append(sentence);
+            currentTokens += sTokens;
         }
 
         if (current.length() > header.length()) {
@@ -470,7 +556,7 @@ public class MarkdownDocumentChunker {
     // ======================== 合并小 chunk ========================
 
     /**
-     * 合并过小的 chunk：如果相邻 chunk 合并后不超过 maxTokens，则合并。
+     * 合并过小的 chunk：如果相邻 chunk 合并后不超过 maxTokens，且属于同一上下文前缀，则合并。
      */
     private List<Chunk> mergeSmallChunks(List<Chunk> chunks) {
         if (chunks.size() <= 1) return chunks;
@@ -482,8 +568,8 @@ public class MarkdownDocumentChunker {
             if (accumulator == null) {
                 accumulator = chunk;
             } else if (accumulator.tokenCount < minTokens
-                    && accumulator.tokenCount + chunk.tokenCount <= maxTokens) {
-                // 合并
+                    && accumulator.tokenCount + chunk.tokenCount <= maxTokens
+                    && accumulator.contextPrefix.equals(chunk.contextPrefix)) {
                 String combinedText = accumulator.text + "\n\n" + chunk.text;
                 accumulator = new Chunk(combinedText,
                         tokenEstimator.estimateTokenCountInText(combinedText),
@@ -504,10 +590,7 @@ public class MarkdownDocumentChunker {
     // ======================== 重叠处理 ========================
 
     /**
-     * 为相邻 chunk 添加重叠内容。
-     * 重叠量 = 前一个 chunk token 数 × overlapRatio
-     * 从前一个 chunk 末尾取重叠文本，追加到当前 chunk 开头。
-     * 重叠量会受 maxTokens 约束，确保追加后不超过上限。
+     * 为相邻 chunk 添加重叠内容，确保追加后不超过 maxTokens。
      */
     private List<Chunk> applyOverlap(List<Chunk> chunks) {
         if (chunks.size() <= 1 || overlapRatio <= 0) {
@@ -522,10 +605,8 @@ public class MarkdownDocumentChunker {
             Chunk curr = chunks.get(i);
 
             int overlapTokens = (int) Math.ceil(prev.tokenCount * overlapRatio);
-            // 确保重叠后不超过 maxTokens：最多允许 (maxTokens - curr.tokenCount) 的重叠
             int maxAllowedOverlap = maxTokens - curr.tokenCount;
             if (maxAllowedOverlap <= 0) {
-                // 当前 chunk 已达到或超过上限，不添加重叠
                 result.add(curr);
                 continue;
             }
@@ -545,18 +626,15 @@ public class MarkdownDocumentChunker {
     }
 
     /**
-     * 从文本末尾提取约 targetTokens 个 token 的文本。
-     * 按段落边界截取，避免截断语义。
+     * 从文本末尾提取约 targetTokens 个 token 的文本，按段落边界截取。
      */
     private String extractTailByText(String text, int targetTokens) {
         if (targetTokens <= 0) return "";
 
-        // 按段落拆分
-        String[] paragraphs = text.split("\\n\\s*\\n");
+        String[] paragraphs = text.split("\\n\\s*\\n|\\n\\s*---\\s*\\n|\\n\\s*\\*\\*\\*\\s*\\n");
         StringBuilder tail = new StringBuilder();
         int tokens = 0;
 
-        // 从后往前拼接段落
         for (int i = paragraphs.length - 1; i >= 0; i--) {
             String para = paragraphs[i].strip();
             if (para.isEmpty()) continue;
@@ -578,9 +656,6 @@ public class MarkdownDocumentChunker {
 
     // ======================== 上下文前缀 ========================
 
-    /**
-     * 构建上下文前缀：父级标题链，用于在子 chunk 中保留层级上下文。
-     */
     private String buildContextPrefix(String currentPrefix, Section section) {
         if (section.title.isEmpty()) return currentPrefix;
         String titleText = section.title.replaceFirst("^#+\\s+", "").strip();
@@ -593,7 +668,7 @@ public class MarkdownDocumentChunker {
 
     static class ContentBlock {
         final String text;
-        final boolean isSplittable;  // true=普通段落可再切, false=表格/代码块不可拆
+        final boolean isSplittable;
 
         ContentBlock(String text, boolean isSplittable) {
             this.text = text;
@@ -603,15 +678,9 @@ public class MarkdownDocumentChunker {
 
     // ======================== Chunk 结果 ========================
 
-    /**
-     * 切片结果：一个语义完整的文本块。
-     */
     public static class Chunk {
-        /** chunk 文本内容 */
         private final String text;
-        /** 估算 token 数 */
         private final int tokenCount;
-        /** 上下文前缀（父级标题链） */
         private final String contextPrefix;
 
         public Chunk(String text, int tokenCount, String contextPrefix) {
@@ -631,5 +700,4 @@ public class MarkdownDocumentChunker {
                     ", text='" + text.substring(0, Math.min(80, text.length())) + "...'}";
         }
     }
-
 }

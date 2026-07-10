@@ -1,7 +1,6 @@
 package com.hai.aiknowledgebase.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.hai.aiknowledgebase.common.ResultCode;
 import com.hai.aiknowledgebase.dto.DocumentFileDTO;
 import com.hai.aiknowledgebase.dto.DocumentInfo;
@@ -32,6 +31,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
+
 import static com.hai.aiknowledgebase.common.FileUtils.*;
 
 
@@ -45,9 +45,6 @@ public class DocumentService {
     private final DocumentMetadataMapper documentMetadataMapper;
     private final CategoryMapper categoryMapper;
     private final VectorizationService asyncVectorizationService;
-
-    @Value("${document.upload-path}")
-    private String uploadPath;
 
     @Value("${vectorstore.pgvector.table-name:embeddings}")
     private String tableName;

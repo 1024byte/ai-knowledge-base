@@ -43,12 +43,6 @@ public class ChatModelConfig {
     }
 
     @Bean
-    public EmbeddingModel embeddingModel() {
-        // BGE 中文模型，默认使用 CPU，适合生产环境
-        return new BgeSmallZhEmbeddingModel();
-    }
-
-    @Bean
     public ChatMemory chatMemory(ChatMemoryStore chatMemoryStore) {
         return MessageWindowChatMemory.builder()
                 .id("default")                  // 设置一个默认的会话ID

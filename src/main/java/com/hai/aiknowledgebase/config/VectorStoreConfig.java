@@ -2,6 +2,7 @@ package com.hai.aiknowledgebase.config;
 
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.model.embedding.onnx.bgesmallzh.BgeSmallZhEmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.pgvector.PgVectorEmbeddingStore;
 import lombok.extern.slf4j.Slf4j;
@@ -32,5 +33,10 @@ public class VectorStoreConfig {
                 .createTable(true)
                 .dropTableFirst(false)
                 .build();
+    }
+    @Bean
+    public EmbeddingModel embeddingModel() {
+        // BGE 中文模型，默认使用 CPU，适合生产环境
+        return new BgeSmallZhEmbeddingModel();
     }
 }

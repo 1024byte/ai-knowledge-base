@@ -44,7 +44,7 @@ public class MarkdownDocumentChunker {
     private final int maxTokens;
     /** 重叠比例 */
     private final double overlapRatio;
-    /** Token 估算器（LangChain4j 官方接口） */
+    /** Token 计算器（LangChain4j 官方接口） */
     private final TokenCountEstimator tokenEstimator;
     /** Embedding 模型（用于语义切分，可为 null） */
     private final EmbeddingModel embeddingModel;

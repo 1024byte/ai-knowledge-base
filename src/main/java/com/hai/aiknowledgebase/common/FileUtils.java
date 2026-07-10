@@ -19,18 +19,7 @@ public class FileUtils {
     }
 
     public static String loadDocumentContent(File file, String filename) throws IOException {
-        String extension = filename.substring(filename.lastIndexOf(".")).toLowerCase();
-
-        switch (extension) {
-            case ".txt":
-            case ".md":
-                return Files.readString(file.toPath(), StandardCharsets.UTF_8);
-            case ".pdf":
-//                log.warn("PDF处理暂未完全实现，建议先转换为txt格式");
-                return Files.readString(file.toPath(), StandardCharsets.UTF_8);
-            default:
-                throw new BusinessException(ResultCode.UNSUPPORTED_FILE_TYPE, extension);
-        }
+        return Files.readString(file.toPath(), StandardCharsets.UTF_8);
     }
 
     /**

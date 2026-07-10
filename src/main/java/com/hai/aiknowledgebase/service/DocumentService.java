@@ -32,8 +32,9 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
-
 import static com.hai.aiknowledgebase.common.FileUtils.*;
+
+
 
 @Slf4j
 @Service
@@ -195,17 +196,6 @@ public class DocumentService {
             return Map.of();
         }
     }
-
-    /**
-     * 获取上传目录的绝对路径
-     */
-    private Path getUploadDirectory() {
-        Path path = Paths.get(uploadPath);
-        log.info("上传目录配置: {}, 绝对路径: {}", uploadPath, path.toAbsolutePath());
-        return path;
-    }
-
-
 
     /**
      * 创建新分类

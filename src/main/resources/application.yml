@@ -39,5 +39,7 @@ vectorstore:
 
 # 文档配置
 document:
-  chunk-size: 500
-  chunk-overlap: 50
+  chunk:
+    min-tokens: 400
+    max-tokens: 8008
+    overlap-ratio: 0.2

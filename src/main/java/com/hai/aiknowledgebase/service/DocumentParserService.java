@@ -2,15 +2,20 @@ package com.hai.aiknowledgebase.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hai.aiknowledgebase.common.FileUtils;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+
+import static com.hai.aiknowledgebase.common.FileUtils.getFileExtension;
 
 @Slf4j
 @Service
@@ -18,53 +23,84 @@ public class DocumentParserService {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    @Value("${mineru.script.path:src/main/resources/scripts/parse_pdf_cli.py}")
-    private String scriptPath;
-
     @Value("${mineru.python.path:E:/Anaconda_envs/envs/pytorch_gpu/python.exe}")
     private String pythonPath;
 
-    public String parsePdf(Path pdfPath) throws Exception {
-        if (!pdfPath.toFile().exists()) {
-            throw new RuntimeException("PDF 文件不存在: " + pdfPath);
+    @Value("${mineru.scripts.docx}")
+    private String docxScriptPath;
+
+    @Value("${mineru.scripts.pdf}")
+    private String pdfScriptPath;
+
+    // 纯文本扩展名（直接读取）
+    private static final Set<String> PLAIN_TEXT_EXTS = Set.of("md", "txt");
+
+    // 使用 python-docx 解析的扩展名
+    private static final Set<String> DOCX_EXTS = Set.of("docx");
+
+    // 使用 MinerU 解析的扩展名（复杂文档）
+    private static final Set<String> MINERU_EXTS = Set.of("pdf", "pptx", "xlsx", "doc", "ppt", "xls", "jpg", "jpeg", "png", "bmp", "tiff");
+
+
+    /**
+     * 根据文件类型选择解析方式
+     */
+    public String parseDocument(Path filePath, String fileName) throws Exception {
+        String extension = getFileExtension(fileName).toLowerCase();
+        log.info("解析文件: {}, 扩展名: {}", fileName, extension);
+        if (PLAIN_TEXT_EXTS.contains(extension)) {
+            // 纯文本：直接读取
+            return FileUtils.loadDocumentContent(filePath.toFile(), fileName);
+        } else if (DOCX_EXTS.contains(extension)) {
+            // DOCX：使用 python-docx
+            return executePythonScript(pythonPath, docxScriptPath, filePath.toString());
+        } else if (MINERU_EXTS.contains(extension)) {
+            // 其他复杂文档：使用 MinerU
+            return executePythonScript(pythonPath, pdfScriptPath, filePath.toString());
+        } else {
+            // 未知类型：尝试用 MinerU 兜底
+            log.warn("未知文件类型: {}, 尝试使用 MinerU", extension);
+            return executePythonScript(pythonPath, pdfScriptPath, filePath.toString());
         }
+    }
 
-        log.info("开始解析 PDF: {}", pdfPath);
-
+    /**
+     * 执行 Python 脚本并返回 JSON 中的 content
+     */
+    private String executePythonScript(String pythonPath, String scriptPath, String filePath) throws Exception {
         List<String> command = new ArrayList<>();
         command.add(pythonPath);
         command.add(scriptPath);
-        command.add(pdfPath.toString());
+        command.add(filePath);
 
         ProcessBuilder pb = new ProcessBuilder(command);
         pb.redirectErrorStream(true);
-
         Process process = pb.start();
-        StringBuilder output = new StringBuilder();
 
+        StringBuilder output = new StringBuilder();
         try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(process.getInputStream(), java.nio.charset.StandardCharsets.UTF_8))) {
+                new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 output.append(line);
             }
         }
-
         int exitCode = process.waitFor();
         if (exitCode != 0) {
-            log.error("Python 脚本执行失败，退出码: {}", exitCode);
-            throw new RuntimeException("Python 脚本执行失败，退出码: " + exitCode);
+            throw new RuntimeException("Python 脚本执行失败，退出码: " + exitCode + "，输出: " + output);
         }
-
-        String outputStr = output.toString();
-        log.debug("Python 脚本输出: {}", outputStr);
-
+        String outputStr = output.toString().trim();
+        // 如果输出包含非 JSON 前缀（如错误日志），尝试提取 JSON
+        int jsonStart = outputStr.indexOf('{');
+        int jsonEnd = outputStr.lastIndexOf('}');
+        if (jsonStart >= 0 && jsonEnd > jsonStart) {
+            outputStr = outputStr.substring(jsonStart, jsonEnd + 1);
+        }
         JsonNode jsonNode = objectMapper.readTree(outputStr);
         if (jsonNode.get("success").asBoolean()) {
             return jsonNode.get("content").asText();
         } else {
-            String error = jsonNode.get("error").asText();
-            throw new RuntimeException("MinerU 解析失败: " + error);
+            throw new RuntimeException("解析失败: " + jsonNode.get("error").asText());
         }
     }
 }

@@ -4,26 +4,19 @@ import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.hai.aiknowledgebase.entity.DocumentMetadata;
 import com.hai.aiknowledgebase.mapper.DocumentMetadataMapper;
 import dev.langchain4j.data.document.Document;
-import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.Metadata;
-import dev.langchain4j.data.document.splitter.DocumentByParagraphSplitter;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.nio.file.Path;
 import java.util.List;
-import java.util.Set;
-
-import static com.hai.aiknowledgebase.common.FileUtils.getFileExtension;
-import static com.hai.aiknowledgebase.common.FileUtils.loadDocumentContent;
 
 @Slf4j
 @Service
@@ -31,13 +24,9 @@ import static com.hai.aiknowledgebase.common.FileUtils.loadDocumentContent;
 public class VectorizationService {
 
     private final DocumentParserService documentParserService;
+    private final DocumentChunkerService documentChunkerService;
     private final EmbeddingStore<TextSegment> embeddingStore;
     private final EmbeddingModel embeddingModel;
-    @Value("${document.chunk-size:500}")
-    private int chunkSize;
-
-    @Value("${document.chunk-overlap:50}")
-    private int chunkOverlap;
 
     private final DocumentMetadataMapper documentMetadataMapper;
 
@@ -46,35 +35,23 @@ public class VectorizationService {
     public void processVectorizationAsync(Long docId, Path filePath, String category) {
         try {
             // 1. 加载内容、切分、向量化（复用现有逻辑）
-            String parsedContent = null;
+//            String parsedContent = null;
             String fileName = filePath.getFileName().toString();
-            String extension = getFileExtension(fileName).toLowerCase();
-            // 判断文件类型：如果是纯文本，直接读取；否则调用 MinerU
-            Set<String> plainTextExtensions = Set.of("md", "txt");
-            if (plainTextExtensions.contains(extension)) {
-                // 纯文本，使用原有方法
-                parsedContent = loadDocumentContent(filePath.toFile(), fileName);
-                log.info("使用基础文本解析，内容长度: {}", parsedContent.length());
-            } else {
-                // 复杂文档（PDF、DOCX、PPTX、XLSX、图片等），调用 MinerU
-                try {
-                    parsedContent = documentParserService.parsePdf(filePath); // 方法名可保留
-                    log.info("MinerU 解析成功，内容长度: {}", parsedContent.length());
-                } catch (Exception e) {
-                    log.error("MinerU 解析失败，回退到基础文本解析", e);
-                    // 回退：尝试用基础方式读取（可能效果差）
-                    parsedContent = loadDocumentContent(filePath.toFile(), fileName);
-                }
-            }
+            String parsedContent = documentParserService.parseDocument(filePath, fileName);
+            log.info("文档解析成功，内容长度: {}", parsedContent.length());
+
+            // 2. 构建 Document
             Document document = Document.from(parsedContent, Metadata.from("source", filePath.getFileName().toString())
                     .put("category", category));
-            DocumentSplitter splitter = new DocumentByParagraphSplitter(chunkSize, chunkOverlap);
-            List<TextSegment> segments = splitter.split(document);
+
+            // 3. 切分 + 向量化 + 存储（使用递归 Markdown 切片器）
+            List<TextSegment> segments = documentChunkerService.split(document);
             for (TextSegment segment : segments) {
                 Embedding embedding = embeddingModel.embed(segment).content();
                 embeddingStore.add(embedding, segment);
             }
-            // 2. 更新状态为 "active"
+
+            // 4. 更新状态为 "active"
             LambdaUpdateWrapper<DocumentMetadata> wrapper = new LambdaUpdateWrapper<>();
             wrapper.eq(DocumentMetadata::getId, docId)
                     .set(DocumentMetadata::getStatus, "active");

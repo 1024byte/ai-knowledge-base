@@ -1,10 +1,8 @@
 package com.hai.aiknowledgebase.service;
 
-import ai.djl.util.JsonUtils;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hai.aiknowledgebase.dto.ChatMessageDTO;
 import com.hai.aiknowledgebase.dto.ChatSessionDTO;
 import com.hai.aiknowledgebase.dto.HaiChatResponse;
@@ -13,34 +11,34 @@ import com.hai.aiknowledgebase.entity.ChatHistory;
 import com.hai.aiknowledgebase.mapper.ChatHistoryMapper;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.message.AiMessage;
-import dev.langchain4j.internal.Json;
-import dev.langchain4j.memory.ChatMemory;
-import dev.langchain4j.memory.chat.MessageWindowChatMemory;
-import dev.langchain4j.model.chat.response.ChatResponse;
-import dev.langchain4j.model.output.Response;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.internal.Json;
+import dev.langchain4j.memory.ChatMemory;
+import dev.langchain4j.memory.chat.MessageWindowChatMemory;
+import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
-import dev.langchain4j.store.embedding.EmbeddingMatch;
+import dev.langchain4j.model.output.Response;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingSearchResult;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.memory.chat.ChatMemoryStore;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
 
 
 @Slf4j
 @Service
+@RequiredArgsConstructor
 public class ChatService {
 
     private final OpenAiChatModel chatModel;
@@ -53,6 +51,8 @@ public class ChatService {
     private final ChatMemoryStore chatMemoryStore;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
+    private final RAGSearchService ragSearchService;  // 注入你的RAG服务
+
     private static final String SYSTEM_PROMPT = """
         你是一个知识库助手，基于提供的文档内容回答用户问题。
         
@@ -63,7 +63,7 @@ public class ChatService {
         4. 可以适当引用文档中的原文
         """;
 
-    public ChatService(OpenAiChatModel chatModel,
+/*    public ChatService(OpenAiChatModel chatModel,
                        EmbeddingStore<TextSegment> embeddingStore,
                        EmbeddingModel embeddingModel,
                        ChatHistoryMapper chatHistoryMapper,  // ✅ 替换
@@ -73,7 +73,7 @@ public class ChatService {
         this.embeddingModel = embeddingModel;
         this.chatHistoryMapper = chatHistoryMapper;
         this.chatMemoryStore = chatMemoryStore;
-    }
+    }*/
 
     // 获取或创建会话的 ChatMemory
     private ChatMemory getChatMemory(String sessionId) {
@@ -89,63 +89,59 @@ public class ChatService {
     public HaiChatResponse chat(String sessionId, String question, int topK) {
         long startTime = System.currentTimeMillis();
 
-        // 1. 向量检索
-        Response<Embedding> embeddingResponse = embeddingModel.embed(question);
-        Embedding questionEmbedding = embeddingResponse.content();
+        // ===== 1. 调用 RAGSearchService 检索相关片段（自动处理文件名过滤） =====
+        List<TextSegment> segments = ragSearchService.retrieveSegments(question, topK);
+        log.info("检索到 {} 个相关文档片段", segments.size());
 
-        EmbeddingSearchResult<TextSegment> searchResult = embeddingStore.search(
-                EmbeddingSearchRequest.builder()
-                        .queryEmbedding(questionEmbedding)
-                        .maxResults(topK)
-                        .build()
-        );
-        List<EmbeddingMatch<TextSegment>> matches = searchResult.matches();
-        log.info("检索到 {} 个相关文档片段", matches.size());
-
-        String context = matches.stream()
-                .map(match -> match.embedded().text())
+        // ===== 2. 构建上下文（与之前相同） =====
+        String context = segments.stream()
+                .map(TextSegment::text)
                 .collect(Collectors.joining("\n\n---\n\n"));
 
-        // 2. 构建提示词
+        // ===== 3. 构建用户 Prompt =====
         String userPrompt = buildPrompt(context, question);
 
-        // 3. 获取当前会话的 ChatMemory
+        // ===== 4. 获取当前会话的 ChatMemory =====
         ChatMemory chatMemory = getChatMemory(sessionId);
 
-        // 4. 构建消息列表
+        // ===== 5. 构建完整消息列表（System + 历史 + 当前用户消息） =====
         List<ChatMessage> allMessages = new ArrayList<>();
         allMessages.add(SystemMessage.from(SYSTEM_PROMPT));
         allMessages.addAll(chatMemory.messages());
         allMessages.add(UserMessage.from(userPrompt));
 
-        // 5. 调用模型
+        // ===== 6. 调用模型 =====
         ChatResponse llmResponse = chatModel.chat(allMessages);
         String answer = llmResponse.aiMessage().text();
 
-        // 6.使用 MyBatis-Plus 保存消息
+        // ===== 7. 保存用户消息 =====
         saveMessage(sessionId, "user", question);
 
-
-        // 7. 更新 ChatMemory
+        // ===== 8. 更新 ChatMemory（保存用户问题和助手回复） =====
         chatMemory.add(UserMessage.from(userPrompt));
         chatMemory.add(AiMessage.from(answer));
 
-        // 8. 提取来源
-        List<String> sources = matches.stream()
-                .map(match -> {
-                    Object source = match.embedded().metadata().getString("source");
+        // ===== 9. 提取来源（从检索到的片段中获取 file_name 元数据） =====
+        List<String> sources = segments.stream()
+                .map(seg -> {
+                    Object source = seg.metadata().getString("source");
                     return source != null ? source.toString() : null;
                 })
                 .filter(Objects::nonNull)
                 .distinct()
                 .collect(Collectors.toList());
 
-        saveMessage(sessionId, "assistant", answer,sources);
+        // ===== 10. 保存助手消息（含来源） =====
+        saveMessage(sessionId, "assistant", answer, sources);
 
         long processingTime = System.currentTimeMillis() - startTime;
         log.info("回答生成完成，耗时 {} ms", processingTime);
 
-        return new HaiChatResponse(answer, sources, processingTime);
+        return HaiChatResponse.builder()
+                .sessionId(sessionId)
+                .answer(answer)
+                .sources(sources)
+                .build();
     }
 
     // ==================== 消息保存（使用 MyBatis-Plus） ====================
@@ -245,7 +241,7 @@ public class ChatService {
      * 删除某个会话及其所有消息
      */
     public void deleteSession(String sessionId) {
-        // ✅ 使用 MyBatis-Plus 删除
+        //使用 MyBatis-Plus 删除
         LambdaQueryWrapper<ChatHistory> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(ChatHistory::getSessionId, sessionId);
         chatHistoryMapper.delete(wrapper);

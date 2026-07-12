@@ -411,7 +411,7 @@ public class MarkdownDocumentChunker {
         List<Chunk> chunks = new ArrayList<>();
 
         // 1. 用 BreakIterator 提取句子列表
-        BreakIterator iterator = BreakIterator.getSentenceInstance(Locale.CHINESE);
+        BreakIterator iterator = BreakIterator.getSentenceInstance(Locale.US);
         iterator.setText(paragraph);
         List<String> sentences = new ArrayList<>();
         int start = iterator.first();

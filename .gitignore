@@ -37,3 +37,7 @@ doc/
 application-local.yml
 /uploads/
 /src/main/resources/application-dev.yml
+
+
+*.onnx
+src/main/resources/onnx_model/

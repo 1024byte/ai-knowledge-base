@@ -40,7 +40,9 @@ public class DocumentController {
 
         String filename = file.getOriginalFilename();
         Long metaId = documentService.uploadDocument(file, category);
-
+        if (metaId == 0L){
+            throw new BusinessException(500, "文档元数据已存在");
+        }
         return Result.success(new DocumentUploadResponse(filename, metaId, "文档上传成功"));
     }
 

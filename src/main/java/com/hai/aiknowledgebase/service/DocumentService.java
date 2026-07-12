@@ -11,6 +11,7 @@ import com.hai.aiknowledgebase.mapper.CategoryMapper;
 import com.hai.aiknowledgebase.mapper.DocumentMetadataMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.codec.digest.DigestUtils;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -45,6 +46,7 @@ public class DocumentService {
     private final DocumentMetadataMapper documentMetadataMapper;
     private final CategoryMapper categoryMapper;
     private final VectorizationService asyncVectorizationService;
+    private final DocumentHashService documentHashService;
 
     @Value("${vectorstore.pgvector.table-name:embeddings}")
     private String tableName;
@@ -67,6 +69,12 @@ public class DocumentService {
                 throw new BusinessException(ResultCode.BAD_REQUEST, "文件名不能为空");
             }
             log.info("开始处理文档: {}, 分类: {}", originalFilename, category);
+
+            // 1. 快速字节哈希（可选，为了性能）
+            String byteHash = DigestUtils.sha256Hex(file.getBytes());
+            if (documentHashService.exists(byteHash)) {
+                return 0L; // 直接返回
+            }
 
             // 1. 处理分类名称
             String normalizedCategory = (category == null || category.trim().isEmpty())
@@ -328,7 +336,9 @@ public class DocumentService {
             String category = metadata.getCategory();
             log.info("开始删除文档: id={}, fileName={}", documentId, fileName);
             // 删除向量库
-            deleteVectorsByFileName(fileName);
+            deleteVectorsByDocId(documentId);
+            // 删除文件哈希记录（数据库 + 缓存）
+            documentHashService.deleteByFileName(documentId);
             // 删除物理文件
             Path physicalFile = Paths.get(filePath);
             if (Files.exists(physicalFile)) {
@@ -337,6 +347,8 @@ public class DocumentService {
             } else {
                 log.warn("物理文件不存在，跳过删除: {}", physicalFile);
             }
+            // 清理空的父目录（日期目录、分类目录）
+            cleanupEmptyParentDirs(physicalFile.getParent());
             // 删除元数据
             int rows = documentMetadataMapper.deleteById(documentId);
             if (rows == 0) {
@@ -356,10 +368,10 @@ public class DocumentService {
     /**
      * 根据文件名删除向量库中的片段
      */
-    private void deleteVectorsByFileName(String fileName) {
-        String sql = "DELETE FROM embeddings WHERE metadata->>'source' = ?";
-        int deleted = jdbcTemplate.update(sql, fileName);
-        log.info("从向量库删除了 {} 个与文件 '{}' 相关的向量", deleted, fileName);
+    private void deleteVectorsByDocId(Long docId) {
+        String sql = "DELETE FROM embeddings WHERE metadata->>'document_id' = ?";
+        int deleted = jdbcTemplate.update(sql,  String.valueOf(docId));
+        log.info("从向量库删除了 {} 个与文件 '{}' 相关的向量", deleted,docId);
     }
 
     /**
@@ -395,6 +407,27 @@ public class DocumentService {
                     log.warn("物理文件夹不为空，保留: {}", categoryDir);
                 }
             }
+        }
+    }
+
+    /**
+     * 从指定目录开始，向上逐级清理空目录，直到 uploadRootPath 为止
+     */
+    private void cleanupEmptyParentDirs(Path dir) throws IOException {
+        Path root = Paths.get(uploadRootPath).toAbsolutePath();
+        Path current = dir.toAbsolutePath();
+        while (current != null && !current.equals(root)) {
+            if (Files.exists(current)) {
+                try (var stream = Files.list(current)) {
+                    if (!stream.findAny().isPresent()) {
+                        Files.delete(current);
+                        log.info("空目录已删除: {}", current);
+                    } else {
+                        break; // 目录非空，停止向上清理
+                    }
+                }
+            }
+            current = current.getParent();
         }
     }
 }

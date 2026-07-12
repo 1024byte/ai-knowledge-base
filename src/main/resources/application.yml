@@ -43,4 +43,4 @@ document:
     min-tokens: 400
     max-tokens: 800
     overlap-ratio: 0.2
-    semantic-threshold: 0.75   # 推荐 0.7-0.8，需要根据数据调优
+    semantic-threshold: 0.2 # 推荐 0.7-0.8，需要根据数据调优

@@ -5,8 +5,8 @@ import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.Metadata;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.model.embedding.onnx.allminilml6v2.AllMiniLmL6V2EmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiTokenCountEstimator;
+import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -35,7 +35,7 @@ public class DocumentChunkerService implements DocumentSplitter {
     @Value("${document.chunk.overlap-ratio:0.2}")
     private double overlapRatio;
 
-    @Value("${document.chunk.semantic-threshold:0.75}")
+    @Value("${document.chunk.semantic-threshold:0.65}")
     private double semanticThreshold;
 
     // 复用估算器实例（无状态，可共享）
@@ -43,12 +43,12 @@ public class DocumentChunkerService implements DocumentSplitter {
             new OpenAiTokenCountEstimator(GPT_4_O_MINI);
 
     // Embedding 模型（本地运行，免费，无需 API Key）
-    private final EmbeddingModel embeddingModel;
+    @Resource(name = "embeddingModel")
+    private EmbeddingModel embeddingModel;
 
     public DocumentChunkerService() {
         // 初始化本地 Embedding 模型（约 30MB，CPU 可跑）
-        this.embeddingModel = new AllMiniLmL6V2EmbeddingModel();
-        log.info("Embedding 模型初始化完成: AllMiniLmL6V2");
+
     }
 
     /**

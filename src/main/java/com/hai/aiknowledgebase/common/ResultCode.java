@@ -20,6 +20,7 @@ public enum ResultCode {
     FILE_SAVE_ERROR(1004, "文件保存失败"),
     UNSUPPORTED_FILE_TYPE(1005, "不支持的文件类型"),
     VECTOR_DELETE_ERROR(1006, "向量删除失败"),
+    FILE_CONTENT_EXIST(1007, "该文档的正文内容已存在，无需重复上传"),
 
     // 数据库错误（2000+）
     DB_ERROR(2001, "数据库操作异常"),

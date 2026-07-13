@@ -2,8 +2,10 @@ package com.hai.aiknowledgebase.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hai.aiknowledgebase.common.CustomDocument;
 import com.hai.aiknowledgebase.common.FileUtils;
 import lombok.extern.slf4j.Slf4j;
+import org.checkerframework.checker.units.qual.C;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -45,22 +47,30 @@ public class DocumentParserService {
     /**
      * 根据文件类型选择解析方式
      */
-    public String parseDocument(Path filePath, String fileName) throws Exception {
+    public CustomDocument parseDocument(Path filePath, String fileName) throws Exception {
         String extension = getFileExtension(fileName).toLowerCase();
-        log.info("解析文件: {}, 扩展名: {}", fileName, extension);
         if (PLAIN_TEXT_EXTS.contains(extension)) {
             // 纯文本：直接读取
-            return FileUtils.loadDocumentContent(filePath.toFile(), fileName);
+            log.info("直接读取纯文本: {}", extension);
+            String content = FileUtils.loadDocumentContent(filePath.toFile(), fileName);
+           return CustomDocument.builder().fileName(fileName).content(content).format(CustomDocument.Format.fromString(extension)).build();
         } else if (DOCX_EXTS.contains(extension)) {
+            String content = executePythonScript(pythonPath, docxScriptPath, filePath.toString());
             // DOCX：使用 python-docx
-            return executePythonScript(pythonPath, docxScriptPath, filePath.toString());
+            log.info("使用 python-docx 解析: {}", extension);
+            return CustomDocument.builder().fileName(fileName).content(content).format(CustomDocument.Format.fromString(extension)).build();
         } else if (MINERU_EXTS.contains(extension)) {
             // 其他复杂文档：使用 MinerU
-            return executePythonScript(pythonPath, pdfScriptPath, filePath.toString());
+            log.info("使用 MinerU 解析: {}", extension);
+            String content = executePythonScript(pythonPath, pdfScriptPath, filePath.toString());
+            return CustomDocument.builder().fileName(fileName).content(content).format(CustomDocument.Format.fromString(extension)).build();
+
         } else {
             // 未知类型：尝试用 MinerU 兜底
             log.warn("未知文件类型: {}, 尝试使用 MinerU", extension);
-            return executePythonScript(pythonPath, pdfScriptPath, filePath.toString());
+            String content = executePythonScript(pythonPath, pdfScriptPath, filePath.toString());
+            return CustomDocument.builder().fileName(fileName).content(content).format(CustomDocument.Format.UNKNOWN).build();
+
         }
     }
 

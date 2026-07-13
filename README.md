@@ -56,7 +56,7 @@ mvn spring-boot:run
 
 ```bash
 curl -X POST http://localhost:8080/api/documents/upload \
-  -F "file=@your-document.txt"
+  -F "file=@your-customDocument.txt"
 ```
 
 #### 智能问答
@@ -136,7 +136,7 @@ spring:
         options:
           model: deepseek-embedding   # Embedding模型
 
-document:
+customDocument:
   upload-path: ./data/uploads         # 文档上传路径
   chunk-size: 500                     # 文本块大小
   chunk-overlap: 50                   # 文本块重叠大小

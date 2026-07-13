@@ -1,9 +1,12 @@
 package com.hai.aiknowledgebase.service;
 
+import com.hai.aiknowledgebase.common.CustomDocument;
+import com.hai.aiknowledgebase.common.FileUtils;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.Metadata;
 import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.model.TokenCountEstimator;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiTokenCountEstimator;
 import jakarta.annotation.Resource;
@@ -13,6 +16,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static dev.langchain4j.model.openai.OpenAiChatModelName.GPT_4_O_MINI;
 
@@ -39,16 +43,20 @@ public class DocumentChunkerService implements DocumentSplitter {
     private double semanticThreshold;
 
     // 复用估算器实例（无状态，可共享）
-    private final OpenAiTokenCountEstimator tokenEstimator =
-            new OpenAiTokenCountEstimator(GPT_4_O_MINI);
+    private final TokenCountEstimator  tokenCountEstimator;
 
     // Embedding 模型（本地运行，免费，无需 API Key）
-    @Resource(name = "embeddingModel")
-    private EmbeddingModel embeddingModel;
+    private final EmbeddingModel embeddingModel;
 
-    public DocumentChunkerService() {
-        // 初始化本地 Embedding 模型（约 30MB，CPU 可跑）
+    private final DocumentRouter documentRouter;
 
+    // 构造器注入（Spring 4.3+ 自动注入，无需 @Autowired）
+    public DocumentChunkerService(TokenCountEstimator tokenEstimator,
+                                  EmbeddingModel embeddingModel,
+                                  DocumentRouter documentRouter) {
+        this.tokenCountEstimator = tokenEstimator;
+        this.embeddingModel = embeddingModel;
+        this.documentRouter = documentRouter;
     }
 
     /**
@@ -86,9 +94,21 @@ public class DocumentChunkerService implements DocumentSplitter {
 
     @Override
     public List<TextSegment> split(Document document) {
-        String text = document.text();
+        String fileName = document.metadata().getString("source");
+        String extension = FileUtils.getFileExtension(fileName);
+
         Metadata metadata = document.metadata();
-        List<MarkdownDocumentChunker.Chunk> chunks = chunk(text);
+        Map <String, Object> metadataMap = metadata.toMap();
+        CustomDocument customDocument =  CustomDocument.builder()
+                .fileName(metadataMap.get("source").toString())
+                .content(document.text())
+                .format(CustomDocument.Format.fromString(extension)).build();
+
+        List<MarkdownDocumentChunker.Chunk> chunks = documentRouter.route(customDocument);
+
+        String text = document.text();
+
+//        List<MarkdownDocumentChunker.Chunk> chunks = chunk(text);
 
         List<TextSegment> segments = new ArrayList<>(chunks.size());
         for (int i = 0; i < chunks.size(); i++) {
@@ -115,7 +135,7 @@ public class DocumentChunkerService implements DocumentSplitter {
                 minTokens,
                 maxTokens,
                 overlapRatio,
-                tokenEstimator,
+                tokenCountEstimator ,
                 embeddingModel,
                 semanticThreshold
         );

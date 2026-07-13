@@ -1,10 +1,12 @@
 package com.hai.aiknowledgebase.config;
 
 import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.model.TokenCountEstimator;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.embedding.onnx.OnnxEmbeddingModel;
 import dev.langchain4j.model.embedding.onnx.PoolingMode;
 import dev.langchain4j.model.huggingface.HuggingFaceEmbeddingModel;
+import dev.langchain4j.model.openai.OpenAiTokenCountEstimator;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.pgvector.PgVectorEmbeddingStore;
 import lombok.extern.slf4j.Slf4j;
@@ -47,5 +49,12 @@ public class VectorStoreConfig {
         // 2. 直接使用构造函数创建 OnnxEmbeddingModel 实例
         //    构造函数：OnnxEmbeddingModel(pathToModel, pathToTokenizer, poolingMode)[reference:5][reference:6]
         return new OnnxEmbeddingModel(modelPath, tokenizerPath, PoolingMode.MEAN);
+    }
+
+    @Bean
+    public TokenCountEstimator tokenCountEstimator(
+            @Value("${langchain4j.tokenizer.model-name:gpt-4o-mini}") String modelName) {
+        // 如果配置文件没配，默认走 GPT_4_O_MINI
+        return new OpenAiTokenCountEstimator(modelName);
     }
 }

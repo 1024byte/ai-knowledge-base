@@ -44,3 +44,7 @@ document:
     max-tokens: 800
     overlap-ratio: 0.2
     semantic-threshold: 0.2 # 推荐 0.7-0.8，需要根据数据调优
+
+langchain4j:
+  tokenizer:
+    model-name: gpt-4o-mini   # 或者 gpt-4o, gpt-3.5-turbo 等

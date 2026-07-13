@@ -1,6 +1,8 @@
 package com.hai.aiknowledgebase.service;
 
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+import com.hai.aiknowledgebase.common.CustomDocument;
+import com.hai.aiknowledgebase.common.FileUtils;
 import com.hai.aiknowledgebase.common.HashType;
 import com.hai.aiknowledgebase.common.ResultCode;
 import com.hai.aiknowledgebase.entity.DocumentMetadata;
@@ -44,23 +46,23 @@ public class VectorizationService {
         try {
             // 1. 加载内容、切分、向量化（复用现有逻辑）
             String fileName = filePath.getFileName().toString();
-            String parsedContent = documentParserService.parseDocument(filePath, fileName);
-            log.info("文档解析成功，内容长度: {}", parsedContent.length());
-            log.info("内容: {}", parsedContent);
-            String contentHash = DigestUtils.sha256Hex(parsedContent);
+            CustomDocument customDocument = documentParserService.parseDocument(filePath, fileName);
+            log.info("文档解析成功，内容长度: {}", customDocument.getContent().length());
+            log.info("内容: {}", customDocument.getContent());
+            String contentHash = DigestUtils.sha256Hex(customDocument.getContent());
             // 1.1查重判断
             if (documentHashService.exists(contentHash)) {
                 log.warn("检测到内容重复文档，文件名: {}", filePath.getFileName());
                 Files.deleteIfExists(filePath);//删除已上传的服务器文件
                 throw new BusinessException(ResultCode.FILE_CONTENT_EXIST,"该文档的正文内容已存在，无需重复上传");
             }
-
             // 2. 构建 Document
-            Document document = Document.from(parsedContent, Metadata.from("source", filePath.getFileName().toString())
-                    .put("category", category).put("document_id",docId));
+            Document document = Document.from(customDocument.getContent(), Metadata.from("source", filePath.getFileName().toString())
+                    .put("category",category).put("document_id",docId));
 
             // 3. 切分 + 向量化 + 存储（使用递归 Markdown 切片器）
             List<TextSegment> segments = documentChunkerService.split(document);
+            log.info("切片完成，生成 {} 个片段", segments.size());
             for (TextSegment segment : segments) {
                 Embedding embedding = embeddingModel.embed(segment).content();
                 embeddingStore.add(embedding, segment);

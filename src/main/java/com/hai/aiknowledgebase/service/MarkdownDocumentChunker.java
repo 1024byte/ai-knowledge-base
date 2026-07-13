@@ -1,6 +1,5 @@
 package com.hai.aiknowledgebase.service;
 
-import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.model.TokenCountEstimator;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import lombok.extern.slf4j.Slf4j;
@@ -411,7 +410,7 @@ public class MarkdownDocumentChunker {
         List<Chunk> chunks = new ArrayList<>();
 
         // 1. 用 BreakIterator 提取句子列表
-        BreakIterator iterator = BreakIterator.getSentenceInstance(Locale.US);
+        BreakIterator iterator = BreakIterator.getSentenceInstance(Locale.ROOT);
         iterator.setText(paragraph);
         List<String> sentences = new ArrayList<>();
         int start = iterator.first();

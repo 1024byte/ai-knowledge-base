@@ -41,3 +41,4 @@ application-local.yml
 
 *.onnx
 src/main/resources/onnx_model/
+/.trae/skills/design-interface.md

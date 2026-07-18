@@ -665,6 +665,35 @@ public class DocumentService {
         log.info("从向量库删除了 {} 个与文件 '{}' 相关的向量", deleted, docId);
     }
 
+    // ======================== 文档内容读取 ========================
+
+    /**
+     * <h3>根据文档 ID 查询文档元数据（用于文件流式返回）</h3>
+     *
+     * <p>只查询数据库元数据，不读取文件内容。文件内容的流式传输由 Controller 层负责。</p>
+     *
+     * <h4>设计考量</h4>
+     * <ul>
+     *   <li><b>不分文件类型</b>：PDF、Word、图片等二进制文件无法用 {@code Files.readString()} 读取，
+     *       正确做法是返回文件流让浏览器渲染</li>
+     *   <li><b>不加载到内存</b>：大文件（几百 MB）如果一次性读到 String 会导致 OOM，
+     *       应使用 {@code FileSystemResource} + {@code InputStreamResource} 流式传输</li>
+     *   <li><b>Service 只查元数据</b>：文件流的管理（Content-Type、Content-Disposition 等 HTTP 头）
+     *       属于 Controller 层职责，Service 不应关心</li>
+     * </ul>
+     *
+     * @param documentId 文档在数据库中的唯一标识
+     * @return 文档元数据（包含 filePath、fileName、fileType、fileSize）
+     * @throws BusinessException 文档不存在时抛出
+     */
+    public DocumentMetadata getDocumentFileInfo(Long documentId) {
+        DocumentMetadata metadata = documentMetadataMapper.selectById(documentId);
+        if (metadata == null) {
+            throw new BusinessException(ResultCode.DOCUMENT_NOT_FOUND);
+        }
+        return metadata;
+    }
+
     /**
      * <h3>从指定目录开始，向上逐级清理空目录</h3>
      *

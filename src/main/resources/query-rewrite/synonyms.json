@@ -1,0 +1,54 @@
+{
+  "version": "1.0",
+  "updated": "2026-07-14",
+  "entries": [
+    {
+      "key": "换工作",
+      "synonyms": ["职业转换", "跳槽", "转行", "career switch"],
+      "category": "business",
+      "enabled": true
+    },
+    {
+      "key": "薪资",
+      "synonyms": ["工资", "薪酬", "收入", "salary"],
+      "category": "business",
+      "enabled": true
+    },
+    {
+      "key": "阅读",
+      "synonyms": ["文章", "短文", "passage", "reading"],
+      "category": "education",
+      "enabled": true
+    },
+    {
+      "key": "词汇",
+      "synonyms": ["单词", "词", "vocabulary", "word"],
+      "category": "education",
+      "enabled": true
+    },
+    {
+      "key": "主旨",
+      "synonyms": ["大意", "中心思想", "main idea", "gist"],
+      "category": "education",
+      "enabled": true
+    },
+    {
+      "key": "配置",
+      "synonyms": ["设置", "参数", "config", "setting"],
+      "category": "tech",
+      "enabled": true
+    },
+    {
+      "key": "切片",
+      "synonyms": ["分块", "切分", "chunk", "split"],
+      "category": "tech",
+      "enabled": true
+    },
+    {
+      "key": "召回",
+      "synonyms": ["检索", "搜索", "recall", "retrieve"],
+      "category": "tech",
+      "enabled": true
+    }
+  ]
+}

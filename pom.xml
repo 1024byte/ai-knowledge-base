@@ -71,10 +71,10 @@
         </dependency>
 
         <!-- 【修复】中文BGE量化嵌入 1.17.2 可用 -->
-        <dependency>
+<!--        <dependency>
             <groupId>dev.langchain4j</groupId>
             <artifactId>langchain4j-embeddings-bge-small-zh-v15-q</artifactId>
-        </dependency>
+        </dependency>-->
 
         <!-- 英文MiniLM嵌入 -->
         <dependency>
@@ -149,6 +149,13 @@
         <dependency>
             <groupId>com.github.ben-manes.caffeine</groupId>
             <artifactId>caffeine</artifactId>
+        </dependency>
+
+        <!-- jieba-analysis 中文分词 -->
+        <dependency>
+            <groupId>com.huaban</groupId>
+            <artifactId>jieba-analysis</artifactId>
+            <version>1.0.2</version>
         </dependency>
 
 

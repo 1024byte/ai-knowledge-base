@@ -5,7 +5,6 @@ import dev.langchain4j.model.TokenCountEstimator;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.embedding.onnx.OnnxEmbeddingModel;
 import dev.langchain4j.model.embedding.onnx.PoolingMode;
-import dev.langchain4j.model.huggingface.HuggingFaceEmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiTokenCountEstimator;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.pgvector.PgVectorEmbeddingStore;
@@ -54,7 +53,7 @@ public class VectorStoreConfig {
     @Bean
     public TokenCountEstimator tokenCountEstimator(
             @Value("${langchain4j.tokenizer.model-name:gpt-4o-mini}") String modelName) {
-        // 如果配置文件没配，默认走 GPT_4_O_MINI
+        // 如果配置文件没配，默认走 GPT_4_O_MINI  token计数器
         return new OpenAiTokenCountEstimator(modelName);
     }
 }

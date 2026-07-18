@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hai.aiknowledgebase.dto.ChatMessageDTO;
 import com.hai.aiknowledgebase.dto.ChatSessionDTO;
 import com.hai.aiknowledgebase.dto.HaiChatResponse;
+import com.hai.aiknowledgebase.dto.QueryRewriteResult;
 import com.hai.aiknowledgebase.dto.SearchResult;
 import com.hai.aiknowledgebase.entity.ChatHistory;
 import com.hai.aiknowledgebase.mapper.ChatHistoryMapper;
@@ -52,6 +53,8 @@ public class ChatService {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private final RAGSearchService ragSearchService;  // 注入你的RAG服务
+    private final QueryRewriteService queryRewriteService;  // 查询改写服务
+
 
     private static final String SYSTEM_PROMPT = """
         你是一个知识库助手，基于提供的文档内容回答用户问题。
@@ -89,8 +92,17 @@ public class ChatService {
     public HaiChatResponse chat(String sessionId, String question, int topK) {
         long startTime = System.currentTimeMillis();
 
-        // ===== 1. 调用 RAGSearchService 检索相关片段（自动处理文件名过滤） =====
-        List<TextSegment> segments = ragSearchService.retrieveSegments(question, topK);
+        // ===== 0. 查询改写 =====
+        QueryRewriteResult rewriteResult = queryRewriteService.rewrite(question);
+        String searchQuery = rewriteResult.getRewrittenQuery();
+        List<String> expandKeywords = rewriteResult.getExpandKeywords();
+        List<String> excludeKeywords = rewriteResult.getExcludeKeywords();
+        log.info("查询改写 | 原始: {} | 改写: {} | 扩展词: {} | 排除词: {} | 置信度: {} | 路径: {}",
+                question, searchQuery, expandKeywords, excludeKeywords,
+                String.format("%.2f", rewriteResult.getConfidence()), rewriteResult.getPath());
+
+        // ===== 1. 调用 RAGSearchService 检索相关片段（使用改写后的查询和扩展/排除关键词） =====
+        List<TextSegment> segments = ragSearchService.retrieveSegments(searchQuery, topK, expandKeywords, excludeKeywords);
         log.info("检索到 {} 个相关文档片段", segments.size());
 
         // ===== 2. 构建上下文（与之前相同） =====
@@ -180,7 +192,6 @@ public class ChatService {
 
         List<ChatHistory> list = chatHistoryMapper.selectList(wrapper);
 
-
         return list.stream()
                 .map(record -> new ChatMessageDTO(
                         record.getRole(),
@@ -257,7 +268,6 @@ public class ChatService {
     // ==================== 搜索接口（不变） ====================
     public List<SearchResult> search(String query, int topK) {
         log.info("搜索查询: {}", query);
-
         Response<Embedding> queryEmbeddingResponse = embeddingModel.embed(query);
         Embedding queryEmbedding = queryEmbeddingResponse.content();
 

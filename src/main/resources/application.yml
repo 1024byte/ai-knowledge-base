@@ -43,8 +43,26 @@ document:
     min-tokens: 400
     max-tokens: 800
     overlap-ratio: 0.2
-    semantic-threshold: 0.2 # 推荐 0.7-0.8，需要根据数据调优
+    semantic-threshold: 0.6 # 推荐 0.7-0.8，需要根据数据调优
 
 langchain4j:
   tokenizer:
     model-name: gpt-4o-mini   # 或者 gpt-4o, gpt-3.5-turbo 等
+
+# 查询改写配置
+query-rewrite:
+  enabled: true                      # 总开关
+  config:
+    synonyms-path: query-rewrite/synonyms.json
+    fixed-mapping-path: query-rewrite/fixed-mapping.json
+    stopwords-path: query-rewrite/stopwords.json
+  l1:
+    confidence-threshold: 0.85       # L1 置信度高于此值直接返回
+  l2:
+    confidence-threshold: 0.70       # L2 置信度高于此值直接返回
+
+# 混合检索配置（并行双路召回 + RRF 融合）
+hybrid-search:
+  enabled: true                      # 总开关：true=向量+关键词双路召回，false=仅向量检索
+  rrf:
+    k: 60                            # RRF 常数 k，值越大排名差异越平滑（推荐 60）

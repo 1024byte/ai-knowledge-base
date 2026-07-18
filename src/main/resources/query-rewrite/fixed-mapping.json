@@ -1,0 +1,9 @@
+{
+  "version": "1.0",
+  "updated": "2026-07-14",
+  "entries": [
+    { "from": "专升本", "to": "专升本 3500词", "enabled": true, "confidence": 0.95 },
+    { "from": "讲稿", "to": "讲义", "enabled": true, "confidence": 0.95 },
+    { "from": "API", "to": "API 接口", "enabled": true, "confidence": 0.90 }
+  ]
+}

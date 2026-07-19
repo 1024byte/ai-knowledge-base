@@ -153,9 +153,13 @@ public class VectorizationService {
 
             // ===== 步骤3：构建 LangChain4j Document =====
             // 设置元数据：source（文件名）、category（分类）、document_id（数据库ID）
+            DocumentMetadata docMeta = documentMetadataMapper.selectById(docId);
+            String sourceFileName = (docMeta != null && docMeta.getFileName() != null)
+                    ? docMeta.getFileName()
+                    : filePath.getFileName().toString();
             Document document = Document.from(
                     customDocument.getContent(),
-                    Metadata.from("source", filePath.getFileName().toString())
+                    Metadata.from("source", sourceFileName)
                             .put("category", category)
                             .put("document_id", docId));
 

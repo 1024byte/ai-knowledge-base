@@ -395,39 +395,41 @@ public class MarkdownDocumentChunker {
 
             if (totalTokens <= maxTokens) {
                 // ===== 策略1：Section 不超限 → 直接打包 =====
+                String sectionPrefix = buildContextPrefix(currentPrefix, section);
                 String text = section.fullText();
                 if (!text.isBlank()) {
                     currentFrameChunks.add(new Chunk(
-                            wrapWithContext(text, currentPrefix),
+                            wrapWithContext(text, sectionPrefix),
                             tokenEstimator.estimateTokenCountInText(text),
-                            currentPrefix));
+                            sectionPrefix));
                 }
 
             } else if (!section.children.isEmpty()) {
                 // ===== 策略2：Section 超限但有子节点 → 递归处理 =====
+                // 构建当前 Section 的上下文前缀（级联当前标题）
+                String sectionPrefix2 = buildContextPrefix(currentPrefix, section);
                 // 先处理自身内容（title + content，不含子节点）
                 if (!section.title.isEmpty() || !section.content.isEmpty()) {
                     Section ownSection = new Section(
                             section.level, section.title, section.content);
                     List<Chunk> ownChunks = splitLargeSection(
-                            ownSection, currentPrefix);
+                            ownSection, sectionPrefix2);
                     currentFrameChunks.addAll(ownChunks);
                 }
-                // 构建子节点的上下文前缀（级联当前标题）
-                String childPrefix = buildContextPrefix(currentPrefix, section);
                 // 压入帧标记和子节点 Section（逆序）
-                stack.push(new FrameMarker(childPrefix));
+                stack.push(new FrameMarker(sectionPrefix2));
                 for (int i = section.children.size() - 1; i >= 0; i--) {
                     stack.push(section.children.get(i));
                 }
                 // 创建新的帧用于收集子节点的 Chunk
                 chunkFrameStack.push(new ArrayList<>());
-                prefixFrameStack.push(childPrefix);
+                prefixFrameStack.push(sectionPrefix2);
 
             } else {
                 // ===== 策略3：Section 超限且无子节点 → 直接拆分 =====
+                String sectionPrefix3 = buildContextPrefix(currentPrefix, section);
                 currentFrameChunks.addAll(
-                        splitLargeSection(section, currentPrefix));
+                        splitLargeSection(section, sectionPrefix3));
             }
         }
 

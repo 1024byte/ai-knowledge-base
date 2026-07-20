@@ -268,13 +268,15 @@ class L2NlpServicesTest {
         @DisplayName("hasCorrection 应正确判断是否发生了纠错")
         void hasCorrection() {
             // "配质" → "配置" 应检测到纠错
-            assertThat(corrector.hasCorrection("配质API")).isTrue();
+            corrector.correct("配质API");
+            assertThat(corrector.hasCorrection()).isTrue();
         }
 
         @Test
         @DisplayName("hasCorrection 对正确查询应返回 false")
         void noCorrectionForCorrect() {
-            assertThat(corrector.hasCorrection("配置API")).isFalse();
+            corrector.correct("配置API");
+            assertThat(corrector.hasCorrection()).isFalse();
         }
     }
 }

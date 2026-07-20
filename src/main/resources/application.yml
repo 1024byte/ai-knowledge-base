@@ -10,8 +10,8 @@ spring:
     driver-class-name: org.postgresql.Driver
   servlet:
     multipart:
-      max-file-size: 10MB
-      max-request-size: 10MB
+      max-file-size: 200MB
+      max-request-size: 200MB
 
   mybatis-plus:
     configuration:
@@ -44,6 +44,10 @@ document:
     max-tokens: 800
     overlap-ratio: 0.2
     semantic-threshold: 0.6 # 推荐 0.7-0.8，需要根据数据调优
+  parser:
+    max-output-size-mb: 200      # Python 进程输出上限，超过则终止解析
+  upload:
+    max-size-mb: 200             # 上传文件大小上限，超过则拒绝
 
 langchain4j:
   tokenizer:

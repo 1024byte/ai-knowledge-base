@@ -17,7 +17,54 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * 查询改写配置加载器
- * 职责：从 JSON 文件加载同义词、固定映射、停用词，支持定时刷新
+ *
+ * <h2>职责</h2>
+ * 从 classpath 下的 JSON 文件中加载三类配置数据，并提供线程安全的读取接口：
+ * <ul>
+ *   <li><b>同义词词典</b>（synonyms.json）：key → 同义词列表，
+ *       用于 L1/L2 查询扩展，丰富搜索关键词</li>
+ *   <li><b>固定映射</b>（fixed-mapping.json）：原始词 → 标准词 + 置信度，
+ *       用于 L1 规则改写，将口语化表达映射为标准术语</li>
+ *   <li><b>停用词表</b>（stopwords.json）：中英文停用词，
+ *       用于 L2 分词后过滤无意义词汇</li>
+ * </ul>
+ *
+ * <h2>架构设计</h2>
+ * <h3>Copy-on-Write 并发模型</h3>
+ * 使用 {@link AtomicReference} 持有配置数据，加载时整体替换引用，
+ * 读取时无需加锁，实现无锁线程安全：
+ * <pre>{@code
+ * synonymDict.set(newDict);  // 写入：原子替换整个 Map
+ * synonymDict.get();         // 读取：获取快照引用
+ * }</pre>
+ *
+ * <h3>三层容错机制</h3>
+ * <ol>
+ *   <li><b>文件正常</b>：加载 JSON 文件内容</li>
+ *   <li><b>文件缺失/损坏 + 首次启动</b>：使用硬编码兜底数据，保证服务不中断</li>
+ *   <li><b>文件缺失/损坏 + 热加载</b>：保留内存中的旧数据，记录 ERROR 日志</li>
+ * </ol>
+ *
+ * <h3>热加载机制</h3>
+ * 通过 {@link Scheduled} 每 5 分钟检查各配置文件的最后修改时间（mtime），
+ * 仅在文件发生变化时才重新加载。支持通过 {@link #reload()} 手动触发。
+ *
+ * <h2>配置路径</h2>
+ * 通过 Spring 的 {@code @Value} 注入，默认值如下：
+ * <ul>
+ *   <li>同义词：{@code query-rewrite/synonyms.json}</li>
+ *   <li>固定映射：{@code query-rewrite/fixed-mapping.json}</li>
+ *   <li>停用词：{@code query-rewrite/stopwords.json}</li>
+ * </ul>
+ *
+ * <h2>已知限制</h2>
+ * <ul>
+ *   <li>配置文件在 JAR 包内时，无法获取文件修改时间（mtime=0），热加载不会触发</li>
+ *   <li>生产环境建议将配置文件放在 JAR 外部目录，以支持热加载</li>
+ *   <li>兜底数据是硬编码的，与 JSON 文件变更需同步维护</li>
+ * </ul>
+ *
+ * @see QueryRewriteService 查询改写服务（本类的消费者）
  */
 @Slf4j
 @Component
@@ -47,26 +94,73 @@ public class QueryRewriteConfigLoader {
 
     // ==================== 公共读接口 ====================
 
+    /**
+     * 获取同义词词典
+     *
+     * <p>返回当前加载的同义词数据快照，key 为基准词，value 为同义词列表。
+     * 返回的 Map 不可修改，但内部 List 仍可修改（调用方不应修改）。</p>
+     *
+     * <h3>示例</h3>
+     * <pre>{@code
+     * {"换工作": ["职业转换", "跳槽", "转行"], "薪资": ["工资", "薪酬", "收入"]}
+     * }</pre>
+     *
+     * @return 不可修改的同义词词典视图，永不返回 null
+     */
     public Map<String, List<String>> getSynonymDict() {
         return Collections.unmodifiableMap(synonymDict.get());
     }
 
+    /**
+     * 获取固定映射
+     *
+     * <p>返回当前加载的固定映射数据快照，key 为原始词（from），value 为目标词（to）。
+     * 返回的 Map 不可修改。</p>
+     *
+     * <h3>示例</h3>
+     * <pre>{@code
+     * {"API网关": "API Gateway", "讲稿": "讲义", "专升本": "专升本 3500词"}
+     * }</pre>
+     *
+     * @return 不可修改的固定映射视图，永不返回 null
+     */
     public Map<String, String> getFixedMapping() {
         return Collections.unmodifiableMap(fixedMapping.get());
     }
 
     /**
      * 获取固定映射的置信度配置
-     * key 为 from 值，value 为该条映射的 confidence
+     *
+     * <p>key 为固定映射的原始词（from），value 为该条映射的置信度（0.0~1.0）。
+     * 返回的 Map 不可修改。</p>
+     *
+     * @return 不可修改的置信度映射视图，永不返回 null
      */
     public Map<String, Double> getFixedMappingConfidence() {
-        return fixedMappingConfidence.get();
+        return Collections.unmodifiableMap(fixedMappingConfidence.get());
     }
 
+    /**
+     * 获取停用词表
+     *
+     * <p>返回当前加载的停用词集合快照，包含中英文停用词。
+     * 英文停用词已统一转为小写。返回的 Set 不可修改。</p>
+     *
+     * @return 不可修改的停用词集合视图，永不返回 null
+     */
     public Set<String> getStopWords() {
         return Collections.unmodifiableSet(stopWords.get());
     }
 
+    /**
+     * 判断指定词是否为停用词
+     *
+     * <p>对输入做 trim 和 toLowerCase 处理后进行精确匹配。
+     * 大小写不敏感（英文停用词在加载时已转为小写）。</p>
+     *
+     * @param word 待检查的词
+     * @return true 表示该词是停用词，null 或空字符串返回 false
+     */
     public boolean isStopWord(String word) {
         if (word == null || word.isEmpty()) return false;
         return stopWords.get().contains(word.trim().toLowerCase());
@@ -74,6 +168,12 @@ public class QueryRewriteConfigLoader {
 
     // ==================== 初始化 & 定时刷新 ====================
 
+    /**
+     * Bean 初始化钩子，在依赖注入完成后自动调用
+     *
+     * <p>Spring 容器启动时执行，加载全部三类配置文件。
+     * 若文件缺失或损坏，自动使用硬编码兜底数据，确保服务正常启动。</p>
+     */
     @PostConstruct
     public void init() {
         log.info("初始化 QueryRewriteConfigLoader...");
@@ -81,7 +181,24 @@ public class QueryRewriteConfigLoader {
     }
 
     /**
-     * 定时刷新：每5分钟检查一次文件修改时间
+     * 定时刷新任务：每 5 分钟检查文件修改时间并增量加载
+     *
+     * <h3>执行逻辑</h3>
+     * <ol>
+     *   <li>获取各配置文件的当前 mtime（修改时间戳）</li>
+     *   <li>与上次加载时记录的 mtime 比较</li>
+     *   <li>仅当 mtime 发生变化时，才调用对应的 load 方法</li>
+     *   <li>若有任一文件被重新加载，输出汇总日志</li>
+     * </ol>
+     *
+     * <h3>Cron 表达式</h3>
+     * {@code 0 *{@literal /}5 * * * ?} —— 每 5 分钟整点触发（0, 5, 10, 15...）
+     *
+     * <h3>注意事项</h3>
+     * <ul>
+     *   <li>配置文件在 JAR 包内时 mtime 为 0，不会触发重新加载</li>
+     *   <li>文件被删除后 mtime 为 0，不会触发重新加载（保留旧数据）</li>
+     * </ul>
      */
     @Scheduled(cron = "0 */5 * * * ?")
     public void scheduledReload() {
@@ -104,7 +221,10 @@ public class QueryRewriteConfigLoader {
     }
 
     /**
-     * 手动触发热加载（供管理端调用）
+     * 手动触发全量热加载
+     *
+     * <p>供管理端 API 调用，强制重新加载全部三类配置文件。
+     * 与定时刷新不同，此方法忽略 mtime 检查，无条件执行加载。</p>
      */
     public void reload() {
         log.info("手动触发热加载...");
@@ -113,6 +233,12 @@ public class QueryRewriteConfigLoader {
 
     // ==================== 私有加载逻辑（统一返回 boolean） ====================
 
+    /**
+     * 全量加载所有配置文件
+     *
+     * <p>依次加载同义词、固定映射、停用词，不检查返回值。
+     * 各子方法内部已处理容错逻辑（文件缺失、JSON 损坏等）。</p>
+     */
     private void loadAll() {
         loadSynonyms();
         loadFixedMapping();
@@ -120,8 +246,19 @@ public class QueryRewriteConfigLoader {
     }
 
     /**
-     * 加载同义词
-     * @return true 表示加载成功（包括加载到空配置），false 表示加载失败（保留旧数据）
+     * 加载同义词配置
+     *
+     * <h3>三种场景</h3>
+     * <table border="1">
+     *   <tr><th>场景</th><th>条件</th><th>行为</th><th>返回值</th></tr>
+     *   <tr><td>正常加载</td><td>文件存在且 JSON 合法</td><td>更新 synonymDict 和 mtime</td><td>true</td></tr>
+     *   <tr><td>首次启动+文件缺失</td><td>synonymDict 为空</td><td>使用硬编码兜底</td><td>true</td></tr>
+     *   <tr><td>热加载+文件缺失</td><td>synonymDict 非空</td><td>保留旧数据，记录 ERROR</td><td>false</td></tr>
+     *   <tr><td>首次启动+JSON 损坏</td><td>synonymDict 为空</td><td>使用硬编码兜底</td><td>true</td></tr>
+     *   <tr><td>热加载+JSON 损坏</td><td>synonymDict 非空</td><td>保留旧数据，记录 ERROR</td><td>false</td></tr>
+     * </table>
+     *
+     * @return true 表示新数据已生效（含兜底），false 表示保留旧数据
      */
     private boolean loadSynonyms() {
         try {
@@ -161,8 +298,13 @@ public class QueryRewriteConfigLoader {
     }
 
     /**
-     * 加载固定映射
-     * @return true 表示加载成功（包括加载到空配置），false 表示加载失败（保留旧数据）
+     * 加载固定映射配置
+     *
+     * <h3>处理逻辑</h3>
+     * 与 {@link #loadSynonyms()} 采用相同的三层容错策略，额外处理置信度映射。
+     * 固定映射同时更新两个数据结构：{@code fixedMapping} 和 {@code fixedMappingConfidence}。
+     *
+     * @return true 表示新数据已生效（含兜底），false 表示保留旧数据
      */
     private boolean loadFixedMapping() {
         try {
@@ -201,8 +343,14 @@ public class QueryRewriteConfigLoader {
     }
 
     /**
-     * 加载停用词
-     * @return true 表示加载成功（包括加载到空配置），false 表示加载失败（保留旧数据）
+     * 加载停用词配置
+     *
+     * <h3>处理逻辑</h3>
+     * 与 {@link #loadSynonyms()} 采用相同的三层容错策略。
+     * <b>注意：</b>空 Set 与 null 语义不同——空 Set 表示运维有意清空所有停用词，
+     * null 表示文件不存在。
+     *
+     * @return true 表示新数据已生效（含兜底），false 表示保留旧数据
      */
     private boolean loadStopwords() {
         try {
@@ -241,7 +389,31 @@ public class QueryRewriteConfigLoader {
 
     /**
      * 从 classpath 加载同义词
+     *
+     * <h3>JSON 结构</h3>
+     * <pre>{@code
+     * {
+     *   "entries": [
+     *     { "enabled": true, "key": "换工作", "synonyms": ["职业转换", "跳槽", "转行"] },
+     *     { "enabled": false, "key": "disabled_example", "synonyms": ["xxx"] }
+     *   ]
+     * }
+     * }</pre>
+     *
+     * <h3>字段说明</h3>
+     * <ul>
+     *   <li><b>enabled</b>：是否启用该组同义词，默认 true。设为 false 可临时禁用而不删除配置</li>
+     *   <li><b>key</b>：基准词，查询中匹配此词时触发同义词扩展</li>
+     *   <li><b>synonyms</b>：同义词数组，命中 key 时追加到扩展关键词中</li>
+     * </ul>
+     *
+     * <h3>设计原则</h3>
+     * 本方法只负责"搬运"——将 JSON 解析为 Map，不包含任何决策逻辑
+     * （如文件缺失时是否使用兜底）。决策责任由上层 {@link #loadSynonyms()} 承担。
+     *
+     * @param classpath classpath 下的文件路径
      * @return 解析成功返回 Map（可能为空），文件不存在返回 null，解析失败抛出异常
+     * @throws Exception JSON 解析失败时抛出
      */
     private Map<String, List<String>> loadSynonymsFromFile(String classpath) throws Exception {
         try (InputStream is = getClass().getClassLoader().getResourceAsStream(classpath)) {
@@ -270,59 +442,108 @@ public class QueryRewriteConfigLoader {
 
     /**
      * 从 classpath 加载固定映射
-     * @return 解析成功返回 FixedMappingResult（可能为空），文件不存在返回 null，解析失败抛出异常
+     *
+     * <h3>JSON 结构</h3>
+     * <pre>{@code
+     * {
+     *   "entries": [
+     *     { "enabled": true, "from": "API网关", "to": "API Gateway", "confidence": 0.95 },
+     *     { "enabled": false, "from": "disabled_example", "to": "xxx", "confidence": 0.8 }
+     *   ]
+     * }
+     * }</pre>
+     *
+     * <h3>字段说明</h3>
+     * <ul>
+     *   <li><b>enabled</b>：是否启用该条映射，默认 true。设为 false 可临时禁用而不删除配置</li>
+     *   <li><b>from</b>：原始词，查询中匹配此词时触发替换</li>
+     *   <li><b>to</b>：目标词，替换为的标准表达</li>
+     *   <li><b>confidence</b>：置信度，默认 0.95</li>
+     * </ul>
+     *
+     * @param classpath classpath 下的文件路径
+     * @return 解析成功返回 FixedMappingResult（可能为空 Map），文件不存在返回 null，解析失败抛出异常
      */
     private FixedMappingResult loadFixedMappingFromFile(String classpath) throws Exception {
-        InputStream is = getClass().getClassLoader().getResourceAsStream(classpath);
-        if (is == null) {
-            log.error("固定映射文件不存在: {}", classpath);
-            return null;  // ✅ 修复：文件缺失返回 null，而不是 fallback
-        }
-
-        JsonNode root = objectMapper.readTree(is);
-        JsonNode entries = root.get("entries");
-        Map<String, String> mapping = new HashMap<>();
-        Map<String, Double> confidence = new HashMap<>();
-        if (entries != null && entries.isArray()) {
-            for (JsonNode entry : entries) {
-                boolean enabled = entry.has("enabled") ? entry.get("enabled").asBoolean() : true;
-                if (!enabled) continue;
-                String from = entry.get("from").asText();
-                String to = entry.get("to").asText();
-                double conf = entry.has("confidence") ? entry.get("confidence").asDouble() : 0.95;
-                mapping.put(from, to);
-                confidence.put(from, conf);
+        try (InputStream is = getClass().getClassLoader().getResourceAsStream(classpath)) {
+            if (is == null) {
+                log.error("固定映射文件不存在: {}", classpath);
+                return null;
             }
+
+            JsonNode root = objectMapper.readTree(is);
+            JsonNode entries = root.get("entries");
+            Map<String, String> mapping = new HashMap<>();
+            Map<String, Double> confidence = new HashMap<>();
+            if (entries != null && entries.isArray()) {
+                for (JsonNode entry : entries) {
+                    boolean enabled = entry.has("enabled") ? entry.get("enabled").asBoolean() : true;
+                    if (!enabled) continue;
+                    String from = entry.get("from").asText();
+                    String to = entry.get("to").asText();
+                    double conf = entry.has("confidence") ? entry.get("confidence").asDouble() : 0.95;
+                    mapping.put(from, to);
+                    confidence.put(from, conf);
+                }
+            }
+            return new FixedMappingResult(mapping, confidence);
         }
-        // ✅ 修复：不管是否为空，都返回 result（不在这里返回 fallback）
-        return new FixedMappingResult(mapping, confidence);
     }
 
     /**
      * 从 classpath 加载停用词
+     *
+     * <h3>JSON 结构</h3>
+     * <pre>{@code
+     * {
+     *   "zh": ["的", "了", "是", "在"],
+     *   "en": ["the", "a", "an", "is"]
+     * }
+     * }</pre>
+     *
+     * <h3>字段说明</h3>
+     * <ul>
+     *   <li><b>zh</b>：中文停用词列表</li>
+     *   <li><b>en</b>：英文停用词列表（加载时自动转为小写）</li>
+     * </ul>
+     * 中英文停用词合并到同一个 Set 中，英文词统一小写以支持大小写不敏感匹配。
+     *
+     * @param classpath classpath 下的文件路径
      * @return 解析成功返回 Set（可能为空），文件不存在返回 null，解析失败抛出异常
      */
     private Set<String> loadStopwordsFromFile(String classpath) throws Exception {
-        InputStream is = getClass().getClassLoader().getResourceAsStream(classpath);
-        if (is == null) {
-            log.error("停用词文件不存在: {}", classpath);
-            return null;  // ✅ 修复：文件缺失返回 null，而不是 fallback
-        }
+        try (InputStream is = getClass().getClassLoader().getResourceAsStream(classpath)) {
+            if (is == null) {
+                log.error("停用词文件不存在: {}", classpath);
+                return null;
+            }
 
-        JsonNode root = objectMapper.readTree(is);
-        Set<String> stopWordsSet = new HashSet<>();
-        if (root.has("zh")) {
-            root.get("zh").forEach(node -> stopWordsSet.add(node.asText()));
+            JsonNode root = objectMapper.readTree(is);
+            Set<String> stopWordsSet = new HashSet<>();
+            if (root.has("zh")) {
+                root.get("zh").forEach(node -> stopWordsSet.add(node.asText()));
+            }
+            if (root.has("en")) {
+                root.get("en").forEach(node -> stopWordsSet.add(node.asText().toLowerCase()));
+            }
+            return stopWordsSet;
         }
-        if (root.has("en")) {
-            root.get("en").forEach(node -> stopWordsSet.add(node.asText().toLowerCase()));
-        }
-        // ✅ 修复：不管是否为空，都返回 stopWordsSet（不在这里返回 fallback）
-        return stopWordsSet;
     }
 
     // ==================== 兜底硬编码（保证服务不中断） ====================
 
+    /**
+     * 同义词兜底数据
+     *
+     * <p>当 synonyms.json 文件缺失或解析失败且内存中无旧数据时使用。
+     * 包含最基础的同义词组，确保查询扩展功能不中断。</p>
+     *
+     * <h3>维护提醒</h3>
+     * 兜底数据应与 JSON 文件内容保持同步。若 JSON 文件新增了重要的同义词组，
+     * 建议同步更新此方法，确保文件缺失时服务质量不降级过多。
+     *
+     * @return 兜底同义词词典
+     */
     private Map<String, List<String>> getFallbackSynonyms() {
         Map<String, List<String>> fallback = new HashMap<>();
         fallback.put("换工作", Arrays.asList("职业转换", "跳槽", "转行"));
@@ -331,6 +552,13 @@ public class QueryRewriteConfigLoader {
         return fallback;
     }
 
+    /**
+     * 固定映射兜底数据
+     *
+     * <p>当 fixed-mapping.json 文件缺失或解析失败且内存中无旧数据时使用。</p>
+     *
+     * @return 兜底固定映射（from → to）
+     */
     private Map<String, String> getFallbackFixedMapping() {
         Map<String, String> fallback = new HashMap<>();
         fallback.put("专升本", "专升本 3500词");
@@ -339,6 +567,14 @@ public class QueryRewriteConfigLoader {
         return fallback;
     }
 
+    /**
+     * 固定映射置信度兜底数据
+     *
+     * <p>与 {@link #getFallbackFixedMapping()} 配套使用，为每条兜底映射指定置信度。
+     * key 必须与固定映射的 from 字段一一对应。</p>
+     *
+     * @return 兜底置信度映射（from → confidence）
+     */
     private Map<String, Double> getFallbackFixedMappingConfidence() {
         Map<String, Double> fallback = new HashMap<>();
         fallback.put("专升本", 0.95);
@@ -347,6 +583,14 @@ public class QueryRewriteConfigLoader {
         return fallback;
     }
 
+    /**
+     * 停用词兜底数据
+     *
+     * <p>当 stopwords.json 文件缺失或解析失败且内存中无旧数据时使用。
+     * 包含最基础的中英文停用词，确保分词过滤功能不中断。</p>
+     *
+     * @return 兜底停用词集合
+     */
     private Set<String> getFallbackStopWords() {
         return new HashSet<>(Arrays.asList("的", "了", "在", "是", "我", "有", "和", "就",
                 "the", "a", "an", "is", "are", "was", "were"));
@@ -356,8 +600,28 @@ public class QueryRewriteConfigLoader {
 
     /**
      * 获取 classpath 文件的最后修改时间
-     * 注意：如果文件在 jar 包内，无法获取修改时间，返回 0（此时热加载不会触发）
-     * 生产环境建议将配置文件放在外部目录，而不是打包在 jar 内
+     *
+     * <h3>工作原理</h3>
+     * 通过 {@link ClassLoader#getResource(String)} 获取文件 URL，判断协议类型：
+     * <ul>
+     *   <li><b>file:// 协议</b>：文件在文件系统上，可读取 {@link Files#getLastModifiedTime(Path)}</li>
+     *   <li><b>jar:// 协议</b>：文件在 JAR 包内，无法获取修改时间，返回 0</li>
+     * </ul>
+     *
+     * <h3>返回值含义</h3>
+     * <ul>
+     *   <li>返回 &gt; 0：文件在文件系统上，返回值为 Unix 毫秒时间戳</li>
+     *   <li>返回 0：文件在 JAR 包内或文件不存在，无法检测修改</li>
+     * </ul>
+     * 返回 0 时，{@link #scheduledReload()} 中的 mtime 比较（{@code > lastXxxModify}）不会触发，
+     * 因此 JAR 包内的配置文件不支持热加载。
+     *
+     * <h3>生产环境建议</h3>
+     * 将配置文件放在 JAR 外部目录（如 {@code /etc/app/query-rewrite/}），
+     * 通过 Spring 的 {@code spring.config.additional-location} 或修改 classpath 使其被加载。
+     *
+     * @param classpath classpath 下的文件路径
+     * @return 文件修改时间的毫秒时间戳，无法获取时返回 0
      */
     private long getFileModifyTime(String classpath) {
         try {
@@ -373,7 +637,16 @@ public class QueryRewriteConfigLoader {
     }
 
     /**
-     * 固定映射加载结果（包含映射关系和置信度）
+     * 固定映射加载结果
+     *
+     * <p>封装一次文件解析产生的两个关联数据结构，避免通过多个返回值或输出参数传递。</p>
+     *
+     * <h3>字段</h3>
+     * <ul>
+     *   <li><b>mapping</b>：原始词 → 目标词（from → to）</li>
+     *   <li><b>confidence</b>：原始词 → 置信度（from → confidence）</li>
+     * </ul>
+     * 两个 Map 的 key 集合始终一致（同一组 from 值）。
      */
     private static class FixedMappingResult {
         final Map<String, String> mapping;

@@ -94,6 +94,10 @@ public class DocumentService {
     @Value("${file.upload.root:./uploads}")
     private String uploadRootPath;
 
+    /** 文件上传大小上限（MB），默认 500MB，超过此限制直接拒绝 */
+    @Value("${document.upload.max-size-mb:500}")
+    private long maxUploadSizeMb;
+
     // ======================== 文档上传 ========================
 
     /**
@@ -146,10 +150,19 @@ public class DocumentService {
             }
             log.info("开始处理文档: {}, 分类: {}", originalFilename, category);
 
-            // ===== 步骤1：字节哈希去重 =====
-            // 对整个文件字节流计算 SHA-256，快速判定是否完全相同的文件
-            // 注意：这会将文件字节全部读入内存，大文件可能 OOM
-            String byteHash = DigestUtils.sha256Hex(file.getBytes());
+            // ===== 步骤0：文件大小校验 =====
+            // 前置检查，超过上限直接拒绝，避免大文件撑爆内存和磁盘
+            long fileSize = file.getSize();
+            long maxBytes = maxUploadSizeMb * 1024 * 1024;
+            if (fileSize > maxBytes) {
+                throw new BusinessException(ResultCode.BAD_REQUEST,
+                        String.format("文件大小超过上传上限（%dMB），当前文件: %.1fMB",
+                                maxUploadSizeMb, fileSize / (1024.0 * 1024.0)));
+            }
+
+            // ===== 步骤1：流式 SHA-256 去重 =====
+            // 使用 InputStream 流式计算哈希，避免 file.getBytes() 将整个文件加载到内存
+            String byteHash = DigestUtils.sha256Hex(file.getInputStream());
             if (documentHashService.exists(byteHash)) {
                 return 0L;  // 重复文件，返回 0L 表示跳过
             }

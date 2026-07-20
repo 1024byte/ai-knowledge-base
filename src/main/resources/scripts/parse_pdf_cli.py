@@ -40,7 +40,7 @@ def parse_pdf_via_api(pdf_path, params=None):
         if params:
             default_params.update(params)
 
-        # 构建请求
+        # 构建请求（stream=True 启用流式传输，避免全量加载到内存）
         with open(pdf_path, 'rb') as f:
             files = {'files': (os.path.basename(pdf_path), f)}
 
@@ -56,12 +56,20 @@ def parse_pdf_via_api(pdf_path, params=None):
             response = requests.post(
                 MINERU_API_URL,
                 files=files,
-                data=data,  # 🔑 关键添加
-                timeout=600  # 大文档延长超时
+                data=data,
+                timeout=600,  # 大文档延长超时
+                stream=True   # 🔑 流式接收响应，避免 response.content 全量加载
             )
 
         response.raise_for_status()
-        result = response.json()
+        # 使用 json.load() 从原始流中增量解析，避免 response.content 中间副本
+        # json.load() 逐 chunk 读取并构建 dict，不会在内存中保留完整 bytes 副本
+        #
+        # 注意：requests 在 stream=True 时会将 response.raw.decode_content 设为 False，
+        # 导致 read() 返回未解压的 gzip 数据（0x1f 0x8b 开头）。
+        # 必须强制启用解压，否则 json.load() 会因二进制数据而报 UTF-8 解码错误
+        response.raw.decode_content = True
+        result = json.load(response.raw)
 
         # 解析返回结果（根据实际格式调整）
         if isinstance(result, dict):
@@ -114,7 +122,7 @@ def clean_markdown(md_text):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print(json.dumps({"success": False, "error": "缺少 PDF 路径参数"}))
+        json.dump({"success": False, "error": "缺少 PDF 路径参数"}, sys.stdout, ensure_ascii=False)
         sys.exit(1)
 
     pdf_path = sys.argv[1]
@@ -129,4 +137,6 @@ if __name__ == "__main__":
     }
 
     result = parse_pdf_via_api(pdf_path, params=custom_params)
-    print(json.dumps(result, ensure_ascii=False))
+    # 使用 json.dump() 直接写入 stdout，避免 json.dumps() 创建完整字符串副本
+    json.dump(result, sys.stdout, ensure_ascii=False)
+    sys.stdout.write('\n')

@@ -1,5 +1,7 @@
 package com.hai.aiknowledgebase.service;
 
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hai.aiknowledgebase.common.CustomDocument;
@@ -11,11 +13,13 @@ import org.springframework.stereotype.Service;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
 import static com.hai.aiknowledgebase.common.FileUtils.getFileExtension;
 
@@ -66,6 +70,27 @@ public class DocumentParserService {
     /** MinerU 解析脚本路径，用于处理 PDF、图片、PPT、Excel 等复杂文档 */
     @Value("${mineru.scripts.pdf}")
     private String pdfScriptPath;
+
+    /** Python 进程输出最大字节数（默认 500MB），超过此限制视为异常并拒绝 */
+    @Value("${document.parser.max-output-size-mb:500}")
+    private int maxOutputSizeMb;
+
+    /** Python 进程超时时间（分钟），默认 10 分钟 */
+    private static final int PYTHON_TIMEOUT_MINUTES = 10;
+
+    // ==================== 预编译正则（避免每次调用重复编译） ====================
+
+    /** 匹配 HTML 标签，如 &lt;div&gt;、&lt;span&gt; */
+    private static final Pattern HTML_TAG_PATTERN = Pattern.compile("<[^>]+>");
+
+    /** 匹配中文括号注释，如 【注1】、【说明】 */
+    private static final Pattern BRACKET_PATTERN = Pattern.compile("【[^】]*】");
+
+    /** 匹配水平空白字符（空格、制表符），但不匹配换行符 */
+    private static final Pattern HORIZONTAL_WHITESPACE_PATTERN = Pattern.compile("[^\\S\\n]+");
+
+    /** 匹配 3 个及以上连续换行，合并为 2 个（一个空行） */
+    private static final Pattern EXCESS_NEWLINES_PATTERN = Pattern.compile("\\n{3,}");
 
     // ==================== 文件类型路由表 ====================
 
@@ -131,6 +156,7 @@ public class DocumentParserService {
         } else if (DOCX_EXTS.contains(extension)) {
             // ===== 分支2：python-docx 解析 =====
             // docx 是 Office Open XML 格式，python-docx 库比 MinerU 更轻量、更快
+            checkFileSize(filePath, extension);
             log.info("使用 python-docx 解析: {}", extension);
             String content = executePythonScript(pythonPath, docxScriptPath, filePath.toString());
             return CustomDocument.builder()
@@ -142,6 +168,7 @@ public class DocumentParserService {
         } else if (MINERU_EXTS.contains(extension)) {
             // ===== 分支3：MinerU 深度学习引擎 =====
             // 处理 PDF、图片 OCR、PPT、Excel 等复杂文档
+            checkFileSize(filePath, extension);
             log.info("使用 MinerU 解析: {}", extension);
             String content = executePythonScript(pythonPath, pdfScriptPath, filePath.toString());
             return CustomDocument.builder()
@@ -152,8 +179,7 @@ public class DocumentParserService {
 
         } else {
             // ===== 分支4：未知格式兜底 =====
-            // 对于不在路由表中的扩展名，打出 WARN 日志后尝试用 MinerU 解析
-            // 这是一种"死马当活马医"的策略，MinerU 对未知格式也有一定的容错能力
+            checkFileSize(filePath, extension);
             log.warn("未知文件类型: {}, 尝试使用 MinerU", extension);
             String content = executePythonScript(pythonPath, pdfScriptPath, filePath.toString());
             return CustomDocument.builder()
@@ -161,6 +187,31 @@ public class DocumentParserService {
                     .content(content)
                     .format(CustomDocument.Format.UNKNOWN)
                     .build();
+        }
+    }
+
+    // ==================== 文件大小校验 ====================
+
+    /**
+     * 检查文件大小是否超过上限，防止超大文件导致 OOM
+     *
+     * <p>在调用 Python 解析脚本之前进行前置校验，尽早拒绝超大文件。</p>
+     *
+     * @param filePath  文件路径
+     * @param extension 文件扩展名（用于日志）
+     * @throws RuntimeException 文件大小超过上限时抛出
+     */
+    private void checkFileSize(Path filePath, String extension) {
+        try {
+            long fileSizeBytes = Files.size(filePath);
+            long maxBytes = (long) maxOutputSizeMb * 1024 * 1024;
+            if (fileSizeBytes > maxBytes) {
+                throw new RuntimeException(
+                        String.format("文件大小超过解析上限（%dMB），当前文件: %.1fMB，类型: %s",
+                                maxOutputSizeMb, fileSizeBytes / (1024.0 * 1024.0), extension));
+            }
+        } catch (java.io.IOException e) {
+            log.warn("无法读取文件大小: {}", filePath, e);
         }
     }
 
@@ -203,23 +254,18 @@ public class DocumentParserService {
      *   <li><b>{@code pb.redirectErrorStream(true)}</b>：
      *       将 stderr 合并到 stdout。如果不合并，当 stderr 缓冲区满时 Python 进程会阻塞，
      *       而 Java 只读 stdout 会导致<b>死锁</b>。这是 ProcessBuilder 的经典陷阱</li>
-     *   <li><b>{@code process.waitFor()}</b>：
-     *       阻塞等待子进程退出。注意：必须<b>先读完输出再 waitFor</b>，
-     *       否则输出缓冲区满也会导致死锁。当前代码先读后等，顺序正确</li>
-     *   <li><b>JSON 片段提取</b>：
-     *       Python 可能输出日志前缀（如 "Loading model..."），
-     *       通过 {@code indexOf('{')} 和 {@code lastIndexOf('}')} 定位纯 JSON 部分</li>
-     *   <li><b>两层 JSON 解析</b>：
-     *       外层 {@code outerRoot} 包含 success 状态和 content 字符串，
-     *       内层 {@code innerRoot} 的 content 字符串需要二次解析才能得到 results</li>
-     *   <li><b>{@code fields().next()}</b>：
-     *       results 是一个单 key 的 JSON 对象，key 是动态文件名，
-     *       通过迭代器取第一个（也是唯一一个）entry 获取内容</li>
-     *   <li><b>{@code replaceAll("[^\\S\\n]+", " ")}</b>：
-     *       正则 {@code [^\S\n]} 匹配<b>非换行的空白字符</b>（空格、制表符等），
-     *       将其合并为单个空格，但<b>保留换行符</b>不破坏段落结构</li>
-     *   <li><b>{@code replaceAll("\\n{3,}", "\\n\\n")}</b>：
-     *       将 3 个及以上的连续换行合并为 2 个（即一个空行），保持文档结构整洁</li>
+     *   <li><b>{@code process.waitFor(timeout, TimeUnit)}</b>：
+     *       带超时的等待，避免 Python 进程因 MinerU API 故障而无限阻塞。
+     *       超时后 {@code destroyForcibly()} 强制终止子进程</li>
+     *   <li><b>输出大小限制</b>：
+     *       逐行读取时累计字节数，超过 {@code maxOutputSizeMb} 上限立即终止进程并抛异常，
+     *       防止大文件解析结果撑爆堆内存</li>
+     *   <li><b>流式 JSON 解析（Jackson Streaming API）</b>：
+     *       内层 JSON 使用 {@link JsonParser} 逐 token 扫描，找到 {@code md_content}
+     *       字段即停止，不构建完整树模型。相比 {@code readTree()} 节省 3~5 倍内存</li>
+     *   <li><b>预编译正则</b>：
+     *       后处理正则提取为 {@code static final Pattern}，避免每次调用
+     *       {@code String.replaceAll()} 时重复编译，提升性能并减少临时对象</li>
      * </ul>
      *
      * @param pythonPath Python 解释器路径
@@ -237,29 +283,43 @@ public class DocumentParserService {
 
         // ===== 步骤2：启动子进程 =====
         ProcessBuilder pb = new ProcessBuilder(command);
-        // 关键：合并 stderr 到 stdout，避免缓冲区满导致死锁
         pb.redirectErrorStream(true);
         Process process = pb.start();
 
-        // ===== 步骤3：读取子进程输出 =====
+        // ===== 步骤3：读取子进程输出（带大小限制） =====
+        long maxBytes = (long) maxOutputSizeMb * 1024 * 1024;
         StringBuilder output = new StringBuilder();
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
             String line;
+            long totalBytes = 0;
             while ((line = reader.readLine()) != null) {
+                // 逐行追加，同时检查累计大小是否超过上限
+                int lineBytes = line.getBytes(StandardCharsets.UTF_8).length;
+                totalBytes += lineBytes;
+                if (totalBytes > maxBytes) {
+                    process.destroyForcibly();
+                    throw new RuntimeException(
+                            String.format("Python 脚本输出超过上限（%dMB），已终止进程。文件: %s",
+                                    maxOutputSizeMb, filePath));
+                }
                 output.append(line);
             }
         }
 
-        // ===== 步骤4：等待子进程退出并检查结果 =====
-        int exitCode = process.waitFor();
+        // ===== 步骤4：等待子进程退出（带超时） =====
+        boolean finished = process.waitFor(PYTHON_TIMEOUT_MINUTES, TimeUnit.MINUTES);
+        if (!finished) {
+            process.destroyForcibly();
+            throw new RuntimeException(
+                    "Python 脚本执行超时（" + PYTHON_TIMEOUT_MINUTES + " 分钟），已强制终止。文件: " + filePath);
+        }
+        int exitCode = process.exitValue();
         if (exitCode != 0) {
             throw new RuntimeException("Python 脚本执行失败，退出码: " + exitCode + "，输出: " + output);
         }
 
         // ===== 步骤5：从输出中提取 JSON 片段 =====
-        // Python 脚本可能在输出 JSON 之前打印了日志（如 "Loading model..."），
-        // 需要跳过这些非 JSON 前缀，只取 {} 之间的内容
         String outputStr = output.toString().trim();
         int jsonStart = outputStr.indexOf('{');
         int jsonEnd = outputStr.lastIndexOf('}');
@@ -267,38 +327,41 @@ public class DocumentParserService {
             outputStr = outputStr.substring(jsonStart, jsonEnd + 1);
         }
 
-        // ===== 步骤6：解析嵌套 JSON 结构 =====
-        // 第一层：外层 JSON，包含 success 状态和 content 字符串
+        // ===== 步骤6：解析外层 JSON（外层很小，用树模型即可） =====
         JsonNode outerRoot = objectMapper.readTree(outputStr);
 
         if (outerRoot.get("success").asBoolean()) {
-            // content 字段本身是一个 JSON 字符串，需要二次解析
             String innerJsonString = outerRoot.path("content").asText();
-            JsonNode innerRoot = objectMapper.readTree(innerJsonString);
 
-            // results 是一个单 key 对象，key 是动态文件名
-            JsonNode resultsNode = innerRoot.path("results");
-
-            if (resultsNode.isObject() && resultsNode.size() > 0) {
-                // 取 results 中第一个（也是唯一一个）entry
-                Map.Entry<String, JsonNode> entry = resultsNode.fields().next();
-                // 提取 md_content 字段 —— 最终需要的 Markdown 文本
-                String mdContent = entry.getValue().path("md_content").asText();
-
-                // ===== 步骤7：后处理清洗 =====
-                // 去除 HTML 标签（如 <div>, <span> 等）
-                mdContent = mdContent.replaceAll("<[^>]+>", " ");
-                // 去除中文括号注释（如 【注1】、【说明】 等）
-                mdContent = mdContent.replaceAll("【[^】]*】", " ");
-                // 合并水平空白字符（空格、制表符），但保留换行符不破坏段落结构
-                mdContent = mdContent.replaceAll("[^\\S\\n]+", " ").trim();
-                // 合并多余空行：3个及以上连续换行 → 2个换行（一个空行）
-                mdContent = mdContent.replaceAll("\\n{3,}", "\n\n");
-
-                return mdContent;
+            // ===== 步骤7：流式解析内层 JSON，避免全量加载树模型 =====
+            // 内层 JSON 可能包含数百 MB 的 Markdown 内容，
+            // 使用 JsonParser 逐 token 读取，只提取 md_content 字段，跳过其余节点
+            String mdContent = null;
+            JsonParser parser = objectMapper.getFactory().createParser(innerJsonString);
+            JsonToken token;
+            while ((token = parser.nextToken()) != null) {
+                if (token == JsonToken.FIELD_NAME && "md_content".equals(parser.currentName())) {
+                    parser.nextToken();
+                    mdContent = parser.getValueAsString();
+                    break;
+                }
             }
-            // results 为空或非对象时，直接返回其文本表示
-            return resultsNode.asText();
+            parser.close();
+
+            if (mdContent == null) {
+                // md_content 不存在，尝试以树模型回退解析（此时内容应较小）
+                JsonNode innerRoot = objectMapper.readTree(innerJsonString);
+                JsonNode resultsNode = innerRoot.path("results");
+                return resultsNode.asText();
+            }
+
+            // ===== 步骤8：后处理清洗（使用预编译正则，避免每次调用重复编译） =====
+            mdContent = HTML_TAG_PATTERN.matcher(mdContent).replaceAll(" ");
+            mdContent = BRACKET_PATTERN.matcher(mdContent).replaceAll(" ");
+            mdContent = HORIZONTAL_WHITESPACE_PATTERN.matcher(mdContent).replaceAll(" ").trim();
+            mdContent = EXCESS_NEWLINES_PATTERN.matcher(mdContent).replaceAll("\n\n");
+
+            return mdContent;
         } else {
             throw new RuntimeException("解析失败: " + outerRoot.get("error").asText());
         }

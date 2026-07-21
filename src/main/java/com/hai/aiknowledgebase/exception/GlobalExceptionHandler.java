@@ -18,6 +18,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.multipart.MultipartException;
 import org.springframework.web.servlet.NoHandlerFoundException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.stream.Collectors;
 
@@ -102,6 +103,20 @@ public class GlobalExceptionHandler {
     @ResponseStatus(HttpStatus.NOT_FOUND)
     public Result<Void> handleNoHandlerFoundException(NoHandlerFoundException e) {
         log.warn("请求路径不存在: {}", e.getRequestURL());
+        return Result.error(ResultCode.NOT_FOUND);
+    }
+
+    /**
+     * 处理静态资源未找到异常（如浏览器自动请求 sw.js、favicon.ico 等）
+     * <p>
+     * 与 {@link NoHandlerFoundException} 不同，此异常由 {@code ResourceHttpRequestHandler}
+     * 抛出，表示请求匹配到了静态资源处理器但实际文件不存在。
+     * 这是浏览器自动行为，属于正常现象，不需要记录 ERROR 日志。
+     */
+    @ExceptionHandler(NoResourceFoundException.class)
+    @ResponseStatus(HttpStatus.NOT_FOUND)
+    public Result<Void> handleNoResourceFoundException(NoResourceFoundException e) {
+        log.debug("静态资源不存在: {}", e.getResourcePath());
         return Result.error(ResultCode.NOT_FOUND);
     }
 

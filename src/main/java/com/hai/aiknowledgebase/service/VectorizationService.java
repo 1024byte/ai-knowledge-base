@@ -99,6 +99,9 @@ public class VectorizationService {
     /** 混合检索服务：提供 BM25 关键词索引，向量化时同步建立关键词索引 */
     private final HybridSearchService hybridSearchService;
 
+    /** SSE 状态推送服务：向量化完成后向前端实时推送状态 */
+    private final DocumentStatusSseService documentStatusSseService;
+
     // ======================== 异步向量化主流程 ========================
 
     /**
@@ -204,6 +207,10 @@ public class VectorizationService {
                     .set(DocumentMetadata::getStatus, "active");
             documentMetadataMapper.update(null, wrapper);
 
+            // ===== 步骤7.1：SSE 推送状态变更 =====
+            // 通知前端文档处理完成，前端可据此刷新列表或停止轮询
+            documentStatusSseService.pushStatus(docId, "active", null, segments.size());
+
             // ===== 步骤8：保存文件哈希（用于去重） =====
             // 8.1 字节级哈希：检测完全相同的文件（即使是相同内容的 PDF 和 Word 文件，字节级哈希也不同）
             try (InputStream is = Files.newInputStream(filePath)) {
@@ -227,6 +234,8 @@ public class VectorizationService {
             log.error("异步向量化失败: docId={}", docId, e);
             // 更新文档状态为 failed，并记录错误信息（独立事务，不受外层事务影响）
             updateDocumentStatus(docId, "failed", e.getMessage());
+            // SSE 推送失败状态，通知前端处理异常
+            documentStatusSseService.pushStatus(docId, "failed", e.getMessage(), 0);
         }
     }
 

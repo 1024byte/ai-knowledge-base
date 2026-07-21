@@ -8,6 +8,7 @@ import com.hai.aiknowledgebase.dto.DocumentUploadResponse;
 import com.hai.aiknowledgebase.entity.DocumentMetadata;
 import com.hai.aiknowledgebase.exception.BusinessException;
 import com.hai.aiknowledgebase.service.DocumentService;
+import com.hai.aiknowledgebase.service.DocumentStatusSseService;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -17,6 +18,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -27,6 +29,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 @Slf4j
 @RestController
@@ -35,6 +38,7 @@ import java.util.List;
 public class DocumentController {
 
     private final DocumentService documentService;
+    private final DocumentStatusSseService documentStatusSseService;
 
     /**
      * 上传文档
@@ -55,7 +59,7 @@ public class DocumentController {
         if (metaId == 0L){
             throw new BusinessException(500, "文档元数据已存在");
         }
-        return Result.success(new DocumentUploadResponse(filename, metaId, "文档上传成功"));
+        return Result.success(new DocumentUploadResponse(filename, metaId, "文档上传成功，正在异步处理中..."));
     }
 
     /**
@@ -268,5 +272,104 @@ public class DocumentController {
                 || ext.endsWith(".bmp");
     }
 
+    // ==================== SSE 实时推送 + 状态查询 ====================
+
+    /**
+     * <h3>订阅文档处理状态（SSE 实时推送）</h3>
+     *
+     * <p>前端在上传文件后调用此接口建立 SSE 长连接，服务端在异步向量化完成后
+     * 自动推送最终状态，无需前端轮询。</p>
+     *
+     * <h4>前端使用示例（JavaScript）</h4>
+     * <pre>{@code
+     * const eventSource = new EventSource('/api/documents/sse?docId=42');
+     *
+     * eventSource.addEventListener('connected', (e) => {
+     *     console.log('SSE 已连接:', JSON.parse(e.data));
+     * });
+     *
+     * eventSource.addEventListener('status', (e) => {
+     *     const data = JSON.parse(e.data);
+     *     if (data.status === 'active') {
+     *         console.log('文档处理完成，切片数:', data.chunkCount);
+     *         // 刷新文档列表
+     *     } else if (data.status === 'failed') {
+     *         console.error('文档处理失败:', data.errorMessage);
+     *         // 提示用户
+     *     }
+     *     eventSource.close();
+     * });
+     *
+     * eventSource.onerror = () => {
+     *     console.warn('SSE 连接中断，降级为轮询');
+     *     eventSource.close();
+     *     startPolling(42); // 启动轮询兜底
+     * };
+     * }</pre>
+     *
+     * <h4>降级策略</h4>
+     * <p>如果 SSE 连接失败（如代理服务器不支持），前端应自动降级为轮询
+     * {@code GET /api/documents/{id}/status}。</p>
+     *
+     * @param docId 文档 ID
+     * @return SseEmitter 实例
+     */
+    @GetMapping(value = "/sse", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter subscribeStatus(@RequestParam Long docId) {
+        log.info("SSE 订阅文档状态: docId={}", docId);
+        return documentStatusSseService.subscribe(docId);
+    }
+
+    /**
+     * <h3>查询单个文档的处理状态（轮询降级）</h3>
+     *
+     * <p>当 SSE 不可用时，前端可定期调用此接口查询文档处理进度。</p>
+     *
+     * <h4>返回示例</h4>
+     * <pre>{@code
+     * {
+     *   "code": 200,
+     *   "data": {
+     *     "id": 42,
+     *     "filename": "章程.pdf",
+     *     "status": "active",
+     *     "errorMessage": null,
+     *     "chunkCount": 15
+     *   }
+     * }
+     * }</pre>
+     *
+     * @param id 文档 ID
+     * @return 文档状态信息
+     */
+    @GetMapping("/{id}/status")
+    public Result<DocumentInfo> getDocumentStatus(@PathVariable Long id) {
+        log.info("查询文档状态: id={}", id);
+
+        if (id == null || id <= 0) {
+            throw new BusinessException(400, "文档ID无效");
+        }
+
+        DocumentMetadata metadata = documentService.getDocumentFileInfo(id);
+        // 查询 chunk 数量
+        Map<String, Integer> chunkCountMap = documentService.getChunkCountMap();
+        int chunkCount = chunkCountMap.getOrDefault(metadata.getFileName(), 0);
+
+        DocumentInfo info = new DocumentInfo(
+                metadata.getId(),
+                metadata.getFileName(),
+                metadata.getFileSize(),
+                metadata.getFileType(),
+                metadata.getUploadTime()
+                        .atZone(java.time.ZoneId.systemDefault())
+                        .toInstant()
+                        .toEpochMilli(),
+                chunkCount,
+                metadata.getStatus(),
+                metadata.getErrorMessage()
+        );
+
+        return Result.success(info);
+    }
 
 }

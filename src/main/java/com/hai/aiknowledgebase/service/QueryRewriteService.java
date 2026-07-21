@@ -52,7 +52,7 @@ import java.util.stream.Collectors;
  * <ul>
  *   <li>{@link QueryRewriteConfigLoader}：词典配置加载器（同义词、固定映射、停用词）</li>
  *   <li>{@link ChineseTokenizerService}：中文分词服务</li>
- *   <li>{@link QueryIntentClassifier}：查询意图分类器</li>
+ *   <li>{@link IntentRecognitionOrchestrator}：意图识别编排器（规则引擎 + LLM 策略链）</li>
  *   <li>{@link QueryCorrector}：查询纠错服务</li>
  *   <li>{@link LocalQueryRewriter}：L3 LLM 改写器（可选注入）</li>
  * </ul>
@@ -74,8 +74,8 @@ public class QueryRewriteService{
     /** 中文分词服务：用于查询分词和关键词提取 */
     private final ChineseTokenizerService tokenizerService;
 
-    /** 查询意图分类器：识别 FACTUAL / PROCEDURAL / COMPARISON / DEFINITIONAL / AMBIGUOUS */
-    private final QueryIntentClassifier intentClassifier;
+    /** 意图识别编排器：策略链（规则引擎 → LLM），输出意图 + 置信度 + 改写提示 */
+    private final IntentRecognitionOrchestrator orchestrator;
 
     /** 查询纠错服务：基于编辑距离的拼写纠错 */
     private final QueryCorrector queryCorrector;
@@ -512,7 +512,7 @@ public class QueryRewriteService{
      * <ol>
      *   <li><b>查询纠错</b>：调用 {@link QueryCorrector#correct(String)} 对 L1 结果进行拼写纠错</li>
      *   <li><b>中文分词</b>：调用 {@link ChineseTokenizerService#tokenize(String, boolean)} 全模式分词</li>
-     *   <li><b>意图识别</b>：调用 {@link QueryIntentClassifier#classify(String)} 识别查询意图</li>
+     *   <li><b>意图识别</b>：调用 {@link IntentRecognitionOrchestrator#recognize(String)} 识别查询意图</li>
      *   <li><b>关键词提取</b>：调用 {@link ChineseTokenizerService#extractKeywords(String, int)} 提取 Top-5 关键词</li>
      *   <li><b>合并扩展关键词</b>：继承 L1 扩展关键词，合并 L2 提取的关键词，去重</li>
      *   <li><b>同义词扩展</b>：对每个分词 token 查找同义词词典，追加同义词</li>
@@ -532,9 +532,10 @@ public class QueryRewriteService{
         // 2. 中文分词
         List<String> tokens = tokenizerService.tokenize(correctedQuery, true);
 
-        // 3. 意图识别
-        QueryIntent intent = intentClassifier.classify(correctedQuery);
-        log.debug("L2 意图识别结果: {} | 分词: {}", intent, tokens);
+        // 3. 意图识别（策略链：规则引擎 → LLM 兜底）
+        IntentResult intentResult = orchestrator.recognize(correctedQuery);
+        QueryIntent intent = intentResult.primaryIntent();
+        log.debug("L2 意图识别结果: {} (置信度: {}) | 分词: {}", intent, intentResult.confidence(), tokens);
 
         // 4. 关键词提取（基于分词结果）
         List<String> keywords = tokenizerService.extractKeywords(correctedQuery, 5);
@@ -552,6 +553,16 @@ public class QueryRewriteService{
 
         // 7. 按意图选择改写策略
         RewriteStrategy strategy = selectStrategy(intent, correctedQuery, keywords, synonymExpanded);
+
+        // 7.5 合并 LLM 改写提示词到扩展关键词（提升检索召回率）
+        if (intentResult.rewriteHints() != null && !intentResult.rewriteHints().isEmpty()) {
+            strategy.expandKeywords.addAll(intentResult.rewriteHints());
+            // 去重：改写提示词可能与既有扩展词重复（final 字段不能重新赋值，用 clear + addAll 原地去重）
+            List<String> deduped = strategy.expandKeywords.stream().distinct().collect(Collectors.toList());
+            strategy.expandKeywords.clear();
+            strategy.expandKeywords.addAll(deduped);
+            log.debug("L2 合并 LLM 改写提示词: {}", intentResult.rewriteHints());
+        }
 
         // 8. 继承 L1 排除词
         List<String> excludeKeywords = new ArrayList<>();

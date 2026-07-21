@@ -207,7 +207,7 @@ public class DocumentService {
             metadata.setCategory(normalizedCategory);
             metadata.setFileSize(file.getSize());
             metadata.setFileType(getFileExtension(originalFilename));
-            metadata.setStatus("active");
+            metadata.setStatus("processing");
             // MyBatis-Plus 插入后自动回填主键 ID
             documentMetadataMapper.insert(metadata);
             Long docId = metadata.getId();
@@ -342,10 +342,10 @@ public class DocumentService {
                 throw new BusinessException(ResultCode.BAD_REQUEST, "分类名称不能为空");
             }
 
-            // 校验1：数据库层面——该分类下是否有活跃文档
+            // 校验1：数据库层面——该分类下是否有活跃或处理中的文档
             LambdaQueryWrapper<DocumentMetadata> docWrapper = new LambdaQueryWrapper<>();
             docWrapper.eq(DocumentMetadata::getCategory, categoryName)
-                    .eq(DocumentMetadata::getStatus, "active");
+                    .in(DocumentMetadata::getStatus, "active", "processing");
             Long docCount = documentMetadataMapper.selectCount(docWrapper);
             if (docCount != null && docCount > 0) {
                 throw new BusinessException(ResultCode.CATEGORY_NOT_EMPTY);
@@ -406,17 +406,18 @@ public class DocumentService {
     }
 
     /**
-     * <h3>检查某个分类下是否还有活跃文件</h3>
+     * <h3>检查某个分类下是否还有非失败状态的文档</h3>
      *
-     * <p>用于删除分类前的安全校验，以及删除文档后判断是否需要自动清理空分类。</p>
+     * <p>用于删除分类前的安全校验，以及删除文档后判断是否需要自动清理空分类。
+     * 同时检查 processing 和 active 状态的文档，避免在异步处理中误删分类。</p>
      *
      * @param category 分类名称
-     * @return true 有活跃文件，false 无活跃文件
+     * @return true 有活跃/处理中文档，false 无
      */
     private boolean hasFilesInCategory(String category) {
         LambdaQueryWrapper<DocumentMetadata> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(DocumentMetadata::getCategory, category)
-                .eq(DocumentMetadata::getStatus, "active");
+                .in(DocumentMetadata::getStatus, "active", "processing");
         return documentMetadataMapper.selectCount(wrapper) > 0;
     }
 
@@ -455,20 +456,26 @@ public class DocumentService {
     /**
      * <h3>查询所有上传的历史文档列表</h3>
      *
-     * <p>仅返回 status = "active" 的文档，按上传时间降序排列。</p>
+     * <p>返回所有状态的文档，按上传时间降序排列。前端可通过 status 字段区分处理状态。</p>
+     *
+     * <h4>状态说明</h4>
+     * <ul>
+     *   <li><b>processing</b>：异步向量化处理中，暂不可检索</li>
+     *   <li><b>active</b>：处理完成，可正常检索</li>
+     *   <li><b>failed</b>：处理失败，需查看 errorMessage</li>
+     * </ul>
      *
      * <h4>附加信息</h4>
      * <p>每个文档会附带其在 PGVector 中的 chunk 数量，
      * 通过 {@link #getChunkCountMap} 从 PGVector 的 embeddings 表中查询。</p>
      *
-     * @return 文档信息列表（含 chunk 数量）
+     * @return 文档信息列表（含 chunk 数量和处理状态）
      */
     public List<DocumentInfo> listDocuments() {
         log.info("查询历史文档列表");
 
         LambdaQueryWrapper<DocumentMetadata> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(DocumentMetadata::getStatus, "active")
-                .orderByDesc(DocumentMetadata::getUploadTime);
+        wrapper.orderByDesc(DocumentMetadata::getUploadTime);
         List<DocumentMetadata> list = documentMetadataMapper.selectList(wrapper);
 
         if (list.isEmpty()) {
@@ -479,11 +486,12 @@ public class DocumentService {
         // 批量查询每个文档的 chunk 数量
         Map<String, Integer> chunkCountMap = getChunkCountMap();
 
-        // 转换为 DTO，附加 chunk 数量
+        // 转换为 DTO，附加 chunk 数量、状态、错误信息
         return list.stream().map(metadata -> {
             int chunkCount = chunkCountMap.getOrDefault(
                     metadata.getFileName(), 0);
             return new DocumentInfo(
+                    metadata.getId(),
                     metadata.getFileName(),
                     metadata.getFileSize(),
                     metadata.getFileType(),
@@ -492,7 +500,9 @@ public class DocumentService {
                             .atZone(ZoneId.systemDefault())
                             .toInstant()
                             .toEpochMilli(),
-                    chunkCount
+                    chunkCount,
+                    metadata.getStatus(),
+                    metadata.getErrorMessage()
             );
         }).collect(Collectors.toList());
     }
@@ -513,7 +523,7 @@ public class DocumentService {
      *
      * @return source → chunkCount 的映射
      */
-    private Map<String, Integer> getChunkCountMap() {
+    public Map<String, Integer> getChunkCountMap() {
         try {
             // PostgreSQL JSON 操作符：->> 返回文本值，-> 返回 JSON 对象
             String sql = String.format(

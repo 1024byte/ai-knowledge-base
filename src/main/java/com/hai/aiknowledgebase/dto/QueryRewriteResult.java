@@ -40,6 +40,12 @@ public class QueryRewriteResult {
     /** 是否触发漂移校验拦截 */
     private boolean driftBlocked;
 
+    /** 命中的改写策略（路由分类结果） */
+    private RewriteStrategyEnum strategy;
+
+    /** 检索质量评分（0.0-1.0），仅检索后回填，默认 -1 表示未评估 */
+    private double retrievalQuality;
+
     /** LLM 消耗的 Token 数（仅 L3 路径有值，用于埋点） */
     private Integer tokenUsage;
 

@@ -56,19 +56,19 @@ public class RuleIntentClassifier implements IntentClassifier {
     // ==================== 意图关键词定义 ====================
 
     private static final Set<String> DEFINITIONAL_KEYWORDS = Set.of(
-            "什么是", "定义", "含义", "意思", "是什么", "指的是", "概念", "解释"
+            "什么是", "定义", "含义", "指的是", "概念"
     );
 
     private static final Set<String> PROCEDURAL_KEYWORDS = Set.of(
-            "如何", "怎么", "怎样", "步骤", "方法", "操作", "教程", "怎么做", "如何做", "怎么办"
+            "如何", "怎么", "怎样", "步骤", "教程", "怎么做", "如何做", "怎么办"
     );
 
     private static final Set<String> COMPARISON_KEYWORDS = Set.of(
-            "区别", "对比", "不同", "差异", "vs", "VS", "和", "与", "相比", "比较"
+            "区别", "对比", "差异", "vs", "VS", "和", "与", "相比"
     );
 
     private static final Set<String> FACTUAL_KEYWORDS = Set.of(
-            "多少", "几个", "是否", "能不能", "可以", "有多少", "几", "多久", "什么时候"
+            "多少", "几个", "是否", "能不能", "有多少", "多久", "什么时候"
     );
 
     private static final Set<String> AMBIGUOUS_PRONOUNS = Set.of(

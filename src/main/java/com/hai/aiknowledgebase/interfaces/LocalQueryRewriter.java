@@ -1,6 +1,7 @@
 package com.hai.aiknowledgebase.interfaces;
 
 import com.hai.aiknowledgebase.dto.QueryRewriteResult;
+import com.hai.aiknowledgebase.dto.RewriteRequest;
 
 /**
  * L3 大模型查询改写器接口
@@ -11,8 +12,9 @@ public interface LocalQueryRewriter {
 
     /**
      * 执行基于大模型的查询改写
-     * @param originalQuery 原始用户查询
+     *
+     * @param request 改写请求，包含原始查询、截断后的对话历史和路由决策
      * @return 改写结果（含改写后的文本和扩展关键词）
      */
-    QueryRewriteResult rewrite(String originalQuery);
+    QueryRewriteResult rewrite(RewriteRequest request);
 }

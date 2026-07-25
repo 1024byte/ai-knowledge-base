@@ -1,6 +1,7 @@
 package com.hai.aiknowledgebase.service;
 
 import com.hai.aiknowledgebase.dto.SearchResult;
+import com.hai.aiknowledgebase.queryrewrite.QueryRewriteService;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
@@ -24,17 +25,15 @@ import java.util.stream.Collectors;
  *
  * <p>核心职责：编排多策略检索流程，将检索到的文档片段构建为上下文，调用 LLM 生成最终答案。</p>
  *
- * <h3>检索流程（四阶段级联）</h3>
+ * <h3>检索流程（三阶段级联）</h3>
  * <pre>
  * 用户查询 "配置向量数据库"
  *     │
  *     ├── 阶段1：混合检索（向量 + BM25）── 主检索路径，取语义和关键词之长
  *     │
- *     ├── 阶段2：扩展关键词辅助检索 ── 对每个扩展词独立做向量检索，去重追加
+ *     ├── 阶段2：文件名过滤检索 ── 检测查询中的文件名，在指定文件范围内检索
  *     │
- *     ├── 阶段3：文件名过滤检索 ── 检测查询中的文件名，在指定文件范围内检索
- *     │
- *     └── 阶段4：排除关键词过滤 ── 剔除包含排除词的片段（如 "不要XX"）
+ *     └── 阶段3：排除关键词过滤 ── 剔除包含排除词的片段（如 "不要XX"）
  *     │
  *     └──→ 最终去重结果集
  * </pre>
@@ -72,6 +71,9 @@ public class RAGSearchService {
     /** 文件名过滤模式下的检索返回数量（扩大范围以提高命中率） */
     private static final int MAX_RESULTS_WHEN_FILTERED = 20;
 
+    /** 向量检索最低余弦相似度阈值，低于此值的片段视为无关结果（0.6 分仍无关则需 &gt; 0.6） */
+    private static final double MIN_VECTOR_SCORE = 0.65;
+
     // ==================== 核心检索方法 ====================
 
     /**
@@ -88,33 +90,25 @@ public class RAGSearchService {
     }
 
     /**
-     * <h3>检索文档片段（完整版）—— 四阶段级联检索</h3>
+     * <h3>检索文档片段（完整版）—— 三阶段级联检索</h3>
      *
-     * <p>这是 RAG 检索的核心编排方法，按以下四个阶段依次执行：</p>
+     * <p>这是 RAG 检索的核心编排方法，按以下三个阶段依次执行：</p>
      *
      * <h4>阶段1：混合检索（主路径）</h4>
      * <p>调用 {@link HybridSearchService#hybridSearch} 并行执行向量检索和 BM25 关键词检索，
-     * 使用 RRF 算法融合排序。这是整个检索流程的基石，提供了语义相关性和关键词精确性的双重要求。</p>
+     * 使用 RRF 算法融合排序。这是整个检索流程的基石。</p>
      *
-     * <h4>阶段2：扩展关键词辅助检索</h4>
-     * <p>对每个扩展关键词（来自 QueryRewriteService 的 L1 同义词扩展 / L2 意图扩展），
-     * 独立执行一次向量检索，将结果去重后追加到结果集中。</p>
-     * <p>为什么用向量检索而不是混合检索？扩展词通常较短，BM25 效果有限，向量检索的语义泛化能力更强。</p>
-     * <p>检索数量 = max(topK/2, 3)，保证每个扩展词至少取 3 个结果，但不超过 topK 的一半。</p>
-     *
-     * <h4>阶段3：文件名过滤检索</h4>
+     * <h4>阶段2：文件名过滤检索</h4>
      * <p>检测用户查询中是否包含文件名（如 "章程.pdf"），如果包含，则在指定文件的范围内
-     * 进行向量检索。这对于用户明确指定查看某个文档的场景非常有效。</p>
-     * <p>降级机制：如果带扩展名过滤无结果，自动尝试去除扩展名（如 "章程"）重试。</p>
+     * 进行向量检索。降级机制：带扩展名无结果时自动去除扩展名重试。</p>
      *
-     * <h4>阶段4：排除关键词过滤</h4>
-     * <p>遍历所有结果片段，如果片段文本中包含排除关键词（如用户说 "不包含XX"），
-     * 则将该片段从结果集中移除。这是对检索结果的二次过滤，确保不返回用户明确不要的内容。</p>
+     * <h4>阶段3：排除关键词过滤</h4>
+     * <p>遍历所有结果片段，剔除包含排除关键词的片段，确保不返回用户明确不要的内容。</p>
      *
-     * @param userQuery       用户原始查询
+     * @param userQuery       用户原始查询（经查询改写后的 rewrittenQuery）
      * @param topK            返回结果数量上限
-     * @param expandKeywords  扩展关键词列表（来自查询改写服务）
-     * @param excludeKeywords 排除关键词列表（来自查询改写服务）
+     * @param expandKeywords  扩展关键词（已废弃，由阶段1混合检索的BM25覆盖）
+     * @param excludeKeywords 排除关键词列表
      * @return 去重、过滤后的文档片段列表
      */
     public List<TextSegment> retrieveSegments(String userQuery, int topK,
@@ -125,32 +119,13 @@ public class RAGSearchService {
 
         // ===== 阶段1：混合检索（主路径）=====
         // 并行执行向量检索 + BM25 关键词检索，RRF 融合排序
-        List<TextSegment> allResults = new ArrayList<>(hybridSearchService.hybridSearch(userQuery, topK));
+        // minVectorScore 过滤掉余弦相似度低于阈值的向量结果，避免无关片段进入融合
+
+        List<TextSegment> allResults = new ArrayList<>(hybridSearchService.hybridSearch(userQuery, topK,MIN_VECTOR_SCORE));
+
         log.info("混合检索召回 {} 个片段", allResults.size());
 
-        // ===== 阶段2：扩展关键词辅助检索 =====
-        if (expandKeywords != null && !expandKeywords.isEmpty()) {
-            for (String keyword : expandKeywords) {
-                // 跳过与原始查询完全相同的扩展词，避免重复检索
-                if (keyword.equals(userQuery)) continue;
-
-                // 对每个扩展词独立执行向量检索
-                // 检索数量 = max(topK/2, 3)，保证至少取 3 个结果
-                List<TextSegment> expanded = hybridSearchService.vectorSearch(
-                        keyword, Math.max(topK / 2, 3));
-
-                // 去重：基于文本内容完全匹配，避免同一片段被重复添加
-                for (TextSegment seg : expanded) {
-                    if (allResults.stream().noneMatch(
-                            existing -> existing.text().equals(seg.text()))) {
-                        allResults.add(seg);
-                    }
-                }
-            }
-            log.info("扩展关键词检索后总片段数: {}", allResults.size());
-        }
-
-        // ===== 阶段3：文件名过滤检索 =====
+        // ===== 阶段2：文件名过滤检索 =====
         // 检测用户查询中是否包含文件名（如 "章程.pdf"、"打开文档里的内容"）
         String fileNameKeyword = extractFileName(userQuery);
         if (fileNameKeyword != null) {
@@ -189,7 +164,7 @@ public class RAGSearchService {
             }
         }
 
-        // ===== 阶段4：排除关键词过滤 =====
+        // ===== 阶段3：排除关键词过滤 =====
         // 遍历结果集，剔除包含排除关键词的片段
         if (excludeKeywords != null && !excludeKeywords.isEmpty()) {
             int beforeFilter = allResults.size();

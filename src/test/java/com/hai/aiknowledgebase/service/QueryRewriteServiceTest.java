@@ -2,6 +2,8 @@ package com.hai.aiknowledgebase.service;
 
 import com.hai.aiknowledgebase.dto.*;
 import com.hai.aiknowledgebase.interfaces.LocalQueryRewriter;
+import com.hai.aiknowledgebase.queryrewrite.QueryCorrector;
+import com.hai.aiknowledgebase.queryrewrite.QueryRewriteService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -409,7 +411,7 @@ class QueryRewriteServiceTest {
                     .path(RewritePath.L3_CONTEXT_COMPLETION)
                     .build();
 
-            when(llmRewriter.rewrite(anyString())).thenReturn(l3Result);
+            when(llmRewriter.rewrite(any(RewriteRequest.class))).thenReturn(l3Result);
 
             RewriteRequest request = RewriteRequest.builder()
                     .query("数据库连接")
@@ -429,7 +431,7 @@ class QueryRewriteServiceTest {
             // 提高 L2 阈值使 L2 不满足，才会触发 L3 调用
             ReflectionTestUtils.setField(queryRewriteService, "l2ConfidenceThreshold", 0.90);
 
-            when(llmRewriter.rewrite(anyString())).thenThrow(new RuntimeException("LLM 服务不可用"));
+            when(llmRewriter.rewrite(any(RewriteRequest.class))).thenThrow(new RuntimeException("LLM 服务不可用"));
 
             RewriteRequest request = RewriteRequest.builder()
                     .query("数据库连接")
@@ -458,7 +460,7 @@ class QueryRewriteServiceTest {
                     .path(RewritePath.NONE)
                     .build();
 
-            when(llmRewriter.rewrite(anyString())).thenReturn(l3Result);
+            when(llmRewriter.rewrite(any(RewriteRequest.class))).thenReturn(l3Result);
 
             RewriteRequest request = RewriteRequest.builder()
                     .query("数据库连接")

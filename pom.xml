@@ -158,6 +158,20 @@
             <version>1.0.2</version>
         </dependency>
 
+        <!-- word-checker 中英文拼写检测（L1 纠错层） -->
+        <dependency>
+            <groupId>com.github.houbb</groupId>
+            <artifactId>word-checker</artifactId>
+            <version>1.2.0</version>
+        </dependency>
+
+        <!-- pinyin4j 拼音转换（L2 纠错层：同音字匹配） -->
+        <dependency>
+            <groupId>com.belerweb</groupId>
+            <artifactId>pinyin4j</artifactId>
+            <version>2.5.1</version>
+        </dependency>
+
 
     </dependencies>
 

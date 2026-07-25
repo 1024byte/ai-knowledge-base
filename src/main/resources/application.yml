@@ -65,8 +65,26 @@ query-rewrite:
   l2:
     confidence-threshold: 0.70       # L2 置信度高于此值直接返回
 
+# 三层漏斗纠错配置
+corrector:
+  l1:
+    threshold: 0.85                  # L1 word-checker 置信度阈值
+    timeout-ms: 50                   # L1 超时时间（毫秒）
+  l2:
+    threshold: 0.80                  # L2 拼音匹配 置信度阈值
+    timeout-ms: 200                  # L2 超时时间（毫秒）
+  l3:
+    timeout-ms: 2000                 # L3 LLM 超时时间（毫秒）
+
 # 混合检索配置（并行双路召回 + RRF 融合）
 hybrid-search:
   enabled: true                      # 总开关：true=向量+关键词双路召回，false=仅向量检索
   rrf:
     k: 60                            # RRF 常数 k，值越大排名差异越平滑（推荐 60）
+
+# Chat Prompt Token 预算控制
+chat:
+  prompt:
+    max-context-tokens: 3000         # 检索上下文最大 token 数，超出按片段截断
+    max-history-tokens: 1500         # 历史对话最大 token 数，超出从最早的消息开始丢弃
+    max-assistant-history-chars: 100  # 历史中 assistant 消息截断字符数（用于 LLM 输入和改写）

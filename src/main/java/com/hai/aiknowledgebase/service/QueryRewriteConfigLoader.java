@@ -2,6 +2,7 @@ package com.hai.aiknowledgebase.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hai.aiknowledgebase.queryrewrite.QueryRewriteService;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -150,6 +151,32 @@ public class QueryRewriteConfigLoader {
      */
     public Set<String> getStopWords() {
         return Collections.unmodifiableSet(stopWords.get());
+    }
+
+    /**
+     * 获取所有词典 key（合并同义词词典 key/value + 固定映射 key）
+     *
+     * <p>供纠错模块使用，返回所有已知的合法词汇。纠错时如果 token 不在该集合中，
+     * 则判定为疑似错别字并尝试纠正。</p>
+     *
+     * @return 所有词典 key 的集合（不可修改），永不返回 null
+     */
+    public Set<String> getAllDictionaryKeys() {
+        Set<String> keys = new java.util.LinkedHashSet<>();
+        Map<String, java.util.List<String>> synDict = synonymDict.get();
+        if (synDict != null) {
+            keys.addAll(synDict.keySet());
+            for (java.util.List<String> values : synDict.values()) {
+                if (values != null) {
+                    keys.addAll(values);
+                }
+            }
+        }
+        Map<String, String> fixed = fixedMapping.get();
+        if (fixed != null) {
+            keys.addAll(fixed.keySet());
+        }
+        return Collections.unmodifiableSet(keys);
     }
 
     /**

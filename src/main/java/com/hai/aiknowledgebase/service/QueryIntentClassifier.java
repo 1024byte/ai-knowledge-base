@@ -2,6 +2,7 @@ package com.hai.aiknowledgebase.service;
 
 import com.hai.aiknowledgebase.dto.IntentResult;
 import com.hai.aiknowledgebase.dto.QueryIntent;
+import com.hai.aiknowledgebase.queryrewrite.QueryRewriteService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;

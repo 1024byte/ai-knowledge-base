@@ -12,7 +12,7 @@ import lombok.NoArgsConstructor;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class ChatMessage {
+public class CustomChatMessage {
 
     /** 角色：user / assistant */
     private String role;

@@ -252,31 +252,44 @@ public class HybridSearchService {
      * @return 融合排序后的 TextSegment 列表（按 RRF 分数降序）
      */
     public List<TextSegment> hybridSearch(String query, int topK) {
+        return hybridSearch(query, topK, 0.0);
+    }
+
+    /**
+     * <h3>混合检索（带向量相关性阈值）</h3>
+     *
+     * <p>与 {@link #hybridSearch(String, int)} 相同，但在 RRF 融合前过滤低质量向量结果，
+     * 避免无关查询中低分向量片段通过 BM25 关键词匹配被带入最终结果。</p>
+     *
+     * @param query          用户查询文本
+     * @param topK           返回结果数量上限
+     * @param minVectorScore 向量路径最低余弦相似度阈值（0.0~1.0）
+     * @return 按 RRF 融合分数降序排列的 TextSegment 列表
+     */
+    public List<TextSegment> hybridSearch(String query, int topK, double minVectorScore) {
         // 降级判断：如果混合检索关闭或关键词索引为空，直接走纯向量检索
         if (!hybridEnabled || keywordIndex.size() == 0) {
             log.info("混合检索已关闭或关键词索引为空，降级为纯向量检索");
-            return vectorSearch(query, topK);
+            return vectorSearch(query, topK, minVectorScore);
         }
 
         // 并行发起两路检索：向量路径 + 关键词路径
-        // CompletableFuture.supplyAsync 使用默认的 ForkJoinPool.commonPool()
-        // 两路检索互不阻塞，充分利用 CPU 和 IO 资源
         CompletableFuture<List<RankedResult>> vectorFuture =
                 CompletableFuture.supplyAsync(() -> vectorSearchRanked(query, topK));
         CompletableFuture<List<RankedResult>> keywordFuture =
                 CompletableFuture.supplyAsync(() -> keywordSearchRanked(query, topK));
 
-        // join() 阻塞等待两路结果全部返回
-        List<RankedResult> vectorResults = vectorFuture.join();
+        List<RankedResult> vectorResults = vectorFuture.join().stream()
+                .filter(r -> r.getScore() >= minVectorScore)
+                .collect(Collectors.toList());
         List<RankedResult> keywordResults = keywordFuture.join();
 
-        log.info("双路检索完成: 向量结果={}, 关键词结果={}", vectorResults.size(), keywordResults.size());
+        log.info("双路检索完成: 向量结果={} (过滤后), 关键词结果={}", vectorResults.size(), keywordResults.size());
 
-        // RRF 融合排序：将两路结果的排名按 RRF 公式加权合并
+        // RRF 融合排序
         List<RankedResult> fused = reciprocalRankFusion(vectorResults, keywordResults, topK);
         log.info("RRF 融合结果数量: {}", fused.size());
 
-        // 提取 TextSegment 返回
         return fused.stream()
                 .map(RankedResult::getSegment)
                 .collect(Collectors.toList());
@@ -300,7 +313,23 @@ public class HybridSearchService {
      * @return 按余弦相似度降序排列的 TextSegment 列表
      */
     public List<TextSegment> vectorSearch(String query, int topK) {
+        return vectorSearch(query, topK, 0.0);
+    }
+
+    /**
+     * <h3>纯向量检索（带相关性阈值）</h3>
+     *
+     * <p>与 {@link #vectorSearch(String, int)} 相同，但增加余弦相似度阈值过滤，
+     * 仅返回分数 &ge; minScore 的结果，避免无关查询返回低质量片段。</p>
+     *
+     * @param query    用户查询文本
+     * @param topK     返回结果数量上限
+     * @param minScore 最低余弦相似度阈值（0.0~1.0），低于此值的片段将被过滤
+     * @return 按余弦相似度降序排列的 TextSegment 列表
+     */
+    public List<TextSegment> vectorSearch(String query, int topK, double minScore) {
         return vectorSearchRanked(query, topK).stream()
+                .filter(r -> r.getScore() >= minScore)
                 .map(RankedResult::getSegment)
                 .collect(Collectors.toList());
     }

@@ -1,6 +1,8 @@
 package com.hai.aiknowledgebase.service;
 
 import com.hai.aiknowledgebase.dto.QueryIntent;
+import com.hai.aiknowledgebase.queryrewrite.QueryCorrector;
+import com.hai.aiknowledgebase.queryrewrite.corrector.FunnelQueryCorrector;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -115,11 +117,14 @@ class L2NlpServicesTest {
         @Mock
         private ChineseTokenizerService tokenizerService;
 
+        @Mock
+        IntentRecognitionOrchestrator intentRecognitionOrchestrator;
+
         @BeforeEach
         void setUp() {
             // 默认返回足够多的关键词，避免被判定为 AMBIGUOUS
             lenient().when(tokenizerService.tokenize(anyString())).thenReturn(List.of("配置", "API", "接口"));
-            classifier = new QueryIntentClassifier(tokenizerService);
+            classifier = new QueryIntentClassifier(tokenizerService,intentRecognitionOrchestrator);
         }
 
         @Test
@@ -216,6 +221,9 @@ class L2NlpServicesTest {
         @Mock
         private ChineseTokenizerService tokenizerService;
 
+        @Mock
+        FunnelQueryCorrector funnelQueryCorrector;
+
         @BeforeEach
         void setUp() {
             Map<String, List<String>> synonymDict = new HashMap<>();
@@ -239,7 +247,7 @@ class L2NlpServicesTest {
                 return tokens;
             });
 
-            corrector = new QueryCorrector(configLoader, tokenizerService);
+            corrector = new QueryCorrector(funnelQueryCorrector);
         }
 
         @Test

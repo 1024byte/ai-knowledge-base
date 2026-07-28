@@ -73,13 +73,14 @@ public class KeywordsUtils {
      * <h3>匹配模式</h3>
      * 使用 {@link #EXCLUDE_PATTERN} 正则匹配"不包含/除了/不要/排除/不含"后的内容。
      * 匹配到后按分隔符（顿号、逗号、"和"、"&"、空格）分割，再按助词
-     * （"的"、"了吗"、"呢"、"吧"等）二次分割，取每个片段的首个有效词。
+     * （"的"、"了吗"、"呢"、"吧"等）二次分割，只取助词前的首个有效词作为排除词。
      *
      * <h3>示例</h3>
      * <ul>
-     *   <li>"不包含糖的饮料" → 提取 "糖"（"的"后的"饮料"被过滤）</li>
+     *   <li>"不包含糖的饮料" → 提取 "糖"（"的"后的"饮料"是限定对象，不排除）</li>
      *   <li>"除了苹果、香蕉和橘子" → 提取 "苹果", "香蕉", "橘子"</li>
      *   <li>"不要Java和Python" → 提取 "Java", "Python"</li>
+     *   <li>"排除咖啡的替代品" → 提取 "咖啡"（"替代品"是用户要找的，不排除）</li>
      * </ul>
      *
      * @param text 查询文本
@@ -92,10 +93,11 @@ public class KeywordsUtils {
             String group = matcher.group(1);
             String[] parts = group.split("[、，,和&\\s]+");
             for (String part : parts) {
-                // 按助词分割，取第一个片段作为排除词（如 "糖的饮料" → "糖"）
+                // 按助词分割，只取第一个片段作为排除词（如 "糖的饮料" → "糖"）
+                // "的"后面的内容通常是限定对象，不应作为排除词
                 String[] subParts = EXCLUDE_PARTICLE_SPLIT.split(part.trim());
-                for (String subPart : subParts) {
-                    String trimmed = subPart.trim();
+                if (subParts.length > 0) {
+                    String trimmed = subParts[0].trim();
                     if (!trimmed.isEmpty() && trimmed.length() >= 2) {
                         excludeKeywords.add(trimmed);
                     }

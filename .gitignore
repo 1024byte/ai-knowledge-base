@@ -40,5 +40,7 @@ application-local.yml
 
 
 *.onnx
-src/main/resources/onnx_model/
+models/
+models/bge-reranker-v2-m3/
+models/onnx_model/
 /.trae/skills/design-interface.md

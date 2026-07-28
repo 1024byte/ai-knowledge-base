@@ -136,7 +136,11 @@ public class ChineseTokenizerService {
     }
 
     /**
-     * 提取 Top-N 关键词（基于 TF-IDF 思路，结合词频和词长加权）
+     * 提取 Top-N 关键词（基于 TF-IDF 思路，结合词频、词长和位置加权）
+     *
+     * <p>排序公式：score = 词频 × (1 + 词长 × 0.3) × (1 + 位置权重 × 0.5)</p>
+     * <p>位置权重：词在分词序列中越靠后权重越高（查询尾部通常是用户关注重点），
+     * 当词频全为 1 时避免仅靠词长排序导致靠后的关键词被截掉。</p>
      *
      * @param text 待提取文本
      * @param topN 返回前 N 个关键词
@@ -154,12 +158,28 @@ public class ChineseTokenizerService {
             freq.put(token, freq.getOrDefault(token, 0) + 1);
         }
 
-        // 加权排序：词频 * 词长权重（长词权重更高）
+        // 记录每个词最后出现的位置（归一化到 [0, 1]，靠后 = 值越大）
+        Map<String, Double> lastPos = new HashMap<>();
+        for (int i = 0; i < tokens.size(); i++) {
+            lastPos.put(tokens.get(i), (double) i / Math.max(tokens.size() - 1, 1));
+        }
+
+        // 加权排序：词频 * 词长权重 * 位置权重；score 相同时后出现的词优先
         return freq.entrySet().stream()
                 .sorted((e1, e2) -> {
-                    double score1 = e1.getValue() * (1 + e1.getKey().length() * 0.3);
-                    double score2 = e2.getValue() * (1 + e2.getKey().length() * 0.3);
-                    return Double.compare(score2, score1);
+                    double posW1 = 1.0 + lastPos.getOrDefault(e1.getKey(), 0.0) * 0.5;
+                    double posW2 = 1.0 + lastPos.getOrDefault(e2.getKey(), 0.0) * 0.5;
+                    double score1 = e1.getValue() * (1 + e1.getKey().length() * 0.3) * posW1;
+                    double score2 = e2.getValue() * (1 + e2.getKey().length() * 0.3) * posW2;
+                    int cmp = Double.compare(score2, score1);
+                    if (cmp == 0) {
+                        // score 相同时，后出现的词优先
+                        return Double.compare(
+                                lastPos.getOrDefault(e2.getKey(), 0.0),
+                                lastPos.getOrDefault(e1.getKey(), 0.0)
+                        );
+                    }
+                    return cmp;
                 })
                 .limit(topN)
                 .map(Map.Entry::getKey)

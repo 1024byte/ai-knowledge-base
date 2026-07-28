@@ -9,15 +9,11 @@ import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingStore;
-import dev.langchain4j.store.embedding.filter.Filter;
-import dev.langchain4j.store.embedding.filter.comparison.ContainsString;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.regex.Pattern;
+import java.util.*;
 import java.util.stream.Collectors;
 
 /**
@@ -25,27 +21,28 @@ import java.util.stream.Collectors;
  *
  * <p>核心职责：编排多策略检索流程，将检索到的文档片段构建为上下文，调用 LLM 生成最终答案。</p>
  *
- * <h3>检索流程（三阶段级联）</h3>
+ * <h3>检索流程（四阶段级联）</h3>
  * <pre>
  * 用户查询 "配置向量数据库"
  *     │
  *     ├── 阶段1：混合检索（向量 + BM25）── 主检索路径，取语义和关键词之长
  *     │
- *     ├── 阶段2：文件名过滤检索 ── 检测查询中的文件名，在指定文件范围内检索
+ *     ├── 阶段2：排除关键词过滤 ── 剔除包含排除词的片段（如 "不要XX"）
  *     │
- *     └── 阶段3：排除关键词过滤 ── 剔除包含排除词的片段（如 "不要XX"）
+ *     ├── 阶段3：Cross-Encoder Rerank 精排 ── 对候选片段精排，提升 Top-K 精度
  *     │
- *     └──→ 最终去重结果集
+ *     └──→ 最终按分数降序重排序
  * </pre>
  *
  * <h3>关键设计</h3>
  * <ul>
- *   <li><b>去重策略</b>：基于文本内容完全匹配（{@code text.equals()}），确保同一片段不会被重复返回</li>
- *   <li><b>文件名提取</b>：三层正则匹配（精确扩展名 → 动作模式 → 位置模式），覆盖多种表达方式</li>
- *   <li><b>降级机制</b>：带扩展名过滤失败时，自动尝试去除扩展名重试</li>
+ *   <li><b>混合检索</b>：向量语义检索 + BM25 关键词检索，RRF 融合排序</li>
+ *   <li><b>Rerank 精排</b>：Cross-Encoder (BGE-Reranker-v2-m3) 对 (query, doc) 联合编码</li>
+ *   <li><b>降级机制</b>：Reranker 不可用时跳过精排，排除词过滤全部剔除时保留原始结果</li>
  * </ul>
  *
  * @see HybridSearchService 混合检索服务（向量 + BM25）
+ * @see RerankerService Cross-Encoder Rerank 精排服务
  * @see QueryRewriteService 查询改写服务（提供扩展词和排除词）
  */
 @Slf4j
@@ -65,6 +62,12 @@ public class RAGSearchService {
     /** 混合检索服务，并行执行向量检索和 BM25 关键词检索 */
     private final HybridSearchService hybridSearchService;
 
+    /** 中文分词服务，用于排除关键词的词级精确匹配（避免子串误杀） */
+    private final ChineseTokenizerService tokenizerService;
+
+    /** Cross-Encoder Rerank 服务，对检索结果精排 */
+    private final RerankerService rerankerService;
+
     /** 默认检索返回数量（无过滤时） */
     private static final int DEFAULT_MAX_RESULTS = 5;
 
@@ -72,46 +75,46 @@ public class RAGSearchService {
     private static final int MAX_RESULTS_WHEN_FILTERED = 20;
 
     /** 向量检索最低余弦相似度阈值，低于此值的片段视为无关结果（0.6 分仍无关则需 &gt; 0.6） */
-    private static final double MIN_VECTOR_SCORE = 0.65;
+    private static final double MIN_VECTOR_SCORE = 0.3;
 
     // ==================== 核心检索方法 ====================
 
     /**
      * <h3>检索文档片段（简化版）</h3>
      *
-     * <p>不传入扩展词和排除词，仅执行混合检索 + 文件名过滤检索。</p>
+     * <p>不传入扩展词和排除词，仅执行混合检索 + Rerank 精排。</p>
      *
      * @param userQuery 用户原始查询
      * @param topK      返回结果数量上限
      * @return 检索到的文档片段列表
      */
-    public List<TextSegment> retrieveSegments(String userQuery, int topK) {
+    public List<HybridSearchService.RankedResult> retrieveSegments(String userQuery, int topK) {
         return retrieveSegments(userQuery, topK, null, null);
     }
 
     /**
-     * <h3>检索文档片段（完整版）—— 三阶段级联检索</h3>
+     * <h3>检索文档片段（三阶段级联 + 分数重排序）</h3>
      *
-     * <p>这是 RAG 检索的核心编排方法，按以下三个阶段依次执行：</p>
+     * <h4>阶段1：混合检索</h4>
+     * <p>并行执行向量语义检索和 BM25 关键词检索，RRF 融合排序，返回带分数结果。</p>
      *
-     * <h4>阶段1：混合检索（主路径）</h4>
-     * <p>调用 {@link HybridSearchService#hybridSearch} 并行执行向量检索和 BM25 关键词检索，
-     * 使用 RRF 算法融合排序。这是整个检索流程的基石。</p>
-     *
-     * <h4>阶段2：文件名过滤检索</h4>
-     * <p>检测用户查询中是否包含文件名（如 "章程.pdf"），如果包含，则在指定文件的范围内
-     * 进行向量检索。降级机制：带扩展名无结果时自动去除扩展名重试。</p>
-     *
-     * <h4>阶段3：排除关键词过滤</h4>
+     * <h4>阶段2：排除关键词过滤</h4>
      * <p>遍历所有结果片段，剔除包含排除关键词的片段，确保不返回用户明确不要的内容。</p>
+     *
+     * <h4>阶段3：Cross-Encoder Rerank 精排</h4>
+     * <p>使用 BGE-Reranker-v2-m3 对候选片段进行 Cross-Encoder 精排，
+     * 将 (query, doc) 联合编码，捕捉 Bi-Encoder 无法建模的词间交互，显著提升 Top-K 精度。</p>
+     *
+     * <h4>最终重排序</h4>
+     * <p>所有阶段的结果合并后，按分数降序统一重排序，确保最相关的片段排在前面。</p>
      *
      * @param userQuery       用户原始查询（经查询改写后的 rewrittenQuery）
      * @param topK            返回结果数量上限
      * @param expandKeywords  扩展关键词（已废弃，由阶段1混合检索的BM25覆盖）
      * @param excludeKeywords 排除关键词列表
-     * @return 去重、过滤后的文档片段列表
+     * @return 按分数降序排列的带分数文档片段列表
      */
-    public List<TextSegment> retrieveSegments(String userQuery, int topK,
+    public List<HybridSearchService.RankedResult> retrieveSegments(String userQuery, int topK,
                                               List<String> expandKeywords,
                                               List<String> excludeKeywords) {
         log.info("开始检索，用户查询: {} | 扩展词: {} | 排除词: {}",
@@ -121,72 +124,82 @@ public class RAGSearchService {
         // 并行执行向量检索 + BM25 关键词检索，RRF 融合排序
         // minVectorScore 过滤掉余弦相似度低于阈值的向量结果，避免无关片段进入融合
 
-        List<TextSegment> allResults = new ArrayList<>(hybridSearchService.hybridSearch(userQuery, topK,MIN_VECTOR_SCORE));
+        List<HybridSearchService.RankedResult> allResults = new ArrayList<>(
+                hybridSearchService.hybridSearchRanked(userQuery, 10, MIN_VECTOR_SCORE));
 
         log.info("混合检索召回 {} 个片段", allResults.size());
 
-        // ===== 阶段2：文件名过滤检索 =====
-        // 检测用户查询中是否包含文件名（如 "章程.pdf"、"打开文档里的内容"）
-        String fileNameKeyword = extractFileName(userQuery);
-        if (fileNameKeyword != null) {
-            log.info("检测到文件名关键词: {}，执行辅助过滤检索", fileNameKeyword);
-
-            // 从原始查询中移除文件名，提取纯内容查询
-            String contentQuery = extractContentQuery(userQuery, fileNameKeyword);
-
-            // 在指定文件范围内进行向量检索
-            List<TextSegment> filtered = searchWithFileNameFilter(
-                    fileNameKeyword, contentQuery, userQuery, MAX_RESULTS_WHEN_FILTERED);
-
-            // 去重追加
-            for (TextSegment seg : filtered) {
-                if (allResults.stream().noneMatch(
-                        existing -> existing.text().equals(seg.text()))) {
-                    allResults.add(seg);
-                }
-            }
-
-            // 降级机制：如果带扩展名过滤无结果，尝试去除扩展名重试
-            // 例如：用户输入 "章程.pdf"，但数据库中 source 字段存的是 "章程"
-            if (filtered.isEmpty()) {
-                String noExt = removeExtension(fileNameKeyword);
-                if (!noExt.equals(fileNameKeyword)) {
-                    log.info("尝试不带扩展名检索: {}", noExt);
-                    List<TextSegment> retry = searchWithFileNameFilter(
-                            noExt, contentQuery, userQuery, MAX_RESULTS_WHEN_FILTERED);
-                    for (TextSegment seg : retry) {
-                        if (allResults.stream().noneMatch(
-                                existing -> existing.text().equals(seg.text()))) {
-                            allResults.add(seg);
-                        }
-                    }
-                }
-            }
-        }
-
-        // ===== 阶段3：排除关键词过滤 =====
-        // 遍历结果集，剔除包含排除关键词的片段
+        // ===== 阶段2：排除关键词过滤 =====
+        // 对片段分词后精确匹配排除词（避免子串误杀，如排除"Java"误杀"JavaScript"）
         if (excludeKeywords != null && !excludeKeywords.isEmpty()) {
             int beforeFilter = allResults.size();
-            allResults = allResults.stream()
-                    .filter(seg -> {
-                        String text = seg.text();
-                        // 如果片段文本中包含任一排除关键词，则过滤掉
+            List<HybridSearchService.RankedResult> filtered = allResults.stream()
+                    .filter(rr -> {
+                        String text = rr.getSegment().text();
+                        // 对片段文本分词，构建词集合用于精确匹配
+                        List<String> segTokens = tokenizerService.tokenize(text, true);
+                        Set<String> tokenSet = new HashSet<>(segTokens);
+                        // 如果任一排除词作为独立词出现在片段中，则过滤掉
                         for (String exclude : excludeKeywords) {
-                            if (text.contains(exclude)) {
+                            if (tokenSet.contains(exclude)) {
                                 return false;
                             }
                         }
                         return true;
                     })
                     .collect(Collectors.toList());
+
+            // 降级：过滤后结果为空，保留原始结果并记录警告
+            if (filtered.isEmpty() && beforeFilter > 0) {
+                log.warn("排除关键词过滤导致所有片段被剔除({} -> 0)，降级保留原始结果", beforeFilter);
+            } else {
+                allResults = filtered;
+            }
             log.info("排除关键词过滤: {} -> {} 个片段", beforeFilter, allResults.size());
         }
+
+        // ===== 阶段3：Cross-Encoder Rerank 精排 =====
+        // 使用 BGE-Reranker-v2-m3 对候选片段进行 Cross-Encoder 精排
+        // Cross-Encoder 将 (query, doc) 联合编码，捕捉 Bi-Encoder 无法建模的词间交互
+        if (rerankerService.isAvailable() && !allResults.isEmpty()) {
+            log.info("开始 Rerank 精排，候选片段数: {}", allResults.size());
+
+            List<String> docTexts = allResults.stream()
+                    .map(r -> r.getSegment().text())
+                    .collect(Collectors.toList());
+
+            List<RerankerService.RerankResult> rerankResults =
+                    rerankerService.rerank(userQuery, docTexts, allResults.size());
+
+            // 按 Rerank 分数重建结果列表
+            List<HybridSearchService.RankedResult> reranked = new ArrayList<>();
+            for (RerankerService.RerankResult rr : rerankResults) {
+                HybridSearchService.RankedResult original = allResults.get(rr.getIndex());
+                // 用 Rerank 分数替换原始分数
+                reranked.add(new HybridSearchService.RankedResult(original.getSegment(), rr.getScore()));
+            }
+            allResults = reranked;
+
+            log.info("Rerank 精排完成，Top-3 分数: {}",
+                    allResults.stream().limit(3)
+                            .map(r -> String.format("%.4f", r.getScore()))
+                            .collect(Collectors.joining(", ")));
+        } else if (rerankerService.isEnabled() && !rerankerService.isAvailable()) {
+            log.info("Reranker 已启用但未初始化，跳过精排");
+        }
+
+        // ===== 最终重排序：按分数降序统一排序 =====
+        // 阶段1(RRF分数) + 阶段2(向量相似度) 的结果混合后，按分数统一重排序
+        // 确保最相关的片段排在前面，缓解 LLM "lost in the middle" 问题
+        allResults.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
+        log.info("分数重排序完成，Top-3 分数: {}",
+                allResults.stream().limit(3)
+                        .map(r -> String.format("%.4f", r.getScore()))
+                        .collect(Collectors.joining(", ")));
 
         log.info("最终返回 {} 个片段", allResults.size());
         return allResults;
     }
-
     // ==================== 底层检索方法 ====================
 
     /**
@@ -221,184 +234,6 @@ public class RAGSearchService {
         return embeddingStore.search(request).matches().stream()
                 .map(EmbeddingMatch::embedded)
                 .collect(Collectors.toList());
-    }
-
-    /**
-     * <h3>带文件名过滤的向量检索</h3>
-     *
-     * <p>在向量检索的基础上，增加 source 字段的过滤条件，仅检索指定文件范围内的文档片段。</p>
-     *
-     * <h4>关键代码解释</h4>
-     * <ul>
-     *   <li><b>ContainsString("source", fileNameKeyword)</b>：
-     *       LangChain4j 的元数据过滤器，表示 source 字段必须包含 fileNameKeyword。
-     *       PGVector 底层会将其转换为 SQL WHERE 条件：{@code metadata->>'source' LIKE '%keyword%'}</li>
-     *   <li><b>searchQuery 的选择逻辑</b>：
-     *       如果移除文件名后仍有内容查询（如 "打开章程.pdf 里的配置说明" → "配置说明"），
-     *       则使用内容查询；否则回退到原始查询。这保证了即使在文件名过滤模式下，
-     *       也能精确匹配用户的内容意图。</li>
-     * </ul>
-     *
-     * @param fileNameKeyword 文件名关键词（用于 source 字段过滤）
-     * @param contentQuery    移除文件名后的纯内容查询
-     * @param originalQuery   原始查询（当 contentQuery 为空时使用）
-     * @param maxResults      最大返回数量
-     * @return 在指定文件范围内检索到的文档片段列表
-     */
-    private List<TextSegment> searchWithFileNameFilter(String fileNameKeyword,
-                                                        String contentQuery,
-                                                        String originalQuery,
-                                                        int maxResults) {
-        // 构建元数据过滤器：source 字段必须包含 fileNameKeyword
-        Filter filter = new ContainsString("source", fileNameKeyword);
-
-        // 选择检索查询：优先使用纯内容查询，为空时回退到原始查询
-        String searchQuery = contentQuery.trim().isEmpty() ? originalQuery : contentQuery;
-
-        // 构建带过滤条件的向量检索请求
-        EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
-                .queryEmbedding(embeddingModel.embed(searchQuery).content())
-                .maxResults(maxResults)
-                .filter(filter)
-                .build();
-
-        List<EmbeddingMatch<TextSegment>> matches = embeddingStore.search(request).matches();
-        log.info("文件名过滤检索（{}）召回 {} 个片段", fileNameKeyword, matches.size());
-
-        return matches.stream().map(EmbeddingMatch::embedded).collect(Collectors.toList());
-    }
-
-    // ==================== 文件名提取与处理 ====================
-
-    /**
-     * <h3>从用户查询中提取文件名</h3>
-     *
-     * <p>使用三层正则表达式级联匹配，按优先级从高到低依次尝试：</p>
-     *
-     * <h4>第一层：精确扩展名匹配（优先级最高）</h4>
-     * <pre>
-     * 正则: ([\w\-\u4e00-\u9fa5]+\.(md|pdf|docx|txt|pptx|xlsx|doc|ppt|xls))
-     *
-     * 示例匹配:
-     *   "打开 章程.pdf"       → "章程.pdf"
-     *   "查看 README.md"      → "README.md"
-     *   "搜索 技术文档.docx"  → "技术文档.docx"
-     * </pre>
-     * <p>这是最精确的匹配方式，直接匹配带扩展名的文件名。</p>
-     *
-     * <h4>第二层：动作模式匹配</h4>
-     * <pre>
-     * 正则: (?:只看|打开|查看|搜索)\s*([\u4e00-\u9fa5\w\-]+?)\s*(?:里的|中的|文档|文件|$)
-     *
-     * 示例匹配:
-     *   "打开 章程 里的"      → "章程"
-     *   "查看 技术文档 文档"  → "技术文档"
-     *   "只看 产品手册"       → "产品手册"
-     * </pre>
-     * <p>匹配用户使用动作动词指定文档的场景，如"打开XX"、"查看XX"。</p>
-     *
-     * <h4>第三层：位置模式匹配</h4>
-     * <pre>
-     * 正则: ([\u4e00-\u9fa5\w\-]+?)\s*(?:里|中)\s*的
-     *
-     * 示例匹配:
-     *   "章程 里的 配置"     → "章程"
-     *   "文档 中的 说明"     → "文档"
-     * </pre>
-     * <p>匹配用户使用位置描述指定文档的场景，如"XX里的"、"XX中的"。需要至少 2 个字符。</p>
-     *
-     * @param query 用户查询文本
-     * @return 提取到的文件名，未匹配到返回 null
-     */
-    private String extractFileName(String query) {
-        if (query == null || query.trim().isEmpty()) {
-            return null;
-        }
-        String trimmed = query.trim();
-
-        // 第一层：精确扩展名匹配
-        // 匹配 中文/英文/数字/连字符 + .扩展名（md/pdf/docx/txt/pptx/xlsx/doc/ppt/xls）
-        Pattern exactFileNamePattern = Pattern.compile(
-                "([\\w\\-\\u4e00-\\u9fa5]+\\.(md|pdf|docx|txt|pptx|xlsx|doc|ppt|xls))");
-        var exactMatcher = exactFileNamePattern.matcher(trimmed);
-        if (exactMatcher.find()) {
-            String fileName = exactMatcher.group(1);
-            log.debug("精确匹配到文件名: {}", fileName);
-            return fileName;
-        }
-
-        // 第二层：动作模式匹配
-        // 匹配 "打开/查看/只看/搜索" + 文件名 + "里的/中的/文档/文件"
-        Pattern actionPattern = Pattern.compile(
-                "(?:只看|打开|查看|搜索)\\s*([\\u4e00-\\u9fa5\\w\\-]+?)\\s*(?:里的|中的|文档|文件|$)");
-        var actionMatcher = actionPattern.matcher(trimmed);
-        if (actionMatcher.find()) {
-            String fileName = actionMatcher.group(1);
-            log.debug("动作模式文件名匹配: {}", fileName);
-            return fileName;
-        }
-
-        // 第三层：位置模式匹配
-        // 匹配 "文件名" + "里/中" + "的"
-        Pattern locationPattern = Pattern.compile(
-                "([\\u4e00-\\u9fa5\\w\\-]+?)\\s*(?:里|中)\\s*的");
-        var locationMatcher = locationPattern.matcher(trimmed);
-        if (locationMatcher.find()) {
-            String fileName = locationMatcher.group(1);
-            // 文件名至少 2 个字符，避免匹配到 "里的" 中的 "里"
-            if (fileName.length() >= 2) {
-                log.debug("位置模式文件名匹配: {}", fileName);
-                return fileName;
-            }
-        }
-
-        return null;
-    }
-
-    /**
-     * <h3>从原始查询中提取纯内容查询</h3>
-     *
-     * <p>移除文件名关键词和动作/位置描述词，剩余部分即为用户的纯内容查询意图。</p>
-     *
-     * <h4>示例</h4>
-     * <pre>
-     * "打开 章程.pdf 里的 配置说明" → "配置说明"
-     * "查看 技术文档 中的 部署流程" → "部署流程"
-     * </pre>
-     *
-     * <p>移除的词包括：文件名本身 + "只看/打开/查看/搜索/里的/中的/文档/文件"等描述词。</p>
-     *
-     * @param originalQuery   原始查询文本
-     * @param fileNameKeyword 已提取到的文件名关键词
-     * @return 移除文件名和描述词后的纯内容查询
-     */
-    private String extractContentQuery(String originalQuery, String fileNameKeyword) {
-        // 第一步：移除文件名关键词
-        String contentQuery = originalQuery.replace(fileNameKeyword, "").trim();
-        // 第二步：移除动作/位置描述词
-        contentQuery = contentQuery.replaceAll(
-                "(?:只看|打开|查看|搜索|里的|中的|文档|文件)", "").trim();
-        return contentQuery;
-    }
-
-    /**
-     * <h3>移除文件扩展名</h3>
-     *
-     * <p>取最后一个点号之前的部分，用于文件名过滤的降级重试。</p>
-     *
-     * <h4>示例</h4>
-     * <pre>
-     * "章程.pdf"     → "章程"
-     * "技术文档.docx" → "技术文档"
-     * "README"       → "README"  （无扩展名，原样返回）
-     * </pre>
-     *
-     * @param fileName 带扩展名的文件名
-     * @return 移除扩展名后的文件名
-     */
-    private String removeExtension(String fileName) {
-        int dotIndex = fileName.lastIndexOf('.');
-        return dotIndex > 0 ? fileName.substring(0, dotIndex) : fileName;
     }
 
     // ==================== 上下文构建与答案生成 ====================
@@ -525,9 +360,8 @@ public class RAGSearchService {
      *
      * <h4>执行流程</h4>
      * <ol>
-     *   <li>调用 {@link #retrieveSegments} 执行四阶段级联检索</li>
+     *   <li>调用 {@link #retrieveSegments} 执行三阶段级联检索</li>
      *   <li>如果检索结果为空，返回兜底提示语</li>
-     *   <li>提取文件名（用于上下文来源声明）</li>
      *   <li>构建格式化上下文</li>
      *   <li>调用 LLM 生成最终答案</li>
      * </ol>
@@ -536,22 +370,22 @@ public class RAGSearchService {
      * @return LLM 生成的答案，或未找到信息时的兜底提示
      */
     public String searchAndAnswer(String userQuery) {
-        // 步骤1：执行四阶段级联检索
-        List<TextSegment> segments = retrieveSegments(userQuery, DEFAULT_MAX_RESULTS);
+        // 步骤1：执行三阶段级联检索
+        List<HybridSearchService.RankedResult> rankedResults = retrieveSegments(userQuery, DEFAULT_MAX_RESULTS);
+        List<TextSegment> segments = rankedResults.stream()
+                .map(HybridSearchService.RankedResult::getSegment)
+                .collect(Collectors.toList());
 
         // 步骤2：检索结果为空时返回兜底提示
         if (segments.isEmpty()) {
             return "未找到相关信息，请尝试更换关键词或指定文件名进行搜索。";
         }
 
-        // 步骤3：提取文件名，用于上下文来源标注
-        String fileName = extractFileName(userQuery);
+        // 步骤3：构建格式化上下文
+        String context = buildContext(segments);
 
-        // 步骤4：构建格式化上下文
-        String context = buildContext(segments, fileName);
-
-        // 步骤5：调用 LLM 生成答案
-        return generateAnswer(userQuery, context, fileName != null);
+        // 步骤4：调用 LLM 生成答案
+        return generateAnswer(userQuery, context);
     }
 
     /**
@@ -571,16 +405,16 @@ public class RAGSearchService {
      */
     public List<SearchResult> search(String query, int topK) {
         // 执行四阶段级联检索
-        List<TextSegment> segments = retrieveSegments(query, topK);
+        List<HybridSearchService.RankedResult> rankedResults = retrieveSegments(query, topK);
 
-        // 将 TextSegment 转为 SearchResult DTO
-        return segments.stream()
-                .map(seg -> {
+        // 将 RankedResult 转为 SearchResult DTO（携带真实分数）
+        return rankedResults.stream()
+                .map(rr -> {
                     // 从 metadata 中提取 source 字段作为文档来源
-                    String source = seg.metadata().getString("source");
+                    String source = rr.getSegment().metadata().getString("source");
                     return new SearchResult(
-                            seg.text(),                                          // 片段文本
-                            0.0,                                                 // 分数（混合检索场景下无统一分数，置 0）
+                            rr.getSegment().text(),                               // 片段文本
+                            rr.getScore(),                                        // 检索分数（RRF/向量相似度）
                             source != null ? source : "未知来源"                  // 文档来源
                     );
                 })

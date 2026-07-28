@@ -2,6 +2,7 @@ package com.hai.aiknowledgebase.queryrewrite.corrector;
 
 import com.github.houbb.word.checker.util.WordCheckerHelper;
 import com.hai.aiknowledgebase.service.ChineseTokenizerService;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -27,9 +28,24 @@ import java.util.List;
 @Slf4j
 @Component
 @RequiredArgsConstructor
-public class WordCheckerCorrector implements CorrectorLayer {
+public class L1WordCheckerCorrector implements CorrectorLayer {
 
     private final ChineseTokenizerService tokenizerService;
+
+    /**
+     * 预热 word-checker 内置词典（27W+ 中英文词典）
+     *
+     * <p>word-checker 的词典在首次调用 {@link WordCheckerHelper#isCorrect} 时懒加载，
+     * 耗时可能超过 L1 超时阈值（50ms）。通过启动时触发一次加载，
+     * 确保请求到来时词典已在内存中，避免首次请求因词典加载超时而降级到 L2。</p>
+     */
+    @PostConstruct
+    public void warmUp() {
+        long start = System.currentTimeMillis();
+        WordCheckerHelper.isCorrect("预热");
+        long costMs = System.currentTimeMillis() - start;
+        log.info("word-checker 词典预热完成，耗时: {}ms", costMs);
+    }
 
     @Override
     public String getLayerName() {

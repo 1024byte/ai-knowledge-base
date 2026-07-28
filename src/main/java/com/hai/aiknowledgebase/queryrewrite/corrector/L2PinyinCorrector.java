@@ -35,7 +35,7 @@ import java.util.*;
 @Slf4j
 @Component
 @RequiredArgsConstructor
-public class PinyinCorrector implements CorrectorLayer {
+public class L2PinyinCorrector implements CorrectorLayer {
 
     private final ChineseTokenizerService tokenizerService;
     private final QueryRewriteConfigLoader configLoader;

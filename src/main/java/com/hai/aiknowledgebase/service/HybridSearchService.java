@@ -296,6 +296,46 @@ public class HybridSearchService {
     }
 
     /**
+     * <h3>混合检索（带向量相关性阈值，返回带分数结果）</h3>
+     *
+     * <p>与 {@link #hybridSearch(String, int, double)} 相同，但返回带 RRF 融合分数的结果，
+     * 供下游按分数统一重排序使用。</p>
+     *
+     * @param query          用户查询文本
+     * @param topK           返回结果数量上限
+     * @param minVectorScore 向量路径最低余弦相似度阈值（0.0~1.0）
+     * @return 按 RRF 融合分数降序排列的 RankedResult 列表
+     */
+    public List<RankedResult> hybridSearchRanked(String query, int topK, double minVectorScore) {
+        // 降级判断：如果混合检索关闭或关键词索引为空，直接走纯向量检索
+        if (!hybridEnabled || keywordIndex.size() == 0) {
+            log.info("混合检索已关闭或关键词索引为空，降级为纯向量检索");
+            return vectorSearchRanked(query, topK).stream()
+                    .filter(r -> r.getScore() >= minVectorScore)
+                    .collect(Collectors.toList());
+        }
+
+        // 并行发起两路检索：向量路径 + 关键词路径
+        CompletableFuture<List<RankedResult>> vectorFuture =
+                CompletableFuture.supplyAsync(() -> vectorSearchRanked(query, topK));
+        CompletableFuture<List<RankedResult>> keywordFuture =
+                CompletableFuture.supplyAsync(() -> keywordSearchRanked(query, topK));
+
+        List<RankedResult> vectorResults = vectorFuture.join().stream()
+                .filter(r -> r.getScore() >= minVectorScore)
+                .collect(Collectors.toList());
+        List<RankedResult> keywordResults = keywordFuture.join();
+
+        log.info("双路检索完成: 向量结果={} (过滤后), 关键词结果={}", vectorResults.size(), keywordResults.size());
+
+        // RRF 融合排序
+        List<RankedResult> fused = reciprocalRankFusion(vectorResults, keywordResults, topK);
+        log.info("RRF 融合结果数量: {}", fused.size());
+
+        return fused;
+    }
+
+    /**
      * <h3>纯向量检索</h3>
      *
      * <p>仅使用向量语义相似度进行检索，不涉及关键词匹配。</p>
@@ -602,27 +642,28 @@ public class HybridSearchService {
     /**
      * <h3>排序结果包装类</h3>
      *
-     * <p>内部使用的数据结构，将文本片段与其检索分数绑定在一起。</p>
+     * <p>将文本片段与其检索分数绑定在一起，供跨阶段统一重排序使用。</p>
      *
      * <p>分数含义取决于检索路径：</p>
      * <ul>
      *   <li>向量检索路径：score 为余弦相似度（0.0 ~ 1.0）</li>
      *   <li>关键词检索路径：score 为 BM25 分数（无上限）</li>
      *   <li>RRF 融合后：score 为 RRF 累加分数</li>
+     *   <li>文件名过滤检索：score 为余弦相似度（0.0 ~ 1.0）</li>
      * </ul>
      */
-    private static class RankedResult {
+    public static class RankedResult {
         /** 文本片段，包含文档内容和元数据 */
         private final TextSegment segment;
         /** 检索分数（向量相似度 / BM25分数 / RRF融合分数） */
         private final double score;
 
-        RankedResult(TextSegment segment, double score) {
+        public RankedResult(TextSegment segment, double score) {
             this.segment = segment;
             this.score = score;
         }
 
-        TextSegment getSegment() { return segment; }
-        double getScore() { return score; }
+        public TextSegment getSegment() { return segment; }
+        public double getScore() { return score; }
     }
 }

@@ -82,6 +82,20 @@ hybrid-search:
   rrf:
     k: 60                            # RRF 常数 k，值越大排名差异越平滑（推荐 60）
 
+# 嵌入模型配置
+embedding:
+  model-path: models/onnx_model
+
+
+# Cross-Encoder Rerank 精排配置
+reranker:
+  enabled: true                     # 总开关：true=启用 Rerank 精排，false=跳过
+  model-path: models/bge-reranker-v2-m3  # ONNX 模型目录（含 model.onnx + tokenizer.json）
+  timeout-ms: 15000                  # Rerank 超时时间（毫秒，GPU 首次推理需 CUDA 预热）
+  max-docs: 30                       # 单次 Rerank 最大文档数（防止 OOM）
+  max-seq-length: 512                # 模型最大序列长度
+  gpu-device-id: 0                 # GPU 设备 ID：-1=CPU 推理，>=0=指定 GPU（需安装 CUDA 12.x + cuDNN 9.x）
+
 # Chat Prompt Token 预算控制
 chat:
   prompt:

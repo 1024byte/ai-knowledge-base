@@ -16,6 +16,8 @@ import org.springframework.core.io.ClassPathResource;
 
 import javax.sql.DataSource;
 import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 
 @Slf4j
 @Configuration
@@ -23,6 +25,9 @@ public class VectorStoreConfig {
 
     @Value("${vectorstore.pgvector.table-name:embeddings}")
     private String tableName;
+
+    @Value("${embedding.model-path}")
+    private String modelDir;
 
     @Bean
     public EmbeddingStore<TextSegment> embeddingStore(EmbeddingModel embeddingModel, DataSource dataSource) {
@@ -42,8 +47,8 @@ public class VectorStoreConfig {
     @Bean
     public EmbeddingModel embeddingModel() throws IOException {
         // 1. 获取模型和分词器文件的路径
-        String modelPath = new ClassPathResource("onnx_model/model.onnx").getFile().getAbsolutePath();
-        String tokenizerPath = new ClassPathResource("onnx_model/tokenizer.json").getFile().getAbsolutePath();
+        String modelPath = Paths.get(modelDir, "model.onnx").toString();
+        String tokenizerPath = Paths.get(modelDir, "tokenizer.json").toString();
 
         // 2. 直接使用构造函数创建 OnnxEmbeddingModel 实例
         //    构造函数：OnnxEmbeddingModel(pathToModel, pathToTokenizer, poolingMode)[reference:5][reference:6]

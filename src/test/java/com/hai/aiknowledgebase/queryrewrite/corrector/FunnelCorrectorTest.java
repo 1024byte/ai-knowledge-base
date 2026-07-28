@@ -26,9 +26,9 @@ import static org.mockito.Mockito.*;
  *
  * <h2>覆盖范围</h2>
  * <ul>
- *   <li>WordCheckerCorrector（L1）：word-checker 内置词典拼写检查</li>
- *   <li>PinyinCorrector（L2）：字符编辑距离 + 拼音匹配</li>
- *   <li>LLMCorrector（L3）：LLM 语义兜底</li>
+ *   <li>L1WordCheckerCorrector（L1）：word-checker 内置词典拼写检查</li>
+ *   <li>L2PinyinCorrector（L2）：字符编辑距离 + 拼音匹配</li>
+ *   <li>L3LLMCorrector（L3）：LLM 语义兜底</li>
  *   <li>FunnelQueryCorrector：三层漏斗编排逻辑</li>
  * </ul>
  */
@@ -44,17 +44,17 @@ class FunnelCorrectorTest {
     @Mock
     private OpenAiChatModel chatModel;
 
-    // ==================== L1: WordCheckerCorrector 测试 ====================
+    // ==================== L1: L1WordCheckerCorrector 测试 ====================
 
     @Nested
-    @DisplayName("L1: WordCheckerCorrector")
+    @DisplayName("L1: L1WordCheckerCorrector")
     class WordCheckerCorrectorTest {
 
-        private WordCheckerCorrector corrector;
+        private L1WordCheckerCorrector corrector;
 
         @BeforeEach
         void setUp() {
-            corrector = new WordCheckerCorrector(tokenizerService);
+            corrector = new L1WordCheckerCorrector(tokenizerService);
         }
 
         @Test
@@ -124,17 +124,17 @@ class FunnelCorrectorTest {
         }
     }
 
-    // ==================== L2: PinyinCorrector 测试 ====================
+    // ==================== L2: L2PinyinCorrector 测试 ====================
 
     @Nested
-    @DisplayName("L2: PinyinCorrector")
-    class PinyinCorrectorTest {
+    @DisplayName("L2: L2PinyinCorrector")
+    class L2PinyinCorrectorTest {
 
-        private PinyinCorrector corrector;
+        private L2PinyinCorrector corrector;
 
         @BeforeEach
         void setUp() {
-            corrector = new PinyinCorrector(tokenizerService, configLoader);
+            corrector = new L2PinyinCorrector(tokenizerService, configLoader);
         }
 
         @Test
@@ -242,17 +242,17 @@ class FunnelCorrectorTest {
         }
     }
 
-    // ==================== L3: LLMCorrector 测试 ====================
+    // ==================== L3: L3LLMCorrector 测试 ====================
 
     @Nested
-    @DisplayName("L3: LLMCorrector")
-    class LLMCorrectorTest {
+    @DisplayName("L3: L3LLMCorrector")
+    class L3LLMCorrectorTest {
 
-        private LLMCorrector corrector;
+        private L3LLMCorrector corrector;
 
         @BeforeEach
         void setUp() {
-            corrector = new LLMCorrector(chatModel);
+            corrector = new L3LLMCorrector(chatModel);
         }
 
         @Test
@@ -333,13 +333,13 @@ class FunnelCorrectorTest {
         private FunnelQueryCorrector funnel;
 
         @Mock
-        private WordCheckerCorrector l1;
+        private L1WordCheckerCorrector l1;
 
         @Mock
-        private PinyinCorrector l2;
+        private L2PinyinCorrector l2;
 
         @Mock
-        private LLMCorrector l3;
+        private L3LLMCorrector l3;
 
         @BeforeEach
         void setUp() {

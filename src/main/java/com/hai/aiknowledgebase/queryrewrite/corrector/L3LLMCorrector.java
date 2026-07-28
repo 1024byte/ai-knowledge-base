@@ -26,7 +26,7 @@ import java.util.List;
 @Slf4j
 @Component
 @RequiredArgsConstructor
-public class LLMCorrector implements CorrectorLayer {
+public class L3LLMCorrector implements CorrectorLayer {
 
     private final OpenAiChatModel chatModel;
 

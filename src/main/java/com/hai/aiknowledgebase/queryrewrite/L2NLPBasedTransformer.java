@@ -58,8 +58,9 @@ public class L2NLPBasedTransformer {
         QueryIntent intent = intentResult.primaryIntent();
         log.debug("L2 意图识别结果: {} (置信度: {}) | 分词: {}", intent, intentResult.confidence(), tokens);
 
-        // 4. 关键词提取（基于分词结果）
-        List<String> keywords = tokenizerService.extractKeywords(correctedQuery, 5);
+        // 4. 关键词提取（基于分词结果，动态 topN：短查询至少 5 个，长查询按分词数扩展，上限 10）
+        int dynamicTopN = Math.max(5, Math.min(tokens.size(), 10));
+        List<String> keywords = tokenizerService.extractKeywords(correctedQuery, dynamicTopN);
 
         // 5. 同义词扩展：对 L1 改写后的查询分词，查同义词词典
         List<String> synonymExpanded = expandSynonyms(tokens);
@@ -83,8 +84,8 @@ public class L2NLPBasedTransformer {
             excludeKeywords.addAll(l1Result.getExcludeKeywords());
         }
 
-        // 9. 计算置信度（四维加权）
-        double confidence = calculateL2Confidence(keywords, intent, tokens);
+        // 9. 计算置信度（四维加权：关键词数量、意图明确度、同义词命中率、LLM改写提示词贡献度）
+        double confidence = calculateL2Confidence(keywords, intent, intentResult);
 
         return QueryRewriteResult.builder()
                 .rewrittenQuery(strategy.rewrittenQuery)
@@ -244,15 +245,17 @@ public class L2NLPBasedTransformer {
      * <table>
      *   <tr><th>维度</th><th>权重</th><th>计算规则</th></tr>
      *   <tr><td>关键词数量</td><td>0.3</td><td>≥3个→1.0，2个→0.6，1个→0.3，0个→0.0</td></tr>
-     *   <tr><td>意图明确度</td><td>0.3</td><td>AMBIGUOUS→0.0，其他→1.0</td></tr>
+     *   <tr><td>意图明确度</td><td>0.3</td><td>AMBIGUOUS→0.0，其他→IntentResult.confidence()</td></tr>
      *   <tr><td>同义词命中率</td><td>0.2</td><td>命中的关键词数 / 关键词总数</td></tr>
-     *   <tr><td>分词质量</td><td>0.2</td><td>有效词（长度≥2且非纯数字）数 / token 总数</td></tr>
+     *   <tr><td>LLM改写提示词贡献度</td><td>0.2</td><td>min(1.0, rewriteHints数 / 3.0)</td></tr>
      * </table>
      *
      * <h3>设计说明</h3>
      * <ul>
      *   <li>关键词数量和意图明确度各占 0.3，是最重要的两个维度</li>
-     *   <li>同义词命中率反映词典覆盖度，分词质量反映输入有效性</li>
+     *   <li>意图明确度使用 IntentResult 的连续置信度，而非二值化（0/1），更精确反映意图识别的可靠程度</li>
+     *   <li>同义词命中率反映词典覆盖度</li>
+     *   <li>LLM 改写提示词贡献度反映 LLM 对查询的理解深度，有提示词说明 LLM 成功解析了查询语义</li>
      *   <li>最终结果保留两位小数（乘以 100 后取整再除以 100）</li>
      * </ul>
      *
@@ -261,12 +264,13 @@ public class L2NLPBasedTransformer {
      * 复杂度为 O(k × v)，其中 k 为关键词数，v 为同义词总数。
      * 在词典规模较大时可能成为瓶颈，可考虑预构建反向索引优化。
      *
-     * @param keywords 关键词列表
-     * @param intent   查询意图
-     * @param tokens   分词 token 列表
+     * @param keywords     关键词列表
+     * @param intent       查询意图
+     * @param intentResult 意图识别结果（含置信度和改写提示词）
      * @return 置信度（0.0 ~ 1.0）
      */
-    private double calculateL2Confidence(List<String> keywords, QueryIntent intent, List<String> tokens) {
+    private double calculateL2Confidence(List<String> keywords, QueryIntent intent,
+                                          IntentResult intentResult) {
         // 1. 关键词数量得分 (权重 0.3)
         double keywordScore;
         if (keywords == null || keywords.isEmpty()) {
@@ -279,12 +283,12 @@ public class L2NLPBasedTransformer {
             keywordScore = 0.3;
         }
 
-        // 2. 意图明确度得分 (权重 0.3)
+        // 2. 意图明确度得分 (权重 0.3)：使用 IntentResult 的连续置信度，而非二值化
         double intentScore;
         if (intent == QueryIntent.AMBIGUOUS) {
             intentScore = 0.0;
         } else {
-            intentScore = 1.0;
+            intentScore = intentResult.confidence();
         }
 
         // 3. 同义词命中数得分 (权重 0.2)
@@ -304,17 +308,14 @@ public class L2NLPBasedTransformer {
             synonymScore = (double) hitCount / keywords.size();
         }
 
-        // 4. 分词质量得分 (权重 0.2)
-        double tokenQualityScore = 0.0;
-        if (tokens != null && !tokens.isEmpty()) {
-            long validCount = tokens.stream()
-                    .filter(t -> t.length() >= 2 && !t.matches("\\d+"))
-                    .count();
-            tokenQualityScore = (double) validCount / tokens.size();
+        // 4. LLM 改写提示词贡献度 (权重 0.2)：有提示词说明 LLM 理解了查询，按数量递增，上限 1.0
+        double rewriteHintScore = 0.0;
+        if (intentResult.rewriteHints() != null && !intentResult.rewriteHints().isEmpty()) {
+            rewriteHintScore = Math.min(1.0, (double) intentResult.rewriteHints().size() / 3.0);
         }
 
         // 加权求和
-        double confidence = keywordScore * 0.3 + intentScore * 0.3 + synonymScore * 0.2 + tokenQualityScore * 0.2;
+        double confidence = keywordScore * 0.3 + intentScore * 0.3 + synonymScore * 0.2 + rewriteHintScore * 0.2;
 
         return Math.round(confidence * 100) / 100.0;
     }

@@ -33,9 +33,9 @@ import java.util.concurrent.TimeoutException;
 @RequiredArgsConstructor
 public class FunnelQueryCorrector {
 
-    private final WordCheckerCorrector l1;
-    private final PinyinCorrector l2;
-    private final LLMCorrector l3;
+    private final L1WordCheckerCorrector l1;
+    private final L2PinyinCorrector l2;
+    private final L3LLMCorrector l3;
 
     @Value("${corrector.l1.threshold:0.85}")
     private double l1Threshold;
@@ -103,14 +103,18 @@ public class FunnelQueryCorrector {
 
     /**
      * 带超时的纠错执行
+     *
+     * <p>超时后调用 {@link CompletableFuture#cancel(boolean)} 取消后台任务，
+     * 避免已超时的纠错任务继续占用线程和 CPU 资源。</p>
      */
     private CorrectionResult executeWithTimeout(CorrectorLayer layer, String query, long timeoutMs) {
+        CompletableFuture<CorrectionResult> future = CompletableFuture
+                .supplyAsync(() -> layer.correct(query));
         try {
-            return CompletableFuture
-                    .supplyAsync(() -> layer.correct(query))
-                    .get(timeoutMs, TimeUnit.MILLISECONDS);
+            return future.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
-            log.warn("{} 纠错超时 ({}ms)", layer.getLayerName(), timeoutMs);
+            future.cancel(true);
+            log.warn("{} 纠错超时 ({}ms)，已取消后台任务", layer.getLayerName(), timeoutMs);
         } catch (Exception e) {
             log.error("{} 纠错异常: {}", layer.getLayerName(), e.getMessage());
         }

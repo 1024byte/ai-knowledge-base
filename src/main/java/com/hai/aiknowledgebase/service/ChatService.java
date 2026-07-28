@@ -217,53 +217,12 @@ public class ChatService {
                 String.format("%.2f", rewriteResult.getConfidence()), rewriteResult.getPath(),
                 rewriteResult.getStrategy());
 
-        // 步骤1：混合检索（向量语义 + BM25 关键词，RRF 融合排序）
-        List<TextSegment> segments = ragSearchService.retrieveSegments(searchQuery, topK, expandKeywords, excludeKeywords);
+        // 步骤1：混合检索（向量语义 + BM25 关键词，RRF 融合排序 + 分数重排序）
+        List<HybridSearchService.RankedResult> rankedResults = ragSearchService.retrieveSegments(searchQuery, topK, expandKeywords, excludeKeywords);
+        List<TextSegment> segments = rankedResults.stream()
+                .map(HybridSearchService.RankedResult::getSegment)
+                .collect(Collectors.toList());
         log.info("检索到 {} 个相关文档片段", segments.size());
-
-        // 步骤1.1：检索质量检查，不达标时触发 HyDE 兜底
-        if (isRetrievalQualityPoor(segments)) {
-            log.warn("检索质量不达标 (结果数={}, 最高分={})，触发 HyDE 兜底",
-                    segments.size(), getTopScore(segments));
-
-            // 如果改写结果中已有 HyDE 答案，直接使用；否则重新生成
-            if (hypotheticAnswer == null || hypotheticAnswer.isBlank()) {
-                hypotheticAnswer = generateHydeAnswer(question);
-            }
-
-            if (hypotheticAnswer != null && !hypotheticAnswer.isBlank()) {
-                log.info("HyDE 兜底检索: 使用假设性答案进行语义检索");
-                List<TextSegment> hydeSegments = ragSearchService.retrieveSegments(
-                        hypotheticAnswer, topK, expandKeywords, excludeKeywords);
-                if (!hydeSegments.isEmpty()) {
-                    segments = hydeSegments;
-                    log.info("HyDE 检索获得 {} 个补充片段", hydeSegments.size());
-                }
-            }
-        }
-
-        // 步骤1.2：如果存在子查询（DECOMPOSE 策略），并行检索子查询结果
-        if (subQueries != null && !subQueries.isEmpty()) {
-            log.info("执行子查询检索: {} 个子查询", subQueries.size());
-            for (String subQuery : subQueries) {
-                try {
-                    List<TextSegment> subSegments = ragSearchService.retrieveSegments(
-                            subQuery, Math.max(2, topK / subQueries.size()), expandKeywords, excludeKeywords);
-                    segments.addAll(subSegments);
-                } catch (Exception e) {
-                    log.warn("子查询检索失败: {} -> {}", subQuery, e.getMessage());
-                }
-            }
-            // 去重：按文本内容去重
-            segments = segments.stream()
-                    .collect(Collectors.toMap(
-                            TextSegment::text,
-                            s -> s,
-                            (s1, s2) -> s1))
-                    .values().stream()
-                    .limit(topK)
-                    .collect(Collectors.toList());
-        }
 
         // 步骤2：构建上下文（Token 预算制：按片段顺序填入，超出预算截断或丢弃）
         ContextBuildResult contextResult = buildContextWithinBudget(segments, maxContextTokens);

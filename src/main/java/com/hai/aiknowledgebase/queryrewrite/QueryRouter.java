@@ -7,10 +7,14 @@ import dev.langchain4j.model.embedding.EmbeddingModel;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 
 /**
@@ -49,11 +53,43 @@ public class QueryRouter {
 
     private final ChineseTokenizerService tokenizerService;
     private final EmbeddingModel embeddingModel;
+
+    /** 嵌入辅助判定超时时间（毫秒） */
+    @Value("${query-router.embedding-timeout-ms:5000}")
+    private long embeddingTimeoutMs;
+
+    /** 规则评分强命中阈值（≥此值直接判定复合） */
+    @Value("${query-router.rule-strong-threshold:0.5}")
+    private double ruleStrongThreshold;
+
+    /** 规则弱信号阈值（≥此值时嵌入辅助用宽松阈值） */
+    @Value("${query-router.rule-weak-signal-threshold:0.1}")
+    private double ruleWeakSignalThreshold;
+
+    /** 嵌入辅助：有弱规则信号时的相似度差值阈值 */
+    @Value("${query-router.embedding-diff-threshold-weak:-0.02}")
+    private double embeddingDiffThresholdWeak;
+
+    /** 嵌入辅助：无规则信号时的相似度差值阈值 */
+    @Value("${query-router.embedding-diff-threshold-none:0.08}")
+    private double embeddingDiffThresholdNone;
+
+    /** 规则评分：多问句/多疑问段权重 */
+    @Value("${query-router.score-weight.multi-question:0.5}")
+    private double scoreWeightMultiQuestion;
+
+    /** 规则评分：对比/隐式对比权重 */
+    @Value("${query-router.score-weight.compare:0.4}")
+    private double scoreWeightCompare;
+
+    /** 规则评分：枚举/多方面权重 */
+    @Value("${query-router.score-weight.enum-aspect:0.3}")
+    private double scoreWeightEnumAspect;
     // ==================== 正则常量 ====================
 
     /** 指代词正则：检测"它/这个/那个/上面/前面/这里/那里/这些/那些/该/其"等 */
     private static final Pattern PRONOUN_PATTERN = Pattern.compile(
-            "它(?:们)?|这个|那个|上面|前面|这里|那里|这些|那些|" +
+            "它(?:们)?|上面|前面|这里|那里|这些|那些|" +
                     "该(?:文档|文件|系统|项目|功能|模块|方法|类|接口|服务|配置|组件)?|" +
                     "其(?:中)?|这(?:个|些)?|那(?:个|些)?"
     );
@@ -189,6 +225,9 @@ public class QueryRouter {
      * 计算质心向量（均值 + L2 归一化）
      */
     private float[] computeCentroid(float[][] vectors) {
+        if (vectors == null || vectors.length == 0) {
+            throw new IllegalArgumentException("vectors 不能为空");
+        }
         int dim = vectors[0].length;
         float[] centroid = new float[dim];
         for (float[] vec : vectors) {
@@ -249,6 +288,12 @@ public class QueryRouter {
             return RewriteStrategyEnum.DIRECT;
         }
 
+        // 无指代词、无历史、非复合、非简单，但查询较短且语义明确 → 仅纠错
+        if (!hasPronouns && !hasHistory && query.length() <= 20) {
+            log.debug("路由决策: CORRECT_ONLY (短查询无指代，仅需纠错)");
+            return RewriteStrategyEnum.CORRECT_ONLY;
+        }
+
         log.debug("路由决策: SIMPLE_REWRITE (默认)");
         return RewriteStrategyEnum.SIMPLE_REWRITE;
     }
@@ -278,7 +323,7 @@ public class QueryRouter {
 
         // 2. 增强规则评分
         double ruleScore = ruleCompoundScore(query);
-        if (ruleScore >= 0.5) {
+        if (ruleScore >= ruleStrongThreshold) {
             log.debug("复合问题规则强命中: score={}", ruleScore);
             return true;
         }
@@ -286,7 +331,7 @@ public class QueryRouter {
         // 3. 嵌入辅助（灰区 0.1~0.4 或无规则信号时）
         if (embeddingAssistAvailable) {
             try {
-                boolean embeddingResult = isCompoundByEmbedding(query, ruleScore);
+                boolean embeddingResult = isCompoundByEmbeddingWithTimeout(query, ruleScore);
                 log.debug("嵌入辅助判定: ruleScore={}, result={}", ruleScore, embeddingResult);
                 return embeddingResult;
             } catch (Exception e) {
@@ -317,37 +362,55 @@ public class QueryRouter {
         // 多问号
         int questionMarkCount = countChar(query, '？') + countChar(query, '?');
         if (questionMarkCount >= 2) {
-            score += 0.5;
+            score += scoreWeightMultiQuestion;
         }
 
         // 多疑问词分段检测（如"什么是Java，它有什么特点"→2段含疑问词）
         int questionSegments = countQuestionSegments(query);
         if (questionSegments >= 2) {
-            score += 0.5;
+            score += scoreWeightMultiQuestion;
         }
 
         // 对比关键词（含排除词过滤）
         if (containsAny(query, COMPARE_KEYWORDS) && !containsAny(query, COMPARE_EXCLUDE_WORDS)) {
-            score += 0.4;
+            score += scoreWeightCompare;
         }
 
         // 多实体 + 隐式对比词
         if (hasMultiEntity(query) && containsAny(query, IMPLICIT_COMPARE_WORDS)) {
-            score += 0.4;
+            score += scoreWeightCompare;
         }
 
         // 枚举关键词
         if (containsAny(query, ENUM_KEYWORDS)) {
-            score += 0.3;
+            score += scoreWeightEnumAspect;
         }
 
         // 多方面关键词
         int aspectCount = countAspects(query);
         if (aspectCount >= 2) {
-            score += 0.3;
+            score += scoreWeightEnumAspect;
         }
 
         return Math.min(score, 1.0);
+    }
+
+    /**
+     * 带超时的嵌入辅助判定
+     *
+     * <p>使用 {@link CompletableFuture} 包装嵌入调用，超时后取消后台任务并降级为规则判断。</p>
+     */
+    private boolean isCompoundByEmbeddingWithTimeout(String query, double ruleScore) {
+        CompletableFuture<Boolean> future = CompletableFuture.supplyAsync(() -> isCompoundByEmbedding(query, ruleScore));
+        try {
+            return future.get(embeddingTimeoutMs, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            log.warn("嵌入辅助判定超时 ({}ms)，已取消后台任务，降级为规则判断", embeddingTimeoutMs);
+            throw new RuntimeException("嵌入辅助判定超时", e);
+        } catch (Exception e) {
+            throw new RuntimeException("嵌入辅助判定异常", e);
+        }
     }
 
     /**
@@ -380,10 +443,10 @@ public class QueryRouter {
         double diff = simCompound - simSimple;
 
         // 根据规则信号强度调整阈值
-        if (ruleScore >= 0.1) {
-            return diff > -0.02;
+        if (ruleScore >= ruleWeakSignalThreshold) {
+            return diff > embeddingDiffThresholdWeak;
         } else {
-            return diff > 0.08;
+            return diff > embeddingDiffThresholdNone;
         }
     }
 
@@ -490,18 +553,36 @@ public class QueryRouter {
      *   <li>顿号枚举：A、B</li>
      *   <li>vs/VS 模式</li>
      * </ul>
+     *
+     * <p>对短连词（"和"/"与"/"及"）通过分词判断是否为独立 token，
+     * 避免"和平""和谐"等词中的子串误判。</p>
      */
     private boolean hasMultiEntity(String query) {
-        for (String conj : ENTITY_CONJUNCTIONS) {
-            if (query.contains(conj)) {
-                return true;
-            }
+        // 长连词直接 contains 检测（不会出现子串误判）
+        if (query.contains("以及") || query.contains("还有") || query.contains("或者")) {
+            return true;
         }
+        // 顿号和 vs 模式
         if (query.contains("、")) {
             return true;
         }
         if (query.contains(" vs ") || query.contains(" VS ")) {
             return true;
+        }
+        // 短连词通过分词判断是否为独立 token
+        try {
+            List<String> tokens = tokenizerService.tokenize(query, false);
+            for (String token : tokens) {
+                if ("和".equals(token) || "与".equals(token) || "及".equals(token)) {
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            log.debug("分词失败，回退到 contains 检测短连词: {}", e.getMessage());
+            // 降级：回退到 contains 检测
+            if (query.contains("和") || query.contains("与") || query.contains("及")) {
+                return true;
+            }
         }
         return false;
     }

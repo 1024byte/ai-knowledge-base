@@ -51,6 +51,7 @@ import java.util.stream.Collectors;
  * @see RuleIntentClassifier 规则引擎（快路径）
  * @see IntentRecognitionOrchestrator 编排器
  */
+@Deprecated
 @Slf4j
 @Component
 @Order(2)

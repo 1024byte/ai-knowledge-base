@@ -254,48 +254,28 @@ public class QueryRouter {
     // ==================== 主入口 ====================
 
     /**
-     * 根据查询特征路由到对应的改写策略
+     * 路由策略选择（简化版）
      *
-     * @param query   原始用户查询（已 trim）
-     * @param history 截断后的对话历史（最近 2 轮）
-     * @return 改写策略
+     * <p>本地 LLM 改写后，路由仅需判断是否需要指代消解和问题分解，
+     * 不再需要规则引擎的复杂路由逻辑。</p>
      */
     public RewriteStrategyEnum route(String query, List<CustomChatMessage> history) {
-        if (query == null || query.length() < 3) {
-            log.debug("路由决策: DIRECT (空或极短查询)");
-            return RewriteStrategyEnum.DIRECT;
-        }
-
-        boolean hasPronouns = PRONOUN_PATTERN.matcher(query).find();
-        boolean hasHistory = history != null && !history.isEmpty();
-
-        if (hasPronouns && hasHistory) {
-            if (isCompound(query)) {
-                log.debug("路由决策: DECOMPOSE (有指代词 + 复合问题)");
-                return RewriteStrategyEnum.DECOMPOSE;
-            }
-            log.debug("路由决策: RESOLVE_ONLY (有指代词 + 有历史)");
+        // 有对话历史 + 包含代词 → RESOLVE_ONLY（纠错+消解后交给 LLM 改写）
+        if (history != null && !history.isEmpty() && containsPronouns(query)) {
             return RewriteStrategyEnum.RESOLVE_ONLY;
         }
 
-        if (isCompound(query)) {
-            log.debug("路由决策: DECOMPOSE (复合问题)");
-            return RewriteStrategyEnum.DECOMPOSE;
-        }
-
-        if (isSimple(query)) {
-            log.debug("路由决策: DIRECT (简单查询)");
-            return RewriteStrategyEnum.DIRECT;
-        }
-
-        // 无指代词、无历史、非复合、非简单，但查询较短且语义明确 → 仅纠错
-        if (!hasPronouns && !hasHistory && query.length() <= 20) {
-            log.debug("路由决策: CORRECT_ONLY (短查询无指代，仅需纠错)");
-            return RewriteStrategyEnum.CORRECT_ONLY;
-        }
-
-        log.debug("路由决策: SIMPLE_REWRITE (默认)");
+        // 默认：SIMPLE_REWRITE（纠错 + LLM 改写）
         return RewriteStrategyEnum.SIMPLE_REWRITE;
+    }
+
+    /**
+     * 检测查询中是否包含中文指代词
+     * <p>匹配：它/它们、这个/那个、上面/前面、这里/那里、
+     * 这些/那些、该文档/该模块/该配置等、其/其中</p>
+     */
+    private boolean containsPronouns(String query) {
+        return PRONOUN_PATTERN.matcher(query).find();
     }
 
     // ==================== 判定规则 ====================

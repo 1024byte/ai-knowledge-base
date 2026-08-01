@@ -54,6 +54,7 @@ import java.util.List;
  * @see RuleIntentClassifier 规则引擎（快路径）
  * @see LLMIntentClassifier LLM 分类器（慢路径）
  */
+@Deprecated
 @Slf4j
 @Service
 @RequiredArgsConstructor

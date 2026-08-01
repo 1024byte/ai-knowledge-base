@@ -15,5 +15,7 @@ public enum RewritePath {
     /** L3 任务分解（Phase 2） */
     L3_TASK_DECOMPOSITION,
     /** L3 HyDE 语义增强（Phase 2） */
-    L3_HYDE
+    L3_HYDE,
+    /** L3 模型改写（Phase 2） */
+    L3_LLM
 }

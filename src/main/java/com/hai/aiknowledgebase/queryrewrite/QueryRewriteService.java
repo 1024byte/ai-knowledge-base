@@ -1,5 +1,6 @@
 package com.hai.aiknowledgebase.queryrewrite;
 
+import com.hai.aiknowledgebase.annotation.Timed;
 import com.hai.aiknowledgebase.dto.*;
 import com.hai.aiknowledgebase.interfaces.LocalQueryRewriter;
 import com.hai.aiknowledgebase.service.ChineseTokenizerService;
@@ -10,6 +11,7 @@ import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -109,15 +111,16 @@ public class QueryRewriteService{
     private boolean enabled;
 
     /** L3 LLM 改写器（可选注入）。如果未配置 Bean 则为 null，L3 不可用 */
-    @org.springframework.beans.factory.annotation.Autowired(required = false)
-    private LocalQueryRewriter llmRewriter;
+//    @org.springframework.beans.factory.annotation.Autowired(required = false)
+//    private LocalQueryRewriter llmRewriter;
+
+    @Autowired(required = false)
+    private LocalLLMRewriter localLLMRewriter;
 
 
     private final L1RuleBasedTransformer l1RuleBasedTransformer;
 
     private final L2NLPBasedTransformer l2NLPBasedTransformer;
-
-    // ==================== 主入口 ====================
 
     /**
      * 简化版入口：执行默认 SIMPLE_REWRITE 路由的查询改写
@@ -137,107 +140,96 @@ public class QueryRewriteService{
         return rewrite(request);
     }
 
-    /**
-     * 完整版入口：根据路由决策执行按需多层查询改写
-     *
-     * <h3>按需路由流程</h3>
-     * <ol>
-     *   <li><b>前置检查</b>：改写开关、空值</li>
-     *   <li><b>路由决策</b>：优先使用 request.strategy，否则通过 QueryRouter 自动判定</li>
-     *   <li><b>按策略执行</b>：
-     *       <ul>
-     *         <li>DIRECT → 直接返回原始查询</li>
-     *         <li>CORRECT_ONLY → 仅纠错</li>
-     *         <li>RESOLVE_ONLY → 纠错 + 指代消解</li>
-     *         <li>SIMPLE_REWRITE → 纠错 + 消解 + L1 + L2</li>
-     *         <li>DECOMPOSE → 纠错 + 消解 + 问题分解</li>
-     *         <li>HYDE → 生成假设性答案（检索后触发，不在此处）</li>
-     *       </ul>
-     *   </li>
-     * </ol>
-     *
-     * @param request 改写请求，包含查询文本、对话历史、策略和会话 ID
-     * @return 改写结果
-     */
-    public QueryRewriteResult rewrite(RewriteRequest request) {
-        if (!enabled) {
-            log.debug("查询改写已禁用，直接返回原始查询");
-            return buildNoneResult(request.getQuery());
-        }
+    // ==================== 主入口 ====================
+    @Timed("查询改写")
+    public QueryRewriteResult rewrite(RewriteRequest request){
 
         String query = request.getQuery();
+        RewriteStrategyEnum strategy = request.getStrategy();
+        List<CustomChatMessage> history = request.getTruncatedHistory();
+        // Step 0: 空值检查
         if (query == null || query.isBlank()) {
-            return buildNoneResult(query);
+            return QueryRewriteResult.builder()
+                    .rewrittenQuery("")
+                    .expandKeywords(Collections.emptyList())
+                    .excludeKeywords(Collections.emptyList())
+                    .confidence(0.0)
+                    .path(RewritePath.L1_RULE)
+                    .build();
+        }
+        String currentQuery = query.trim();
+        // Step 1: 纠错（保留 L1+L2 漏斗纠错，移除 L3 LLM 纠错避免重复调用）
+        currentQuery = queryCorrector.correct(currentQuery);
+        log.debug("纠错后: {} → {}", query, currentQuery);
+
+        // Step 2: 指代消解（保留，需要对话历史）
+        if (history != null && !history.isEmpty() && needsCoreferenceResolution(currentQuery)) {
+            String resolved = resolveCoreference(currentQuery, history);
+            if (resolved != null && !resolved.isBlank()) {
+                currentQuery = resolved;
+                log.debug("指代消解后: {}", currentQuery);
+            }
         }
 
-        String trimmed = query.trim();
-        long startTime = System.currentTimeMillis();
-
-        RewriteStrategyEnum strategy = resolveStrategy(request, trimmed);
-
-        switch (strategy) {
-            case DIRECT:
-                log.debug("策略 DIRECT: 直接返回原始查询");
-                QueryRewriteResult directResult = buildDirectResult(trimmed);
-                logRewriteResult("DIRECT", trimmed, directResult, startTime);
-                return directResult;
-
-            case CORRECT_ONLY:
-                log.debug("策略 CORRECT_ONLY: 仅纠错");
-                return executeCorrectOnly(trimmed, startTime);
-
-            case RESOLVE_ONLY:
-                log.debug("策略 RESOLVE_ONLY: 纠错 + 消解");
-                return executeResolveOnly(trimmed, request.getTruncatedHistory(), startTime);
-
-            case SIMPLE_REWRITE:
-                log.debug("策略 SIMPLE_REWRITE: 纠错 + 消解 + L1/L2 改写");
-                return executeSimpleRewrite(trimmed, request, startTime);
-
-            case DECOMPOSE:
-                log.debug("策略 DECOMPOSE: 纠错 + 消解 + 问题分解");
-                return executeDecompose(trimmed, request.getTruncatedHistory(), startTime);
-
-            case HYDE:
-                log.debug("策略 HYDE: 触发假设性答案生成");
-                return executeHyde(trimmed, request.getTruncatedHistory(), startTime);
-
-            default:
-                log.warn("未知策略: {}, 降级为 SIMPLE_REWRITE", strategy);
-                return executeSimpleRewrite(trimmed, request, startTime);
+        // Step 3: 本地 LLM 改写（替代 L1 规则 + L2 NLP）
+        if (localLLMRewriter != null && localLLMRewriter.isAvailable()) {
+            List<String> historyTexts = extractHistoryTexts(history);
+            QueryRewriteResult llmResult = localLLMRewriter.rewrite(currentQuery, historyTexts);
+            return enrichWithStrategy(llmResult, strategy);
         }
+
+        // Step 4: 降级 — 本地 LLM 不可用时，走 L1 固定映射（仅保留 fixed-mapping，不做同义词扩展）
+        log.info("本地 LLM 不可用，降级到 L1 固定映射");
+        QueryRewriteResult l1Result = l1RuleBasedTransformer.applyRuleRewrite(currentQuery);
+        return enrichWithStrategy(l1Result, strategy);
     }
 
     /**
-     * 解析改写策略：优先使用 request 中的 strategy，否则通过 QueryRouter 自动判定
+     * 判断查询是否需要指代消解
+     * <p>使用正则快速检测查询中是否包含中文指代词，
+     * 避免对无指代词的查询发起不必要的 LLM 调用。</p>
+     */
+    private boolean needsCoreferenceResolution(String query) {
+        return PRONOUN_PATTERN.matcher(query).find();
+    }
+
+    /**
+     * 指代消解：调用 LLM 根据对话历史将指代词替换为具体实体
+     * <p>前置条件：调用方已通过 needsCoreferenceResolution 确认查询包含指代词。</p>
      *
-     * <p>向后兼容：如果 request 中设置了旧的 routingDecision，自动映射到新策略。</p>
+     * @param query   包含指代词的查询
+     * @param history 对话历史
+     * @return 消解后的查询，失败时返回原始查询
      */
-    private RewriteStrategyEnum resolveStrategy(RewriteRequest request, String query) {
-        if (request.getStrategy() != null) {
-            return request.getStrategy();
+    private String resolveCoreference(String query, List<CustomChatMessage> history) {
+        try {
+            String resolved = resolveReferencesWithLLM(query, history);
+            if (resolved != null && !resolved.isBlank() && !resolved.equals(query)) {
+                return resolved.trim();
+            }
+        } catch (Exception e) {
+            log.warn("LLM 指代消解失败，保持原始查询: {}", e.getMessage());
         }
-
-        RoutingDecision decision = request.getRoutingDecision();
-        if (decision != null) {
-            return mapFromRoutingDecision(decision);
-        }
-
-        return queryRouter.route(query, request.getTruncatedHistory());
+        return query;
     }
 
     /**
-     * 旧 RoutingDecision → 新 RewriteStrategyEnum 映射
+     * 将对话历史转换为文本列表，供本地 LLM 改写器使用
+     * <p>每条消息格式化为"角色：内容"，如"用户：什么是EmbeddingStore"</p>
+     *
+     * @param history 对话历史（可为 null 或空）
+     * @return 格式化后的文本列表，空历史返回空列表
      */
-    private RewriteStrategyEnum mapFromRoutingDecision(RoutingDecision decision) {
-        switch (decision) {
-            case SKIP:
-                return RewriteStrategyEnum.DIRECT;
-            case RULE_ONLY:
-            case FULL:
-            default:
-                return RewriteStrategyEnum.SIMPLE_REWRITE;
+    private List<String> extractHistoryTexts(List<CustomChatMessage> history) {
+        if (history == null || history.isEmpty()) {
+            return Collections.emptyList();
         }
+        return history.stream()
+                .map(msg -> {
+                    String roleLabel = "assistant".equalsIgnoreCase(msg.getRole()) ? "助手" : "用户";
+                    return roleLabel + "：" + msg.getContent();
+                })
+                .collect(Collectors.toList());
     }
 
     // ==================== 策略执行方法 ====================
@@ -334,26 +326,6 @@ public class QueryRewriteService{
             logRewriteResult("L2", resolvedQuery, result, startTime);
             return result;
         }
-
-        if (llmRewriter != null) {
-            try {
-                RewriteRequest l3Request = RewriteRequest.builder()
-                        .query(resolvedQuery)
-                        .truncatedHistory(history)
-                        .strategy(RewriteStrategyEnum.SIMPLE_REWRITE)
-                        .sessionId(request.getSessionId())
-                        .build();
-                QueryRewriteResult l3Result = llmRewriter.rewrite(l3Request);
-                if (l3Result != null && l3Result.isRewritten()) {
-                    QueryRewriteResult result = enrichWithStrategy(l3Result, RewriteStrategyEnum.SIMPLE_REWRITE);
-                    logRewriteResult("L3", resolvedQuery, result, startTime);
-                    return result;
-                }
-            } catch (Exception e) {
-                log.error("L3 LLM 改写失败，降级使用 L2 结果: {}", e.getMessage());
-            }
-        }
-
         QueryRewriteResult result = enrichWithStrategy(l2Result, RewriteStrategyEnum.SIMPLE_REWRITE);
         logRewriteResult("L2(L3降级)", resolvedQuery, result, startTime);
         return result;
@@ -652,12 +624,4 @@ public class QueryRewriteService{
                 duration);
     }
 
-    /**
-     * 检查 L3 LLM 改写器是否可用
-     *
-     * @return true 表示已注入 {@link LocalQueryRewriter} Bean，L3 路径可用
-     */
-    public boolean hasL3Rewriter() {
-        return llmRewriter != null;
-    }
 }

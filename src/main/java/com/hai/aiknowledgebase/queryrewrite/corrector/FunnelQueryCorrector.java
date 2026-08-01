@@ -80,24 +80,14 @@ public class FunnelQueryCorrector {
             return r2.getCorrectedQuery();
         }
 
-        // L1 和 L2 都没发现错误 → 短路返回，跳过 L3
+        // L1 和 L2 都没发现错误 → 直接返回（不再调用 L3）
         boolean l2FoundError = r2 != null && r2.isCorrected();
         if (!l1FoundError && !l2FoundError) {
             log.debug("L1/L2 均未发现错误，跳过 L3，返回原始查询");
             return query;
         }
 
-        // L3: LLM 兜底（仅当 L1 或 L2 发现了疑似错误时才调用）
-        CorrectionResult r3 = executeWithTimeout(l3, query, l3TimeoutMs);
-        if (r3 != null) {
-            if (r3.isCorrected()) {
-                log.info("L3 纠错命中 | {} → {} | 置信度: {}",
-                        query, r3.getCorrectedQuery(), r3.getConfidence());
-            }
-            return r3.getCorrectedQuery();
-        }
-
-        log.warn("所有纠错层均超时或失败，返回原始查询: {}", query);
+        log.debug("L1/L2 发现疑似错误但置信度不足，交给 LocalLLMRewriter 处理");
         return query;
     }
 

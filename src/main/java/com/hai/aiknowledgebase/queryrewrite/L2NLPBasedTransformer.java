@@ -14,6 +14,7 @@ import org.springframework.stereotype.Service;
 import java.util.*;
 import java.util.stream.Collectors;
 
+@Deprecated
 @Slf4j
 @Service
 @RequiredArgsConstructor

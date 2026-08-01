@@ -6,5 +6,4 @@ import lombok.Data;
 public class ChatRequest {
     private String sessionId;
     private String question;
-    private int topK = 3;
 }

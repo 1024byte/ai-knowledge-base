@@ -229,76 +229,12 @@ public class HybridSearchService {
 
     // ==================== 核心检索方法 ====================
 
-    /**
-     * <h3>混合检索主入口</h3>
-     *
-     * <p>并行执行向量检索和关键词检索，使用 RRF 算法融合两路结果后返回最终排序。</p>
-     *
-     * <h4>执行步骤</h4>
-     * <ol>
-     *   <li>检查混合检索是否可用（启用开关 + 关键词索引非空）</li>
-     *   <li>使用 {@link CompletableFuture#supplyAsync} 并行发起两路检索</li>
-     *   <li>调用 {@link #reciprocalRankFusion} 进行 RRF 融合排序</li>
-     *   <li>将排序后的结果转换为 TextSegment 列表返回</li>
-     * </ol>
-     *
-     * <h4>降级逻辑</h4>
-     * <ul>
-     *   <li>混合检索关闭 或 关键词索引为空 → 降级为纯向量检索</li>
-     * </ul>
-     *
-     * @param query 用户原始查询文本
-     * @param topK  返回结果数量上限
-     * @return 融合排序后的 TextSegment 列表（按 RRF 分数降序）
-     */
-    public List<TextSegment> hybridSearch(String query, int topK) {
-        return hybridSearch(query, topK, 0.0);
-    }
 
-    /**
-     * <h3>混合检索（带向量相关性阈值）</h3>
-     *
-     * <p>与 {@link #hybridSearch(String, int)} 相同，但在 RRF 融合前过滤低质量向量结果，
-     * 避免无关查询中低分向量片段通过 BM25 关键词匹配被带入最终结果。</p>
-     *
-     * @param query          用户查询文本
-     * @param topK           返回结果数量上限
-     * @param minVectorScore 向量路径最低余弦相似度阈值（0.0~1.0）
-     * @return 按 RRF 融合分数降序排列的 TextSegment 列表
-     */
-    public List<TextSegment> hybridSearch(String query, int topK, double minVectorScore) {
-        // 降级判断：如果混合检索关闭或关键词索引为空，直接走纯向量检索
-        if (!hybridEnabled || keywordIndex.size() == 0) {
-            log.info("混合检索已关闭或关键词索引为空，降级为纯向量检索");
-            return vectorSearch(query, topK, minVectorScore);
-        }
-
-        // 并行发起两路检索：向量路径 + 关键词路径
-        CompletableFuture<List<RankedResult>> vectorFuture =
-                CompletableFuture.supplyAsync(() -> vectorSearchRanked(query, topK));
-        CompletableFuture<List<RankedResult>> keywordFuture =
-                CompletableFuture.supplyAsync(() -> keywordSearchRanked(query, topK));
-
-        List<RankedResult> vectorResults = vectorFuture.join().stream()
-                .filter(r -> r.getScore() >= minVectorScore)
-                .collect(Collectors.toList());
-        List<RankedResult> keywordResults = keywordFuture.join();
-
-        log.info("双路检索完成: 向量结果={} (过滤后), 关键词结果={}", vectorResults.size(), keywordResults.size());
-
-        // RRF 融合排序
-        List<RankedResult> fused = reciprocalRankFusion(vectorResults, keywordResults, topK);
-        log.info("RRF 融合结果数量: {}", fused.size());
-
-        return fused.stream()
-                .map(RankedResult::getSegment)
-                .collect(Collectors.toList());
-    }
 
     /**
      * <h3>混合检索（带向量相关性阈值，返回带分数结果）</h3>
      *
-     * <p>与 {@link #hybridSearch(String, int, double)} 相同，但返回带 RRF 融合分数的结果，
+     * <p>返回带 RRF 融合分数的结果，
      * 供下游按分数统一重排序使用。</p>
      *
      * @param query          用户查询文本
@@ -359,7 +295,7 @@ public class HybridSearchService {
     /**
      * <h3>纯向量检索（带相关性阈值）</h3>
      *
-     * <p>与 {@link #vectorSearch(String, int)} 相同，但增加余弦相似度阈值过滤，
+     * <p>增加余弦相似度阈值过滤，
      * 仅返回分数 &ge; minScore 的结果，避免无关查询返回低质量片段。</p>
      *
      * @param query    用户查询文本
@@ -384,7 +320,7 @@ public class HybridSearchService {
      * <h4>关键代码解释</h4>
      * <ul>
      *   <li><b>embeddingModel.embed(query).content()</b>：
-     *       调用 LangChain4j 的嵌入模型（本项目使用 BGE-small-zh 量化模型），
+     *       调用 LangChain4j 的嵌入模型（本项目使用 paraphrase-multilingual-MiniLM-L12-v2 量化模型），
      *       将查询文本转换为高维向量（如 512 维）。这个向量捕获了查询的语义信息。</li>
      *   <li><b>EmbeddingSearchRequest</b>：
      *       构建向量检索请求，指定查询向量和返回数量。PGVector 底层使用

@@ -1,5 +1,6 @@
 package com.hai.aiknowledgebase.service;
 
+import com.hai.aiknowledgebase.annotation.Timed;
 import ai.djl.huggingface.tokenizers.HuggingFaceTokenizer;
 import ai.onnxruntime.OnnxTensor;
 import ai.onnxruntime.OrtEnvironment;
@@ -72,6 +73,10 @@ public class RerankerService {
     @Value("${reranker.gpu-device-id:-1}")
     private int gpuDeviceId;
 
+    /** Rerank 最低分数阈值，低于此分视为不相关 */
+    @Value("${reranker.min-score:-3.5}")
+    private double minScore;
+
     private HuggingFaceTokenizer tokenizer;
     private OrtEnvironment ortEnv;
     private OrtSession session;
@@ -100,6 +105,18 @@ public class RerankerService {
             ortEnv = OrtEnvironment.getEnvironment();
             OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
 
+            // 1. 启用所有优化（常量折叠、图优化、内存复用等）
+            opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
+
+            // 2. 启用 CPU 内存池（Arena），减少内存碎片（默认即启用，显式设置也无妨）
+            opts.setCPUArenaAllocator(true);
+
+            // 3. 设置执行模式为并行（默认即并行，可省略）
+            opts.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.PARALLEL);
+
+            // 4. 设置线程数（对 CPU 推理有效，GPU 下影响较小）
+            opts.setIntraOpNumThreads(Runtime.getRuntime().availableProcessors());
+
             if (gpuDeviceId >= 0) {
                 try {
                     opts.addCUDA(gpuDeviceId);
@@ -112,7 +129,7 @@ public class RerankerService {
                 opts.setIntraOpNumThreads(Runtime.getRuntime().availableProcessors());
                 log.info("使用 CPU 推理，线程数: {}", Runtime.getRuntime().availableProcessors());
             }
-            String onnxModelPath = Paths.get(modelPath, "model_int8.onnx").toString();
+            String onnxModelPath = Paths.get(modelPath, "model.onnx").toString();
             session = ortEnv.createSession(onnxModelPath, opts);
 
             rerankExecutor = Executors.newSingleThreadExecutor(r -> {
@@ -131,20 +148,39 @@ public class RerankerService {
                     log.warn("GPU 预热失败（不影响使用）: {}", e.getMessage());
                 }
             }
+
         } catch (Exception e) {
             log.warn("BGE-Reranker 初始化失败，Rerank 将不可用: {}", e.getMessage());
             initialized = false;
         }
     }
 
+    private volatile boolean cleaned = false;
+
     @PreDestroy
     void cleanup() {
+        if (cleaned) {
+            return;
+        }
+        cleaned = true;
+
         if (rerankExecutor != null) {
             rerankExecutor.shutdownNow();
+            try {
+                rerankExecutor.awaitTermination(3, TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            rerankExecutor = null;
         }
-        if (session != null) {
-            try { session.close(); } catch (Exception ignored) {}
-        }
+
+        // 不手动关闭 session / tokenizer / ortEnv：
+        // ONNX Runtime + CUDA 在 JVM 关闭时存在 native 崩溃问题
+        // (EXCEPTION_ACCESS_VIOLATION)，因为 CUDA context 在 ShutdownHook
+        // 阶段已被销毁，此时 close() 会访问已释放的 GPU 内存。
+        // JVM 进程退出时操作系统会自动回收所有 native 资源，无需手动释放。
+        initialized = false;
+        log.info("Reranker 资源标记为已释放（native 资源由 OS 自动回收）");
     }
 
     /**
@@ -191,6 +227,7 @@ public class RerankerService {
      * @param topN  返回前 N 个结果
      * @return 按分数降序排列的 Rerank 结果
      */
+    @Timed("Rerank 精排")
     public List<RerankResult> rerank(String query, List<String> docs, int topN) {
         if (!initialized) {
             log.debug("Reranker 未初始化，跳过精排");
@@ -301,7 +338,7 @@ public class RerankerService {
             }
             output.close();
 
-            log.info("Rerank batch 推理完成: batchSize={}, maxLen={}, tokenize={}ms, inference={}ms, total={}ms",
+        log.info("Rerank batch 推理完成: batchSize={}, maxLen={}, tokenize={}ms, inference={}ms, total={}ms",
                     batchSize, maxLen, t1 - t0, t2 - t1, t2 - t0);
             return results;
         } finally {
@@ -333,5 +370,12 @@ public class RerankerService {
      */
     public boolean isEnabled() {
         return enabled;
+    }
+
+    /**
+     * Rerank 最低分数阈值
+     */
+    public double getMinScore() {
+        return minScore;
     }
 }

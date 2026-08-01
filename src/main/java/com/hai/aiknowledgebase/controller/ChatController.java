@@ -1,5 +1,6 @@
 package com.hai.aiknowledgebase.controller;
 
+import com.hai.aiknowledgebase.annotation.Timed;
 import com.hai.aiknowledgebase.common.Result;
 import com.hai.aiknowledgebase.dto.ChatMessageDTO;
 import com.hai.aiknowledgebase.dto.ChatRequest;
@@ -25,6 +26,7 @@ public class ChatController {
     /**
      * 问答接口（多轮对话）
      */
+    @Timed("请求 → 响应 总耗时")
     @PostMapping("/ask")
     public Result<HaiChatResponse> ask(@RequestBody ChatRequest request) {
         // 参数校验
@@ -39,8 +41,7 @@ public class ChatController {
 
         HaiChatResponse response = chatService.chat(
                 request.getSessionId(),
-                request.getQuestion(),
-                request.getTopK() > 0 ? request.getTopK() : 5
+                request.getQuestion()
         );
 
         return Result.success(response);

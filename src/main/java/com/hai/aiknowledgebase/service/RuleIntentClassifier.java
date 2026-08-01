@@ -45,6 +45,7 @@ import java.util.regex.Pattern;
  * @see LLMIntentClassifier LLM 兜底分类器
  * @see IntentRecognitionOrchestrator 编排器
  */
+@Deprecated
 @Slf4j
 @Component
 @Order(1)

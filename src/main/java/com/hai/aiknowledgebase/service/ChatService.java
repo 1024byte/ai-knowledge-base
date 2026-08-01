@@ -3,6 +3,7 @@ package com.hai.aiknowledgebase.service;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hai.aiknowledgebase.annotation.Timed;
 import com.hai.aiknowledgebase.dto.*;
 import com.hai.aiknowledgebase.entity.ChatHistory;
 import com.hai.aiknowledgebase.mapper.ChatHistoryMapper;
@@ -66,6 +67,9 @@ public class ChatService {
 
     @Value("${chat.prompt.max-assistant-history-chars:100}")
     private int maxAssistantHistoryChars;
+
+    @Value("${chat.retrieval.top-k:15}")
+    private int topK;
 
     private static final String SYSTEM_PROMPT = """
             基于下方【参考资料】回答【问题】。规则：
@@ -188,10 +192,10 @@ public class ChatService {
      *
      * @param sessionId 会话 ID，由前端生成（如 "user-001"），用于关联多轮对话历史
      * @param question  用户原始问题，不可为空
-     * @param topK      检索返回的最大文档片段数，建议 3~10
      * @return 包含 AI 回答、来源引用和会话 ID 的响应对象
      */
-    public HaiChatResponse chat(String sessionId, String question, int topK) {
+    @Timed("RAG 全流程")
+    public HaiChatResponse chat(String sessionId, String question) {
         long startTime = System.currentTimeMillis();
 
         // 步骤0：查询改写（含指代消解，使用对话历史）
@@ -246,8 +250,7 @@ public class ChatService {
         log.info("LLM 输入: 历史消息={}, 上下文={}/{}, 总估算 token={}",
                 historyMessages.size(), contextResult.usedTokens(), maxContextTokens, totalTokens);
         // 步骤5：调用 LLM 生成回答
-        ChatResponse llmResponse = chatModel.chat(allMessages);
-        String answer = llmResponse.aiMessage().text();
+        String answer = callLLM(allMessages);
 
         // 步骤6：提取来源引用（从检索片段的 metadata.source 去重）
         List<String> sources = segments.stream()
@@ -453,6 +456,19 @@ public class ChatService {
     }
 
     // ==================== 辅助方法 ====================
+
+    /**
+     * LLM 调用包装（手动计时，Spring AOP 不支持 private 方法拦截）
+     */
+    private String callLLM(List<ChatMessage> messages) {
+        long start = System.currentTimeMillis();
+        log.info("LLM 调用 | 发送内容: {}", messages);
+        ChatResponse response = chatModel.chat(messages);
+
+        log.info("[Timed] LLM 生成 | 耗时: {}ms", System.currentTimeMillis() - start);
+        return response.aiMessage().text();
+    }
+
     private String buildPrompt(String context, String question) {
         return String.format("""
                 【参考资料】
@@ -537,15 +553,26 @@ public class ChatService {
     // ==================== Token 预算控制方法 ====================
 
     /**
-     * <h3>上下文 Token 预算制构建</h3>
-     *
-     * <p>按片段顺序逐个填入上下文，累计 token 不超过预算。
-     * 最后一个片段如果超出剩余预算，截断到剩余 token 数而非整段丢弃。</p>
-     *
-     * @param segments       检索到的文档片段列表
-     * @param maxTokens      token 预算上限
-     * @return 上下文构建结果（包含拼接文本、使用片段数、使用 token 数）
+     * "三明治"布局重排：最相关片段放首尾，一般片段放中间
+     * <p>输入已按分数降序排列，输出为 [0, 2, 4, ..., 5, 3, 1] 的交叉排列：
+     * 偶数索引（0,2,4...）放前面，奇数索引倒序（...,3,1）放后面，
+     * 确保最相关的两个片段占据首尾高关注位置，缓解 LLM "lost in the middle" 问题。</p>
      */
+    private List<String> sandwichOrder(List<TextSegment> segments) {
+        List<String> texts = segments.stream().map(TextSegment::text).collect(Collectors.toList());
+        if (texts.size() <= 2) return texts;
+
+        List<String> result = new ArrayList<>();
+        for (int i = 0; i < texts.size(); i += 2) {
+            result.add(texts.get(i));
+        }
+        int start = texts.size() % 2 == 0 ? texts.size() - 1 : texts.size() - 2;
+        for (int i = start; i >= 1; i -= 2) {
+            result.add(texts.get(i));
+        }
+        return result;
+    }
+
     private ContextBuildResult buildContextWithinBudget(List<TextSegment> segments, int maxTokens) {
         if (segments == null || segments.isEmpty()) {
             return new ContextBuildResult("", 0, 0);
@@ -557,8 +584,9 @@ public class ChatService {
         String separator = "\n\n---\n\n";
         int separatorTokens = tokenCountEstimator.estimateTokenCountInText(separator);
 
-        for (int i = 0; i < segments.size(); i++) {
-            String text = segments.get(i).text();
+        List<String> ordered = sandwichOrder(segments);
+        for (int i = 0; i < ordered.size(); i++) {
+            String text = ordered.get(i);
             int textTokens = tokenCountEstimator.estimateTokenCountInText(text);
             int totalAddTokens = textTokens + (i > 0 ? separatorTokens : 0);
 
@@ -603,23 +631,131 @@ public class ChatService {
         if (text == null || text.isEmpty() || maxTokens <= 0) {
             return "";
         }
-        int currentTokens = 0;
-        int lastSentenceEnd = -1;
-        for (int i = 0; i < text.length(); i++) {
-            currentTokens = tokenCountEstimator.estimateTokenCountInText(text.substring(0, i + 1));
-            if (currentTokens > maxTokens) {
-                if (lastSentenceEnd > 0) {
-                    return text.substring(0, lastSentenceEnd + 1);
-                }
-                return text.substring(0, i);
+
+        // 0. 快速检查整体是否满足
+        int totalTokens = tokenCountEstimator.estimateTokenCountInText(text);
+        if (totalTokens <= maxTokens) {
+            return text;
+        }
+
+        // 1. 尝试按段落截断（优先）
+        List<Integer> paragraphBoundaries = findParagraphBoundaries(text);
+        if (!paragraphBoundaries.isEmpty()) {
+            String result = truncateAtBoundaries(text, paragraphBoundaries, maxTokens);
+            if (result != null) {
+                return result; // 成功按段落截断
             }
+            // 如果段落边界全部超出预算，继续尝试句子级
+        }
+
+        // 2. 尝试按句子截断（次优）
+        List<Integer> sentenceBoundaries = findSentenceBoundaries(text);
+        if (!sentenceBoundaries.isEmpty()) {
+            String result = truncateAtBoundaries(text, sentenceBoundaries, maxTokens);
+            if (result != null) {
+                return result; // 成功按句子截断
+            }
+            // 如果句子边界也全部超出，回退到字符截断
+        }
+
+        // 3. 最终回退：按字符二分截断
+        return binarySearchTruncate(text, maxTokens);
+    }
+
+    /**
+     * 寻找段落边界（连续两个换行符的结束位置）
+     * 支持 \n\n 和 \r\n\r\n
+     */
+    private List<Integer> findParagraphBoundaries(String text) {
+        List<Integer> boundaries = new ArrayList<>();
+        int len = text.length();
+        int i = 0;
+        while (i < len) {
+            char c = text.charAt(i);
+            if (c == '\n' || c == '\r') {
+                // 检查是否有连续两个换行符
+                if (i + 1 < len) {
+                    char next = text.charAt(i + 1);
+                    if ((c == '\n' && next == '\n') || (c == '\r' && next == '\n' && i + 2 < len && text.charAt(i + 2) == '\n')) {
+                        // 找到段落结束位置（即第二个换行符的索引）
+                        int endIdx;
+                        if (c == '\r') {
+                            // \r\n\r\n 模式，结束在第三个 \n 的索引? 实际是两个换行符，我们取第二个 \n 的位置
+                            endIdx = i + 3; // \r\n\r\n 的最后一个字符索引
+                        } else {
+                            endIdx = i + 1; // \n\n 的第二个 \n
+                        }
+                        boundaries.add(endIdx);
+                        // 跳过这段，避免重复
+                        i = endIdx + 1;
+                        continue;
+                    }
+                }
+            }
+            i++;
+        }
+        return boundaries;
+    }
+
+    /**
+     * 寻找句子边界（中英文标点 + 换行符）
+     */
+    private List<Integer> findSentenceBoundaries(String text) {
+        List<Integer> boundaries = new ArrayList<>();
+        for (int i = 0; i < text.length(); i++) {
             char c = text.charAt(i);
             if (c == '。' || c == '？' || c == '！' || c == '.' || c == '?' || c == '!'
                     || c == '\n' || c == '；' || c == ';') {
-                lastSentenceEnd = i;
+                boundaries.add(i);
             }
         }
-        return text;
+        return boundaries;
+    }
+
+    /**
+     * 在候选边界列表中，用二分查找找 ≤ maxTokens 的最大边界，返回截断后的子串
+     * 如果找不到任何边界 ≤ maxTokens，返回 null
+     */
+    private String truncateAtBoundaries(String text, List<Integer> boundaries, int maxTokens) {
+        int low = 0, high = boundaries.size() - 1;
+        int bestIdx = -1;
+        while (low <= high) {
+            int mid = (low + high) >>> 1;
+            int pos = boundaries.get(mid);
+            // 截断到 pos+1（包含标点/换行符）
+            String candidate = text.substring(0, pos + 1);
+            int tokenCount = tokenCountEstimator.estimateTokenCountInText(candidate);
+            if (tokenCount <= maxTokens) {
+                bestIdx = mid;
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+        if (bestIdx != -1) {
+            return text.substring(0, boundaries.get(bestIdx) + 1);
+        }
+        return null; // 没有合适的边界
+    }
+
+    /**
+     * 最终回退：按字符二分截断（保证不切断字符）
+     */
+    private String binarySearchTruncate(String text, int maxTokens) {
+        int low = 0, high = text.length();
+        int bestLen = 0;
+        while (low <= high) {
+            int mid = (low + high) >>> 1;
+            String sub = text.substring(0, mid);
+            int tokenCount = tokenCountEstimator.estimateTokenCountInText(sub);
+            if (tokenCount <= maxTokens) {
+                bestLen = mid;
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+        return text.substring(0, bestLen);
     }
 
     /**

@@ -16,49 +16,25 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * L1 层改写服务
- * 规则改写
- * 1. 固定映射
- * 2. 同义词替换
+ * L1 层改写服务（规则改写）
+ *
+ * <h3>处理流程</h3>
+ * <ol>
+ *   <li><b>固定映射替换</b>：按 key 长度降序匹配，长词优先，区间占用检测防止重复替换</li>
+ *   <li><b>排除关键词提取</b>：正则匹配"不包含/除了/不要"等模式</li>
+ *   <li><b>置信度计算</b>：固定映射命中 → 取映射配置的置信度上限；无命中 → 0.50</li>
+ * </ol>
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class L1RuleBasedTransformer {
 
-
-    /** 词典配置加载器：提供同义词词典、固定映射、停用词，支持定时热加载 */
     private final QueryRewriteConfigLoader configLoader;
-
     private final KeywordsUtils keywordsUtils;
 
     /**
-     * L1 规则改写（Rule-based Rewrite）
-     *
-     * <h3>核心策略：统一候选列表 + 区间占用检测</h3>
-     * 将固定映射和同义词统一抽象为候选列表，按长度降序排序，确保长词优先匹配，
-     * 彻底解决短词误伤长词的问题（如"API"优先匹配"API网关"而非单独的"API"）。
-     *
-     * <h3>处理流程</h3>
-     * <ol>
-     *   <li><b>构建候选列表</b>：合并固定映射和同义词为统一 Candidate 列表，
-     *       按 key 长度降序排序，同长度时固定映射优先</li>
-     *   <li><b>统一匹配</b>：遍历候选列表，使用 {@link #isOverlapping(List, int, int)}
-     *       检测区间占用，避免重复替换同一位置</li>
-     *   <li><b>执行替换</b>：从后往前替换，避免索引偏移（后替换的不影响前面位置的索引）</li>
-     *   <li><b>收集扩展关键词</b>：提取同义词词典中命中的词 + 简单关键词</li>
-     *   <li><b>提取排除词</b>：正则匹配"不包含/除了/不要"等模式</li>
-     *   <li><b>计算置信度</b>：固定映射命中 → 取映射配置的置信度上限；
-     *       同义词命中 → 0.80；有替换但无命中 → 0.70；无替换 → 0.50</li>
-     * </ol>
-     *
-     * <h3>设计说明</h3>
-     * <ul>
-     *   <li>同义词改写格式为 "key + 空格 + firstSynonym"，如"计算机 电脑"，
-     *       保留原始词的同时追加同义词，便于向量检索覆盖更多语义</li>
-     *   <li>区间占用检测确保同一位置不会被多个规则重复替换</li>
-     *   <li>固定映射每词只替换第一次出现（break 机制），避免重复替换</li>
-     * </ul>
+     * L1 规则改写：固定映射替换 + 排除关键词提取
      *
      * @param query 原始查询文本（已 trim）
      * @return L1 改写结果
@@ -66,84 +42,52 @@ public class L1RuleBasedTransformer {
     public QueryRewriteResult applyRuleRewrite(String query) {
         Map<String, String> fixedMapping = configLoader.getFixedMapping();
         Map<String, Double> fixedConfidenceMap = configLoader.getFixedMappingConfidence();
-        Map<String, List<String>> synonymDict = configLoader.getSynonymDict();
 
-        // ========== 1. 统一候选列表（固定映射 + 同义词） ==========
+        // ========== 1. 构建候选列表（仅固定映射） ==========
 
         List<Candidate> candidates = new ArrayList<>();
-
-        // 1.1 固定映射候选
         for (Map.Entry<String, String> entry : fixedMapping.entrySet()) {
             String key = entry.getKey();
             candidates.add(new Candidate(
                     key,
                     entry.getValue(),
-                    true,  // isFixedMapping
+                    true,
                     fixedConfidenceMap.getOrDefault(key, 0.95)
-            ));
-        }
-
-        // 1.2 同义词候选
-        for (Map.Entry<String, List<String>> entry : synonymDict.entrySet()) {
-            String key = entry.getKey();
-            List<String> synonyms = entry.getValue();
-            if (synonyms == null || synonyms.isEmpty()) {
-                continue;
-            }
-            String firstSynonym = synonyms.get(0);//为什这里取第一个同义词
-            if (key.equals(firstSynonym)) {
-                continue; // 同义词就是自己，跳过
-            }
-            candidates.add(new Candidate(
-                    key,
-                    key + " " + firstSynonym,
-                    false, // isFixedMapping
-                    0.80   // 同义词置信度
             ));
         }
 
         candidates.sort((a, b) -> {
             int lenCmp = Integer.compare(b.key.length(), a.key.length());
             if (lenCmp != 0) return lenCmp;
-            // 长度相同，固定映射优先
-            if (a.isFixedMapping != b.isFixedMapping) {
-                return a.isFixedMapping ? -1 : 1;
-            }
             return 0;
         });
-        // ========== 2. 统一匹配（共享区间占用集合） ==========
+
+        // ========== 2. 匹配 + 区间占用检测 ==========
 
         List<Replacement> replacements = new ArrayList<>();
         List<Interval> occupiedIntervals = new ArrayList<>();
         boolean fixedMappingHit = false;
-        boolean synonymHit = false;
 
         for (Candidate candidate : candidates) {
             String key = candidate.key;
             int searchStart = 0;
-            int index;
-            boolean matched = false;
 
-            while ((index = query.indexOf(key, searchStart)) >= 0) {
+            while (true) {
+                int index = query.indexOf(key, searchStart);
+                if (index < 0) break;
                 int end = index + key.length();
 
-                // 检查是否与已占用区间重叠
                 if (!isOverlapping(occupiedIntervals, index, end)) {
                     occupiedIntervals.add(new Interval(index, end));
                     replacements.add(new Replacement(index, end, candidate.replacement));
-                    if (candidate.isFixedMapping) {
-                        fixedMappingHit = true;
-                    } else {
-                        synonymHit = true;
-                    }
-                    matched = true;
+                    fixedMappingHit = true;
                     break;
                 }
                 searchStart = index + 1;
             }
         }
 
-        // ========== 3. 执行替换（从后往前，避免索引偏移） ==========
+        // ========== 3. 执行替换（从后往前） ==========
 
         replacements.sort((a, b) -> Integer.compare(b.start, a.start));
 
@@ -153,22 +97,15 @@ public class L1RuleBasedTransformer {
         }
         String result = resultBuilder.toString();
 
-        // ========== 4. 排除词 ==========
+        // ========== 4. 排除关键词提取 ==========
 
         List<String> excludeKeywords = keywordsUtils.extractExcludeKeywords(query);
 
         // ========== 5. 置信度 ==========
 
-        double confidence;
-        if (fixedMappingHit) {
-            confidence = getFixedMappingMaxConfidence(query, fixedConfidenceMap);
-        } else if (synonymHit) {
-            confidence = 0.80;
-        } else if (!result.equals(query)) {
-            confidence = 0.70;
-        } else {
-            confidence = 0.50;
-        }
+        double confidence = fixedMappingHit
+                ? getFixedMappingMaxConfidence(query, fixedConfidenceMap)
+                : 0.50;
 
         return QueryRewriteResult.builder()
                 .rewrittenQuery(result)

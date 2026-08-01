@@ -55,15 +55,23 @@ langchain4j:
 
 # 查询改写配置
 query-rewrite:
-  enabled: true                      # 总开关
-  config:
-    synonyms-path: query-rewrite/synonyms.json
-    fixed-mapping-path: query-rewrite/fixed-mapping.json
-    stopwords-path: query-rewrite/stopwords.json
+  enabled: true
+  local-llm:
+    enabled: true                          # 本地 LLM 改写开关
+    base-url: http://localhost:11434       # Ollama 服务地址
+    model-name: qwen2.5:3b                # 模型名称
+    temperature: 0.1                       # 改写需要确定性，越低越好
+    max-tokens: 128                        # 改写结果不需要长文本
+    timeout-ms: 2000                        # 严格超时（ms）
+    fidelity-threshold: 0.75              # 改写保真度阈值（cosine similarity）
+    rewrite-timeout-ms: 1500               # 改写超时时间（毫秒）
+    # 以下配置保留但降级为辅助
   l1:
-    confidence-threshold: 0.85       # L1 置信度高于此值直接返回
+    confidence-threshold: 0.85
   l2:
-    confidence-threshold: 0.70       # L2 置信度高于此值直接返回
+    confidence-threshold: 0.80
+
+
 
 # 三层漏斗纠错配置
 corrector:
@@ -92,7 +100,8 @@ reranker:
   enabled: true                     # 总开关：true=启用 Rerank 精排，false=跳过
   model-path: models/bge-reranker-v2-m3  # ONNX 模型目录（含 model.onnx + tokenizer.json）
   timeout-ms: 15000                  # Rerank 超时时间（毫秒，GPU 首次推理需 CUDA 预热）
-  max-docs: 30                       # 单次 Rerank 最大文档数（防止 OOM）
+  max-docs: 5                       # 单次 Rerank 最大文档数（防止 OOM）
+  min-score: -4.5                   # Rerank 最低分数阈值，低于此分视为不相关，不送入 LLM
   max-seq-length: 512                # 模型最大序列长度
   gpu-device-id: 0                 # GPU 设备 ID：-1=CPU 推理，>=0=指定 GPU（需安装 CUDA 12.x + cuDNN 9.x）
 
@@ -102,3 +111,5 @@ chat:
     max-context-tokens: 3000         # 检索上下文最大 token 数，超出按片段截断
     max-history-tokens: 1500         # 历史对话最大 token 数，超出从最早的消息开始丢弃
     max-assistant-history-chars: 100  # 历史中 assistant 消息截断字符数（用于 LLM 输入和改写）
+  retrieval:
+    top-k: 15

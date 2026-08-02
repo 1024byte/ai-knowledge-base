@@ -33,12 +33,37 @@ def _read_api_key_from_yml() -> str:
     return ""
 
 
+def _read_dashscope_key_from_yml() -> str:
+    """从 application-dev.yml 中读取 dashscope.api-key"""
+    yml_paths = [
+        os.path.join(os.path.dirname(__file__), "..", "src", "main", "resources", "application-dev.yml"),
+        os.path.join(os.path.dirname(__file__), "..", "src", "main", "resources", "application.yml"),
+    ]
+    for yml_path in yml_paths:
+        abs_path = os.path.normpath(yml_path)
+        if os.path.exists(abs_path):
+            with open(abs_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            match = re.search(r"dashscope:\s*\r?\n\s*api-key:\s*(\S+)", content)
+            if match:
+                return match.group(1).strip()
+    return ""
+
+
 def _get_api_key() -> str:
     """获取 API Key，优先环境变量，其次 yml 文件"""
     key = os.getenv("DEEPSEEK_API_KEY", "")
     if key:
         return key
     return _read_api_key_from_yml()
+
+
+def _get_dashscope_key() -> str:
+    """获取 DashScope API Key，优先环境变量，其次 yml 文件"""
+    key = os.getenv("DASHSCOPE_API_KEY", "")
+    if key:
+        return key
+    return _read_dashscope_key_from_yml()
 
 
 @dataclass
@@ -68,7 +93,7 @@ class EvalConfig:
 
     # AnswerRelevancy 专用 LLM（需要支持 n>1，DeepSeek 不支持）
     # 阿里云 DashScope 兼容 OpenAI 格式，通义千问支持 n>1
-    ar_api_key: str = os.getenv("DASHSCOPE_API_KEY", "")
+    ar_api_key: str = field(default_factory=_get_dashscope_key)
     ar_api_base: str = os.getenv("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1")
     ar_model: str = os.getenv("DASHSCOPE_MODEL", "qwen-plus")
 

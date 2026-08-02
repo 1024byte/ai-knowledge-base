@@ -108,8 +108,8 @@ reranker:
 # Chat Prompt Token 预算控制
 chat:
   prompt:
-    max-context-tokens: 3000         # 检索上下文最大 token 数，超出按片段截断
-    max-history-tokens: 1500         # 历史对话最大 token 数，超出从最早的消息开始丢弃
-    max-assistant-history-chars: 100  # 历史中 assistant 消息截断字符数（用于 LLM 输入和改写）
+    max-context-tokens: 8000         # 检索上下文最大 token 数，超出按片段截断
+    max-history-tokens: 3000         # 历史对话最大 token 数，超出从最早的消息开始丢弃
+    max-assistant-history-chars: 300  # 历史中 assistant 消息截断字符数（用于 LLM 输入和改写）
   retrieval:
     top-k: 15

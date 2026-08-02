@@ -35,7 +35,6 @@ public class FunnelQueryCorrector {
 
     private final L1WordCheckerCorrector l1;
     private final L2PinyinCorrector l2;
-    private final L3LLMCorrector l3;
 
     @Value("${corrector.l1.threshold:0.85}")
     private double l1Threshold;

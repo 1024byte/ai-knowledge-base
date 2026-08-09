@@ -343,7 +343,7 @@ class FunnelCorrectorTest {
 
         @BeforeEach
         void setUp() {
-            funnel = new FunnelQueryCorrector(l1, l2, l3);
+            funnel = new FunnelQueryCorrector(l1, l2);
             ReflectionTestUtils.setField(funnel, "l1Threshold", 0.85);
             ReflectionTestUtils.setField(funnel, "l1TimeoutMs", 50L);
             ReflectionTestUtils.setField(funnel, "l2Threshold", 0.80);

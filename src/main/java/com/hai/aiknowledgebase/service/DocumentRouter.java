@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 /**
  * <h2>文档智能路由器</h2>
@@ -93,6 +94,11 @@ public class DocumentRouter {
      */
     private final ContentAnalyzer contentAnalyzer = new ContentAnalyzer();
 
+    /**
+     * 试卷/试题内容预处理器，用于分离正文、题目、词汇表。
+     */
+    private final ExamPaperPreprocessor examPaperPreprocessor;
+
     // ======================== 路由入口 ========================
 
     /**
@@ -151,10 +157,14 @@ public class DocumentRouter {
         log.info("文档 [{}] 分类为: {}", customDocument.getFileName(), category);
 
         // ===== 步骤4：根据分类获取配置 =====
-        // 四种分类对应四种预设配置（见 ChunkingConfig 类）
         ChunkingConfig config = getConfigForCategory(category);
 
-        // ===== 步骤5：获取或创建对应的 Chunker（带缓存） =====
+        // ===== 步骤4.5：试题文档预处理（分离正文/题目/词汇表）=====
+        if (category == ContentCategory.EXAM_PAPER) {
+            return routeExamPaper(content, config, customDocument.getFileName());
+        }
+
+        // ===== 步骤5：获取或创建对应的 Chunker（带缓存）=====
         // 以配置参数为 Key，避免为每个文档重复创建 Chunker 实例
         String cacheKey = buildCacheKey(config);
         log.info("使用配置缓存 Key: {}", cacheKey);
@@ -206,10 +216,86 @@ public class DocumentRouter {
                 return ChunkingConfig.LEGAL;
             case TABLE_HEAVY:
                 return ChunkingConfig.TABLE_HEAVY;
+            case EXAM_PAPER:
+                return ChunkingConfig.EXAM_PAPER;
             case GENERAL:
             default:
                 return ChunkingConfig.GENERAL;
         }
+    }
+
+    /**
+     * <h3>试题文档路由：预处理分离 + 分类分块</h3>
+     *
+     * <p>对试卷/阅读理解材料，先通过 {@link ExamPaperPreprocessor} 将混合内容
+     * 拆分为正文、题目、词汇表、答案等独立区域，再分别对每个区域按类型分块，
+     * 每个 Chunk 携带 {@code content_type} 元数据。</p>
+     *
+     * <h4>处理流程</h4>
+     * <pre>
+     * 原始混合文档
+     *     │
+     *     ├── ExamPaperPreprocessor.preprocess()
+     *     │      ├── Region 1: PASSAGE  → "Most Americans would find..."
+     *     │      ├── Region 2: QUESTION → "1. According to the..."
+     *     │      ├── Region 3: VOCAB    → "most 最/大多数 = majority..."
+     *     │      └── Region 4: ANSWER   → "答案：1. B  2. C"
+     *     │
+     *     └── 每个 Region 独立分块 → Chunk 携带 content_type 元数据
+     * </pre>
+     *
+     * @param content  原始文档文本
+     * @param config   切分配置
+     * @param fileName 文件名（用于日志）
+     * @return 带 {@code content_type} 元数据的 Chunk 列表
+     */
+    private List<MarkdownDocumentChunker.Chunk> routeExamPaper(
+            String content, ChunkingConfig config, String fileName) {
+        log.info("文档 [{}] 为试题材料，启用内容分离预处理", fileName);
+
+        // 阶段1：预处理分离内容区域
+        List<ExamPaperPreprocessor.ContentRegion> regions =
+                examPaperPreprocessor.preprocess(content);
+        log.info("预处理完成: {} 个内容区域 → {}",
+                regions.size(),
+                regions.stream()
+                        .map(r -> r.type() + "(" + r.text().length() + "字)")
+                        .collect(Collectors.joining(", ")));
+
+        // 阶段2：获取 Chunker 实例
+        String cacheKey = buildCacheKey(config);
+        MarkdownDocumentChunker chunker = chunkerCache.computeIfAbsent(cacheKey, key -> {
+            EmbeddingModel modelToUse = config.isEnableSemantic() ? embeddingModel : null;
+            return new MarkdownDocumentChunker(
+                    config.getMinTokens(),
+                    config.getMaxTokens(),
+                    config.getOverlapRatio(),
+                    tokenEstimator,
+                    modelToUse,
+                    config.getSemanticThreshold()
+            );
+        });
+
+        // 阶段3：对每个区域独立分块，附加 content_type 元数据
+        List<MarkdownDocumentChunker.Chunk> allChunks = new ArrayList<>();
+        for (ExamPaperPreprocessor.ContentRegion region : regions) {
+            List<MarkdownDocumentChunker.Chunk> regionChunks = chunker.chunk(region.text());
+
+            // 为每个 Chunk 附加 content_type 元数据
+            String contentType = region.type().name().toLowerCase();
+            for (MarkdownDocumentChunker.Chunk chunk : regionChunks) {
+                allChunks.add(new MarkdownDocumentChunker.Chunk(
+                        chunk.text(),
+                        chunk.tokenCount(),
+                        chunk.contextPrefix(),
+                        Map.of("content_type", contentType)
+                ));
+            }
+        }
+
+        log.info("试题文档 [{}] 分块完成: {} 个区域 → {} 个 chunk",
+                fileName, regions.size(), allChunks.size());
+        return allChunks;
     }
 
     /**

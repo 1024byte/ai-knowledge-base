@@ -8,6 +8,7 @@ public enum ContentCategory {
     TECHNICAL("technical", "技术文档"),
     LEGAL("legal", "法律合同文档"),
     TABLE_HEAVY("table_heavy", "表格密集文档"),
+    EXAM_PAPER("exam_paper", "试卷/阅读理解材料"),
     GENERAL("general", "通用文档");
 
     // 库存储标识 + 中文描述

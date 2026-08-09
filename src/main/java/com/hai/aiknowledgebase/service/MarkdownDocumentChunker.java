@@ -4,6 +4,8 @@ import dev.langchain4j.model.TokenCountEstimator;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import lombok.extern.slf4j.Slf4j;
 
+import com.hai.aiknowledgebase.config.ChunkingConfig;
+
 import java.text.BreakIterator;
 import java.util.*;
 import java.util.regex.Matcher;
@@ -43,6 +45,38 @@ public class MarkdownDocumentChunker {
     /** 匹配 Markdown 代码块：{@code ```} 包裹的任意内容 */
     private static final Pattern CODE_BLOCK_PATTERN = Pattern.compile(
             "```[a-zA-Z0-9_]*\\s*[\\s\\S]*?```",
+            Pattern.MULTILINE
+    );
+
+    /**
+     * 匹配编号子标题模式，用于检测"同级别编号子标题"场景。
+     * 支持以下编号格式：
+     * <ul>
+     *   <li>阿拉伯数字：{@code 1.}, {@code 2、}, {@code 3）}, {@code 4)}</li>
+     *   <li>中文数字：{@code 一、}, {@code 二、}, {@code 三．}</li>
+     *   <li>括号编号：{@code （1）}, {@code (2)}, {@code （一）}, {@code (二)}</li>
+     * </ul>
+     *
+     * <p>正则说明：</p>
+     * <pre>
+     *   ^                — 行首
+     *   #{1,6}           — Markdown 标题标记
+     *   \s+              — 标题标记后的空格
+     *   编号体           — 阿拉伯数字 | 中文数字 | 括号编号
+     *   [\.、．）\)]     — 编号后的分隔符
+     *   \s               — 分隔符后的空格
+     * </pre>
+     */
+    private static final Pattern NUMBERED_HEADING_PATTERN = Pattern.compile(
+            "^(#{1,6})\\s+" +
+            "(" +
+            "\\d{1,3}[．、\\.）\\)]\\s?" +                          // 1. 2、3）4)（空格可选）
+            "|" +
+            "[一二三四五六七八九十]{1,3}[、．\\.]\\s?" +             // 一、二、三．（空格可选）
+            "|" +
+            "[（\\(]\\s*(\\d{1,3}|[一二三四五六七八九十]{1,3})\\s*[）\\)]\\s?" +  // （1）（二）（空格可选）
+            ")" +
+            ".+$",
             Pattern.MULTILINE
     );
 
@@ -114,9 +148,174 @@ public class MarkdownDocumentChunker {
         List<Chunk> rawChunks = iterativeChunk(sections, "");
         // 步骤3+4：合并小片段 + 添加重叠（在 applyOverlap 内部完成）
         List<Chunk> overlappedChunks = applyOverlap(rawChunks);
+
+        // 步骤5：为每个 chunk 预计算父上下文（parent_text）
+        // 检索命中时直接用 parent_text 替换 chunk 文本，无需运行时查询邻块
+        computeParentText(overlappedChunks);
+
         log.debug("切片完成: {} 个 section → {} 个原始 chunk → {} 个重叠 chunk",
                 sections.size(), rawChunks.size(), overlappedChunks.size());
         return overlappedChunks;
+    }
+
+    /**
+     * <h3>预计算父上下文（parent_text），按主题边界截断</h3>
+     *
+     * <p>为每个 chunk 生成一个包含前后相邻 chunk 的"全景文本"，
+     * 存入 metadata 的 {@code parent_text} 字段。</p>
+     *
+     * <h4>窗口大小</h4>
+     * <p>由 {@link ChunkingConfig#PARENT_WINDOW} 控制，默认 2。
+     * 每个 chunk 的 parent_text = 自身 + 前 2 个 + 后 2 个（边界处自动截断）。</p>
+     *
+     * <h4>主题边界检测</h4>
+     * <p>窗口向前/后扩展时，遇到不同 H1/H2 标题的 chunk 立即停止。
+     * 防止多主题文档（如试卷）中不同主题的上下文交叉污染。</p>
+     *
+     * <h4>示例</h4>
+     * <pre>
+     *   Chunk 20: "## 期望的优化效果" (金融服务 H2)
+     *   Chunk 21: "..." (无标题，继承金融服务)
+     *   Chunk 22: "## 1.2.4-1 智能卖点" (卖点系统 H2) ← 边界
+     *
+     *   Chunk 22 的 parent_text 只包含 Chunk 22~24（卖点主题内），
+     *   不会跨越到 Chunk 20~21（金融服务主题）。
+     * </pre>
+     *
+     * @param chunks 重叠处理后的 chunk 列表
+     */
+    private void computeParentText(List<Chunk> chunks) {
+        int window = ChunkingConfig.PARENT_WINDOW;
+
+        // 第一遍：为每个 chunk 提取 H1/H2 级标题作为主题标识
+        // 无标题的 chunk 继承前一个 chunk 的主题标识
+        String[] sectionKeys = new String[chunks.size()];
+        String currentSection = null;
+        for (int i = 0; i < chunks.size(); i++) {
+            String key = extractTopSectionKey(chunks.get(i).text());
+            if (key != null) {
+                currentSection = key;
+            }
+            sectionKeys[i] = currentSection;
+        }
+
+        for (int i = 0; i < chunks.size(); i++) {
+            String mySection = sectionKeys[i];
+
+            // 向前扩展：遇到不同主题立即停止
+            int start = i;
+            for (int s = i - 1; s >= 0 && s >= i - window; s--) {
+                if (sectionKeys[s] != null && mySection != null
+                        && !sectionKeys[s].equals(mySection)) {
+                    break;
+                }
+                start = s;
+            }
+
+            // 向后扩展：遇到不同主题立即停止
+            int end = i + 1;
+            for (int e = i + 1; e < chunks.size() && e <= i + window; e++) {
+                if (sectionKeys[e] != null && mySection != null
+                        && !sectionKeys[e].equals(mySection)) {
+                    break;
+                }
+                end = e;
+            }
+
+            String parentText = buildParentTextWithoutOverlap(chunks, start, end);
+
+            chunks.get(i).metadata().put("parent_text", parentText);
+            chunks.get(i).metadata().put("parent_start", String.valueOf(start));
+            chunks.get(i).metadata().put("parent_end", String.valueOf(end - 1));
+        }
+    }
+
+    /**
+     * <h3>从 chunk 文本中提取顶级标题（H1/H2）作为主题标识</h3>
+     *
+     * <p>只识别 H1 和 H2 级别的标题，H3-H6 视为同一主题内的子标题。
+     * 返回 null 表示当前 chunk 没有顶级标题（继承前一个 chunk 的主题）。</p>
+     *
+     * @param text chunk 文本
+     * @return 顶级标题文本，或 null
+     */
+    private String extractTopSectionKey(String text) {
+        Matcher m = HEADING_PATTERN.matcher(text);
+        if (m.find()) {
+            int level = m.group(1).length();
+            if (level <= 2) {
+                return m.group(2).trim();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * <h3>拼接窗口内 chunk 文本，去除相邻 chunk 之间的 overlap 重复</h3>
+     *
+     * <p>由于 applyOverlap 会将前一个 chunk 的尾部拼接到当前 chunk 的头部，
+     * 直接拼接多个 chunk 会导致 overlap 区域重复出现。
+     * 本方法在拼接时检测并去除相邻 chunk 之间的重叠内容。</p>
+     *
+     * <h4>算法</h4>
+     * <ol>
+     *   <li>从第二个 chunk 开始，检测其头部是否与前一个 chunk 的尾部存在重叠</li>
+     *   <li>如果找到重叠，从当前 chunk 中去除重复的头部部分</li>
+     *   <li>用 \n\n 拼接去重后的 chunk 文本</li>
+     * </ol>
+     *
+     * @param chunks chunk 列表
+     * @param start  窗口起始索引
+     * @param end    窗口结束索引（不含）
+     * @return 去除 overlap 重复后的拼接文本
+     */
+    private String buildParentTextWithoutOverlap(List<Chunk> chunks, int start, int end) {
+        StringBuilder parentText = new StringBuilder();
+        String prevText = null;
+
+        for (int j = start; j < end; j++) {
+            String currText = chunks.get(j).text();
+
+            if (prevText != null) {
+                // 检测当前 chunk 头部与前一个 chunk 尾部的重叠
+                String overlap = findOverlapSuffix(prevText, currText);
+                if (!overlap.isEmpty()) {
+                    // 去除当前 chunk 头部的重叠部分
+                    currText = currText.substring(overlap.length());
+                }
+                parentText.append("\n\n");
+            }
+
+            parentText.append(currText);
+            prevText = chunks.get(j).text();
+        }
+
+        return parentText.toString();
+    }
+
+    /**
+     * <h3>查找 text1 尾部与 text2 头部的重叠文本</h3>
+     *
+     * <p>按段落边界从长到短匹配，找到 text1 的后缀与 text2 的前缀的最大重叠。</p>
+     *
+     * @param text1 前一个 chunk 的完整文本
+     * @param text2 当前 chunk 的完整文本
+     * @return 重叠的文本内容（可能为空字符串）
+     */
+    private String findOverlapSuffix(String text1, String text2) {
+        // 按段落分割 text1，从后向前组合后缀，在 text2 头部查找匹配
+        String[] paragraphs = text1.split("(?<=\\n\\n)");
+        StringBuilder suffix = new StringBuilder();
+        for (int i = paragraphs.length - 1; i >= 0; i--) {
+            suffix.insert(0, paragraphs[i]);
+            String candidate = suffix.toString().strip();
+            if (candidate.isEmpty()) continue;
+            // 检查 text2 是否以该后缀开头（允许前导空白差异）
+            if (text2.stripLeading().startsWith(candidate)) {
+                return candidate;
+            }
+        }
+        return "";
     }
 
     // ======================== Section 数据结构 ========================
@@ -235,8 +434,121 @@ public class MarkdownDocumentChunker {
             sections.add(new Section(heading.level, heading.fullLine, content));
         }
 
+        // 步骤4：规范化同级别编号子标题（将平级编号标题调整为父子层级）
+        normalizeNumberedSiblingHeadings(sections);
+
         // 将扁平 Section 列表转为树结构
         return buildSectionTree(sections);
+    }
+
+    /**
+     * <h3>规范化同级别编号子标题</h3>
+     *
+     * <p>解决"父标题和子标题使用相同 Markdown 标题级别"导致层级丢失的问题。</p>
+     *
+     * <h4>场景示例</h4>
+     * <pre>
+     *   ## 腾讯云智能数智人系统优化方案       ← 父标题（无内容，无编号）
+     *   ## 1. 数据收集与分析                  ← 实为子标题（有编号，同级）
+     *   ## 2. 模型优化与训练                  ← 实为子标题（有编号，同级）
+     *   ## 3. 界面与交互设计优化              ← 实为子标题（有编号，同级）
+     * </pre>
+     *
+     * <h4>处理规则</h4>
+     * <ol>
+     *   <li>扫描扁平 Section 列表，寻找"非编号标题 + 连续编号标题"模式</li>
+     *   <li>非编号标题的 content 为空（或仅空白）→ 判定为父标题</li>
+     *   <li>非编号标题的 content 短于 minTokens → 视为章节导语，仍判定为父标题</li>
+     *   <li>后续连续编号标题的 level 提升 1 级（如 H2→H3），使其成为子节点</li>
+     *   <li>只提升一级，且不超过 H6 上限</li>
+     * </ol>
+     *
+     * <h4>为什么只处理"父标题无内容/短内容"的情况？</h4>
+     * <p>如果父标题有大量实质内容（超过 minTokens），则它和编号标题可能是并列关系
+     * （如多个独立章节），不应强行改变层级。仅当父标题为空壳或仅有简短导语时
+     * 才判定为"标题性父节点"。简短导语的阈值取 minTokens，因为短于该值的文本
+     * 无法构成有意义的独立 chunk。</p>
+     *
+     * @param sections 扁平 Section 列表（会被原地修改 level 字段）
+     */
+    private void normalizeNumberedSiblingHeadings(List<Section> sections) {
+        if (sections.size() < 2) return;
+
+        for (int i = 0; i < sections.size() - 1; i++) {
+            Section current = sections.get(i);
+
+            // 条件1：当前标题是非编号标题
+            if (isNumberedHeading(current.title)) continue;
+
+            // 条件2：当前标题的 content 过长（超过 minTokens），视为独立章节，不作为父标题。
+            // 短内容（如章节导语、概述）仍允许作为父标题，因为短于 minTokens 的文本
+            // 无法构成有意义的独立 chunk。
+            if (!current.content.isBlank() && current.content.trim().length() > minTokens) continue;
+
+            // 条件3：当前标题有实质标题文本（非 level=0 的虚拟 Section）
+            if (current.level == 0) continue;
+
+            // 条件4：下一个标题是同级别的编号标题
+            int j = i + 1;
+            if (sections.get(j).level != current.level) continue;
+            if (!isNumberedHeading(sections.get(j).title)) continue;
+
+            // 找到连续编号子标题序列：[j, end)
+            int end = j;
+            while (end < sections.size()
+                    && sections.get(end).level == current.level
+                    && isNumberedHeading(sections.get(end).title)) {
+                end++;
+            }
+
+            // 至少要有 2 个连续编号子标题才判定为父子关系
+            // （单个编号标题可能是并列关系，而非父子）
+            int numberedCount = end - j;
+            if (numberedCount < 2) continue;
+
+            // 提升所有编号子标题的层级（不超过 H6）
+            int newLevel = Math.min(current.level + 1, 6);
+            log.debug("检测到同级别编号子标题模式: 父='{}' (L{}), 子标题数={}, 提升至 L{}",
+                    current.title.replaceAll("^#+\\s+", ""),
+                    current.level, numberedCount, newLevel);
+
+            for (int k = j; k < end; k++) {
+                Section child = sections.get(k);
+                child.level = newLevel;
+                // 同步更新 title 中的 # 数量
+                child.title = "#".repeat(newLevel) + " " +
+                        child.title.replaceFirst("^#+\\s+", "");
+            }
+
+            // 跳过已处理的编号子标题
+            i = end - 1;
+        }
+    }
+
+    /**
+     * <h3>判断标题是否为编号格式</h3>
+     *
+     * <p>检测标题文本是否匹配 {@link #NUMBERED_HEADING_PATTERN}。
+     * 例如：{@code ## 1. 数据收集}、{@code ## 一、概述}、{@code ## （1）步骤} 等。</p>
+     *
+     * <p>排除章节引用编号（如 {@code ## 1. 2. 4-1}、{@code ## 1. 2. 5-2}），
+     * 这些是文档结构标记而非内容编号标题，不应参与层级规范化。</p>
+     *
+     * @param headingText 完整标题行（含 # 前缀，如 "## 1. 数据收集与分析"）
+     * @return true 表示是编号标题
+     */
+    private boolean isNumberedHeading(String headingText) {
+        if (headingText == null || headingText.isBlank()) return false;
+        if (!NUMBERED_HEADING_PATTERN.matcher(headingText).matches()) return false;
+
+        // 排除章节引用编号：如 "## 1. 2. 4-1"、"## 1. 2. 5-2"
+        // 去掉 # 前缀后，如果标题文本以 "数字.数字." 开头，说明是章节引用
+        String titlePart = headingText.replaceFirst("^#+\\s+", "");
+        if (titlePart.matches("\\d{1,3}[．、\\.）\\)]\\s*\\d{1,3}[．、\\.].*")) {
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -946,12 +1258,15 @@ public class MarkdownDocumentChunker {
                 accumulator = chunk;
             } else if (accumulator.tokenCount < minTokens
                     && accumulator.tokenCount + chunk.tokenCount <= maxTokens
-                    && accumulator.contextPrefix.equals(chunk.contextPrefix)) {
+                    && isContextPrefixCompatible(accumulator.contextPrefix, chunk.contextPrefix)) {
                 // 合并条件满足：用 \n\n 连接两个 Chunk
                 String combinedText = accumulator.text + "\n\n" + chunk.text;
+                // 合并后使用更具体的 contextPrefix（子节点的）
+                String mergedPrefix = chunk.contextPrefix.length() > accumulator.contextPrefix.length()
+                        ? chunk.contextPrefix : accumulator.contextPrefix;
                 accumulator = new Chunk(combinedText,
                         tokenEstimator.estimateTokenCountInText(combinedText),
-                        accumulator.contextPrefix);
+                        mergedPrefix);
             } else {
                 // 不满足合并条件：输出累加器，用当前 Chunk 作为新累加器
                 merged.add(accumulator);
@@ -962,6 +1277,28 @@ public class MarkdownDocumentChunker {
         // 输出最后一个累加器
         if (accumulator != null) merged.add(accumulator);
         return merged;
+    }
+
+    /**
+     * <h3>判断两个 contextPrefix 是否兼容（可合并）</h3>
+     *
+     * <p>兼容条件：两者相等，或者一个为另一个的前缀（父子关系）。
+     * 当父节点的标题 chunk 过小（&lt; minTokens）时，允许它与第一个子节点合并，
+     * 避免产生孤立的微小 chunk。</p>
+     *
+     * <p>例如：{@code "1. 2. 4-1"} 与 {@code "1. 2. 4-1 > 1. 卖点生成不准确"}
+     * 是兼容的（前者是后者的前缀），允许合并。</p>
+     *
+     * @param prefix1 第一个 contextPrefix
+     * @param prefix2 第二个 contextPrefix
+     * @return true 表示可以合并
+     */
+    private boolean isContextPrefixCompatible(String prefix1, String prefix2) {
+        if (prefix1 == null || prefix2 == null) return false;
+        if (prefix1.isEmpty() || prefix2.isEmpty()) return false;
+        return prefix1.equals(prefix2)
+                || prefix1.startsWith(prefix2)
+                || prefix2.startsWith(prefix1);
     }
 
     // ======================== 重叠处理 ========================
@@ -1147,16 +1484,23 @@ public class MarkdownDocumentChunker {
         private final String text;
         private final int tokenCount;
         private final String contextPrefix;
+        private final Map<String, String> metadata;
 
         public Chunk(String text, int tokenCount, String contextPrefix) {
+            this(text, tokenCount, contextPrefix, new HashMap<>());
+        }
+
+        public Chunk(String text, int tokenCount, String contextPrefix, Map<String, String> metadata) {
             this.text = text;
             this.tokenCount = tokenCount;
             this.contextPrefix = contextPrefix;
+            this.metadata = metadata != null ? metadata : new HashMap<>();
         }
 
         public String text() { return text; }
         public int tokenCount() { return tokenCount; }
         public String contextPrefix() { return contextPrefix; }
+        public Map<String, String> metadata() { return metadata; }
 
         @Override
         public String toString() {

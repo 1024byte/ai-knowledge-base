@@ -116,6 +116,10 @@ public class DocumentChunkerService implements DocumentSplitter {
             if (!chunk.contextPrefix().isEmpty()) {
                 chunkMetadata.put("context_prefix", chunk.contextPrefix());
             }
+            // 传递 Chunk 级别的元数据（如 content_type、parent_text）
+            for (Map.Entry<String, String> entry : chunk.metadata().entrySet()) {
+                chunkMetadata.put(entry.getKey(), entry.getValue());
+            }
 
             segments.add(TextSegment.from(chunk.text(), chunkMetadata));
         }

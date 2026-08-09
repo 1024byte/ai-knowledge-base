@@ -69,6 +69,9 @@ public class RAGSearchService {
     /** Cross-Encoder Rerank 服务，对检索结果精排 */
     private final RerankerService rerankerService;
 
+    /** 父上下文扩展器，用入库时预计算的 parent_text 替换 chunk 文本 */
+    private final ParentContextExpander parentContextExpander;
+
     /** 默认检索返回数量（无过滤时） */
     private static final int DEFAULT_MAX_RESULTS = 5;
 
@@ -129,10 +132,12 @@ public class RAGSearchService {
         List<HybridSearchService.RankedResult> allResults = new ArrayList<>(
                 hybridSearchService.hybridSearchRanked(userQuery, topK, MIN_VECTOR_SCORE));
 
-        log.info("混合检索召回 {} 个片段，前5个片段内容: {}", allResults.size(),
-                allResults.stream().limit(5)
-                        .map(r -> r.getSegment().text())
-                        .collect(Collectors.joining(" | ")));
+        log.info("混合检索召回 {} 个片段", allResults.size());
+
+        // ===== 阶段1.5：父上下文扩展 =====
+        // 用入库时预计算的 parent_text 替换 chunk 文本，实现零延迟的上下文补全。
+        // 解决 PDF 解析将编号列表/长段落误切分导致的碎片化问题。
+        allResults = parentContextExpander.expand(allResults);
 
         // ===== 阶段2：排除关键词过滤 =====
         // 对片段分词后精确匹配排除词（避免子串误杀，如排除"Java"误杀"JavaScript"）
@@ -216,7 +221,85 @@ public class RAGSearchService {
         log.info("分数阈值过滤: {} -> {} 个片段 (阈值={})", beforeFilter, allResults.size(),
                 String.format("%.2f", rerankerService.getMinScore()));
 
+        // ===== 阶段5：content_type 降权 =====
+        // 对非正文内容（题目、词汇表、答案）降低分数，确保正文优先
+        allResults = applyContentTypeWeighting(allResults);
+
         log.info("最终返回 {} 个片段", allResults.size());
         return allResults;
     }
+
+    /**
+     * <h3>根据 content_type 对片段降权</h3>
+     *
+     * <p>试卷/试题文档中，正文（PASSAGE）权重保持不变，题目（QUESTION）、
+     * 词汇表（VOCAB）、答案（ANSWER）的分数乘以折扣系数，确保检索时正文优先。</p>
+     *
+     * <h4>权重系数</h4>
+     * <table>
+     *   <tr><th>content_type</th><th>系数</th><th>说明</th></tr>
+     *   <tr><td>PASSAGE</td><td>1.0</td><td>正文，不过滤</td></tr>
+     *   <tr><td>QUESTION</td><td>0.3</td><td>选择题，大幅降权</td></tr>
+     *   <tr><td>VOCAB</td><td>0.3</td><td>词汇表，大幅降权</td></tr>
+     *   <tr><td>ANSWER</td><td>0.5</td><td>答案/解析，中度降权</td></tr>
+     *   <tr><td>MIXED</td><td>0.7</td><td>混合内容，轻微降权</td></tr>
+     *   <tr><td>无标记</td><td>1.0</td><td>非试题文档，不过滤</td></tr>
+     * </table>
+     *
+     * @param results 已排序的检索结果
+     * @return 降权后的结果列表
+     */
+    private List<HybridSearchService.RankedResult> applyContentTypeWeighting(
+            List<HybridSearchService.RankedResult> results) {
+        List<HybridSearchService.RankedResult> weighted = new ArrayList<>();
+        int passageCount = 0;
+        int nonPassageCount = 0;
+
+        for (HybridSearchService.RankedResult result : results) {
+            String contentType = null;
+            try {
+                contentType = result.getSegment().metadata().getString("content_type");
+            } catch (Exception ignored) {
+                // metadata 中无 content_type，跳过
+            }
+
+            double weight = getContentTypeWeight(contentType);
+            double newScore = result.getScore() * weight;
+
+            weighted.add(new HybridSearchService.RankedResult(result.getSegment(), newScore));
+
+            if ("passage".equals(contentType) || contentType == null) {
+                passageCount++;
+            } else {
+                nonPassageCount++;
+            }
+        }
+
+        // 按新分数重新排序
+        weighted.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
+
+        if (nonPassageCount > 0) {
+            log.info("content_type 降权: 正文/无标记={} 个, 非正文={} 个 (题目/词汇/答案)",
+                    passageCount, nonPassageCount);
+        }
+        return weighted;
+    }
+
+    /**
+     * 获取内容类型的分数权重系数。
+     */
+    private double getContentTypeWeight(String contentType) {
+        if (contentType == null) {
+            return 1.0;  // 无标记，保持原分
+        }
+        return switch (contentType.toLowerCase()) {
+            case "passage" -> 1.0;
+            case "question" -> 0.3;
+            case "vocab" -> 0.3;
+            case "answer" -> 0.5;
+            case "mixed" -> 0.7;
+            default -> 1.0;
+        };
+    }
+
 }

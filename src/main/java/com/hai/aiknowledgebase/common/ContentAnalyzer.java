@@ -14,6 +14,17 @@ public class ContentAnalyzer {
     private static final Pattern INLINE_CODE_PATTERN = Pattern.compile("`[^`]+`");
     private static final Pattern LEGAL_PATTERN = Pattern.compile("(第[零一二三四五六七八九十百千]+条|依据《|规定：|合同.*条款)");
     private static final Pattern TABLE_LINE_PATTERN = Pattern.compile("^\\s*\\|.*\\|\\s*$");
+    // 试题特征：数字+选项模式（如 "1. ... A. ... B. ..." 或 "1、... A、... B、..."）
+    private static final Pattern EXAM_QUESTION_PATTERN = Pattern.compile(
+            "(?m)^\\s*\\d{1,2}[.、．]\\s*\\S");
+    private static final Pattern EXAM_OPTION_PATTERN = Pattern.compile(
+            "(?m)^\\s*[A-D][.、．]\\s*\\S");
+    // 词汇表特征：英文=中文 或 英文 中文 模式
+    private static final Pattern VOCAB_PATTERN = Pattern.compile(
+            "\\b[a-zA-Z]{2,}(\\s*=\\s*|\\s+)[\\u4e00-\\u9fff]+");
+    // 答案区特征
+    private static final Pattern ANSWER_PATTERN = Pattern.compile(
+            "(答案[：:]|参考答案|正确答案|解析[：:]|Answer[s]?[:：]|Key[:：])");
 
     /**
      * 分析文本内容，返回最匹配的内容分类
@@ -73,19 +84,39 @@ public class ContentAnalyzer {
             tableScore += 2;
         }
 
+        // --- 试卷/试题得分 ---
+        // 强特征（+3分/个）：题目编号（"1. "、"2、 "）+ 选项（"A. "、"B. "）成对出现
+        long questionCount = EXAM_QUESTION_PATTERN.matcher(sample).results().count();
+        long optionCount = EXAM_OPTION_PATTERN.matcher(sample).results().count();
+        // 词汇表特征（+1分/个）："英文=中文" 或 "英文 中文" 模式
+        long vocabCount = VOCAB_PATTERN.matcher(sample).results().count();
+        // 答案区特征（+2分/个）
+        long answerCount = ANSWER_PATTERN.matcher(sample).results().count();
+        double examScore = 0;
+        // 题目+选项成对出现时才视为强信号（避免普通编号列表误判）
+        if (questionCount >= 2 && optionCount >= 2) {
+            examScore = Math.min(10, questionCount * 2 + optionCount * 1.5);
+        }
+        // 词汇表作为辅助信号
+        if (vocabCount >= 3) {
+            examScore += Math.min(5, vocabCount * 0.8);
+        }
+        // 答案区作为辅助信号
+        examScore += answerCount * 2;
+
         // ==================== 2. 决策逻辑（带降级保护） ====================
-        log.debug("文档类型打分：技术={:.2f}, 法律={:.2f}, 表格={:.2f}", techScore, legalScore, tableScore);
+        log.debug("文档类型打分：技术={:.2f}, 法律={:.2f}, 表格={:.2f}, 试题={:.2f}", techScore, legalScore, tableScore, examScore);
 
         // 场景A：得分都很低（都 < 2），直接返回 GENERAL，避免强行分类
-        if (techScore < 2 && legalScore < 2 && tableScore < 2) {
+        if (techScore < 2 && legalScore < 2 && tableScore < 2 && examScore < 2) {
             return ContentCategory.GENERAL;
         }
 
         // 场景B：找出最高分
-        double maxScore = Math.max(techScore, Math.max(legalScore, tableScore));
+        double maxScore = Math.max(Math.max(techScore, legalScore), Math.max(tableScore, examScore));
 
         // 场景C：如果最高分和第二高分差距小于 1.5，说明特征混合严重，为保证切片安全，回退 GENERAL
-        List<Double> sorted = Arrays.asList(techScore, legalScore, tableScore);
+        List<Double> sorted = Arrays.asList(techScore, legalScore, tableScore, examScore);
         Collections.sort(sorted, Collections.reverseOrder());
         if (sorted.get(0) - sorted.get(1) < 1.5 && sorted.get(0) < 6) {
             log.debug("文档类型混合严重，最高分差值不足，回退为 GENERAL");
@@ -99,9 +130,12 @@ public class ContentAnalyzer {
         } else if (legalScore == maxScore) {
             log.debug("判定为 LEGAL（法律文档）");
             return ContentCategory.LEGAL;
-        } else {
+        } else if (tableScore == maxScore) {
             log.debug("判定为 TABLE_HEAVY（表格密集）");
             return ContentCategory.TABLE_HEAVY;
+        } else {
+            log.debug("判定为 EXAM_PAPER（试卷/试题材料）");
+            return ContentCategory.EXAM_PAPER;
         }
     }
 }

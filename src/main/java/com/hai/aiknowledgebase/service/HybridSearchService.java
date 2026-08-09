@@ -321,7 +321,7 @@ public class HybridSearchService {
      * <ul>
      *   <li><b>embeddingModel.embed(query).content()</b>：
      *       调用 LangChain4j 的嵌入模型（本项目使用 paraphrase-multilingual-MiniLM-L12-v2 量化模型），
-     *       将查询文本转换为高维向量（如 512 维）。这个向量捕获了查询的语义信息。</li>
+     *       将查询文本转换为高维向量（如 318 维）。这个向量捕获了查询的语义信息。</li>
      *   <li><b>EmbeddingSearchRequest</b>：
      *       构建向量检索请求，指定查询向量和返回数量。PGVector 底层使用
      *       IVFFlat 或 HNSW 索引进行 ANN 近似最近邻搜索。</li>

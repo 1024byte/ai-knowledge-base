@@ -13,6 +13,9 @@ public class ChunkingConfig {
     private boolean enableSemantic;      // 是否启用语义切分
     private double semanticThreshold;    // 语义转折阈值，仅当 enableSemantic=true 时生效
 
+    // 父上下文窗口大小：每个 chunk 的 parent_text 包含自身 + 前后各 PARENT_WINDOW 个 chunk
+    public static final int PARENT_WINDOW = 2;
+
     // 预置配置
     public static final ChunkingConfig TECHNICAL = ChunkingConfig.builder()
             .minTokens(200)
@@ -45,5 +48,13 @@ public class ChunkingConfig {
             .enableSemantic(false)        // 常规文档递归切分足够
             .semanticThreshold(0.7)
             .build();
-}
 
+    // 试卷/试题文档：英文段落较长，需要更大 maxTokens 保证语义完整
+    public static final ChunkingConfig EXAM_PAPER = ChunkingConfig.builder()
+            .minTokens(200)
+            .maxTokens(800)
+            .overlapRatio(0.15)
+            .enableSemantic(false)        // 试题依赖结构（题目编号、选项），关语义
+            .semanticThreshold(0.7)
+            .build();
+}

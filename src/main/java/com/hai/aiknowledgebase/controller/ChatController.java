@@ -106,4 +106,11 @@ public class ChatController {
         chatService.deleteSession(sessionId);
         return Result.success();
     }
+
+    @DeleteMapping("/sessions")
+    public Result<Void> deleteAllSessions(@RequestParam(required = false) String userId) {
+        log.info("删除历史会话, userId: {}", userId != null ? userId : "全部");
+        chatService.deleteAllSessions(userId);
+        return Result.success();
+    }
 }

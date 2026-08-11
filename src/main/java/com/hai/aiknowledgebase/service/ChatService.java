@@ -31,9 +31,11 @@ import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.memory.chat.ChatMemoryStore;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -58,6 +60,7 @@ public class ChatService {
     private final RAGSearchService ragSearchService;
     private final QueryRewriteService queryRewriteService;
     private final TokenCountEstimator tokenCountEstimator;
+    private final ThreadPoolTaskExecutor taskExecutor;
 
     @Value("${chat.prompt.max-context-tokens:3000}")
     private int maxContextTokens;
@@ -85,7 +88,8 @@ public class ChatService {
                        ChatMemoryStore chatMemoryStore,
                        RAGSearchService ragSearchService,
                        QueryRewriteService queryRewriteService,
-                       TokenCountEstimator tokenCountEstimator) {
+                       TokenCountEstimator tokenCountEstimator,
+                       ThreadPoolTaskExecutor taskExecutor) {
         this.chatModel = chatModel;
         this.embeddingStore = embeddingStore;
         this.embeddingModel = embeddingModel;
@@ -94,6 +98,7 @@ public class ChatService {
         this.ragSearchService = ragSearchService;
         this.queryRewriteService = queryRewriteService;
         this.tokenCountEstimator = tokenCountEstimator;
+        this.taskExecutor = taskExecutor;
     }
 
 
@@ -212,21 +217,28 @@ public class ChatService {
         QueryRewriteResult rewriteResult = queryRewriteService.rewrite(rewriteRequest);
 
         String searchQuery = rewriteResult.getRewrittenQuery();//意图词
-        List<String> expandKeywords = rewriteResult.getExpandKeywords();
-        List<String> excludeKeywords = rewriteResult.getExcludeKeywords();
-        String hypotheticAnswer = rewriteResult.getHypotheticAnswer();
-        List<String> subQueries = rewriteResult.getSubQueries();
-        log.info("查询改写 | 原始: {} | 改写: {} | 扩展词: {} | 排除词: {} | 置信度: {} | 路径: {} | 策略: {}",
+        List<String> expandKeywords = rewriteResult.getExpandKeywords();//扩展关键词
+        List<String> excludeKeywords = rewriteResult.getExcludeKeywords();//排除关键词
+        String hypotheticAnswer = rewriteResult.getHypotheticAnswer(); //假设性答案
+        List<String> subQueries = rewriteResult.getSubQueries(); //任务分解子查询
+        log.info("查询改写 | 原始: {} | 改写: {} | 扩展词: {} | 排除词: {} | 子查询: {} | 置信度: {} | 路径: {} | 策略: {}",
                 question, searchQuery, expandKeywords, excludeKeywords,
+                subQueries != null ? subQueries.size() : 0,
                 String.format("%.2f", rewriteResult.getConfidence()), rewriteResult.getPath(),
                 rewriteResult.getStrategy());
 
-        // 步骤1：混合检索（向量语义 + BM25 关键词，RRF 融合排序 + 分数重排序）
-        List<HybridSearchService.RankedResult> rankedResults = ragSearchService.retrieveSegments(searchQuery, topK, expandKeywords, excludeKeywords);
+        // 步骤1：混合检索（支持多子查询分别检索 + 合并去重）
+        List<HybridSearchService.RankedResult> rankedResults;
+        if (subQueries != null && !subQueries.isEmpty()) {// 多子查询检索：分别对每个子查询进行检索，合并结果并重新排序
+            rankedResults = multiQueryRetrieve(subQueries, topK, expandKeywords, excludeKeywords);//多子查询检索
+                       log.info("多子查询检索: {} 个子查询, 合并后 {} 个片段", subQueries.size(), rankedResults.size());
+        } else {
+            rankedResults = ragSearchService.retrieveSegments(searchQuery, topK, expandKeywords, excludeKeywords);
+            log.info("检索到 {} 个相关文档片段", rankedResults.size());
+        }
         List<TextSegment> segments = rankedResults.stream()
                 .map(HybridSearchService.RankedResult::getSegment)
                 .collect(Collectors.toList());
-        log.info("检索到 {} 个相关文档片段", segments.size());
 
         // 步骤2：构建上下文（Token 预算制：按片段顺序填入，超出预算截断或丢弃）
         ContextBuildResult contextResult = buildContextWithinBudget(segments, maxContextTokens);
@@ -430,6 +442,43 @@ public class ChatService {
         log.info("已删除会话: {}", sessionId);
     }
 
+    /**
+     * 删除历史会话及其消息
+     *
+     * @param userId 指定用户ID则只删除该用户的记录，为 null 则删除全部
+     */
+    public void deleteAllSessions(String userId) {
+        if (userId == null || userId.isBlank()) {
+            // 删除全部
+            chatHistoryMapper.delete(new LambdaQueryWrapper<>());
+            chatMemoryCache.invalidateAll();
+            log.info("已删除所有历史会话");
+        } else {
+            // 按用户删除：先查该用户的所有 sessionId，再逐条清理
+            LambdaQueryWrapper<ChatHistory> queryWrapper = new LambdaQueryWrapper<>();
+            queryWrapper.select(ChatHistory::getSessionId)
+                    .eq(ChatHistory::getUserId, userId)
+                    .groupBy(ChatHistory::getSessionId);
+            List<String> sessionIds = chatHistoryMapper.selectList(queryWrapper).stream()
+                    .map(ChatHistory::getSessionId)
+                    .distinct()
+                    .collect(Collectors.toList());
+
+            // 删除数据库记录
+            LambdaQueryWrapper<ChatHistory> deleteWrapper = new LambdaQueryWrapper<>();
+            deleteWrapper.eq(ChatHistory::getUserId, userId);
+            chatHistoryMapper.delete(deleteWrapper);
+
+            // 清除缓存
+            for (String sessionId : sessionIds) {
+                chatMemoryCache.invalidate(sessionId);
+                chatMemoryStore.deleteMessages(sessionId);
+            }
+
+            log.info("已删除用户 {} 的历史会话，共 {} 个会话", userId, sessionIds.size());
+        }
+    }
+
     // ==================== 搜索接口（不变） ====================
     public List<SearchResult> search(String query, int topK) {
         log.info("搜索查询: {}", query);
@@ -571,6 +620,48 @@ public class ChatService {
             result.add(texts.get(i));
         }
         return result;
+    }
+
+    /**
+     * 多子查询检索：并行执行各子查询的混合检索，合并去重后按分数降序排列
+     *
+     * <p>每个子查询分配 topK/subQueries.size() 个结果配额，
+     * 通过文本内容去重（避免同一片段被重复计入），
+     * 并行执行以降低多子查询场景的总延迟，最终按分数降序排列返回。</p>
+     */
+    private List<HybridSearchService.RankedResult> multiQueryRetrieve(
+            List<String> subQueries, int totalTopK,
+            List<String> expandKeywords, List<String> excludeKeywords) {
+        int perQueryTopK = Math.max(3, totalTopK / subQueries.size());
+
+        List<CompletableFuture<List<HybridSearchService.RankedResult>>> futures = new ArrayList<>();
+        for (String subQuery : subQueries) {
+            futures.add(CompletableFuture.supplyAsync(
+                    () -> ragSearchService.retrieveSegments(subQuery, perQueryTopK, expandKeywords, excludeKeywords),
+                    taskExecutor));
+        }
+
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+        Set<String> seenTexts = new LinkedHashSet<>();
+        List<HybridSearchService.RankedResult> merged = new ArrayList<>();
+        for (CompletableFuture<List<HybridSearchService.RankedResult>> future : futures) {
+            try {
+                List<HybridSearchService.RankedResult> results = future.join();
+                for (HybridSearchService.RankedResult r : results) {
+                    if (seenTexts.add(r.getSegment().text())) {
+                        merged.add(r);
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("子查询检索失败，跳过: {}", e.getMessage());
+            }
+        }
+
+        merged.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
+        log.debug("多子查询检索合并: {} 路并行, 去重后={}",
+                subQueries.size(), merged.size());
+        return merged;
     }
 
     private ContextBuildResult buildContextWithinBudget(List<TextSegment> segments, int maxTokens) {

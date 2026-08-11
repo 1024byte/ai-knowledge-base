@@ -64,7 +64,7 @@ query-rewrite:
     max-tokens: 128                        # 改写结果不需要长文本
     timeout-ms: 2000                        # 严格超时（ms）
     fidelity-threshold: 0.75              # 改写保真度阈值（cosine similarity）
-    rewrite-timeout-ms: 1500               # 改写超时时间（毫秒）
+    rewrite-timeout-ms: 3000               # 改写超时时间（毫秒）
     # 以下配置保留但降级为辅助
   l1:
     confidence-threshold: 0.85

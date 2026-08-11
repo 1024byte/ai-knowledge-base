@@ -10,6 +10,7 @@ import dev.langchain4j.model.ollama.OllamaChatModel;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
@@ -39,15 +40,20 @@ import java.util.concurrent.*;
 public class LocalLLMRewriter {
 
     public static final String REWRITE_SYSTEM_PROMPT = """
-            你是一个查询改写助手。根据以下规则改写用户查询，使其更适合知识库检索：
+            你是一个查询改写助手，你的任务是将用户查询改写为更适合知识库检索的形式。
+            禁止回答问题、禁止生成解释、禁止输出任何非改写结果的内容。
 
-            1. 展开缩写和简称（如"专升本"→"专升本考试"）
-            2. 补充隐含上下文（如"它的配置"→需要根据上下文补充具体对象）
-            3. 拆分复合问题为多个子查询，用 | 分隔
-            4. 保留原始查询的核心语义，不要添加原文没有的信息
-            5. 如果查询已经清晰完整，直接返回原文
+            规则：
+            1. 对比类问题（含"对比/区别/差别/不同/差异/vs"等）必须拆分为多个子查询，用 | 分隔
+               拆分时每个比较对象单独成子查询，每个比较维度单独成子查询，最后追加对比子查询
+               例如："A和B在X和Y上的区别" → "A的X | A的Y | B的X | B的Y | A和B在X和Y上的对比"
+            2. 并列多问问题（含"以及/还有/另外"等）必须拆分为多个子查询，用 | 分隔
+            3. 展开缩写和简称（如"专升本"→"专升本考试"）
+            4. 补充隐含上下文（如"它的配置"→根据上下文补充具体对象）
+            5. 保留原始查询的核心语义，不要添加原文没有的信息
+            6. 如果查询简单且无需拆分，直接返回原文
 
-            只返回改写结果，不要任何解释。""";
+            禁止任何解释、禁止任何回答、禁止markdown格式。只返回改写结果。""";
 
     @Autowired(required = false)
     private OllamaChatModel localRewriteModel;
@@ -69,8 +75,12 @@ public class LocalLLMRewriter {
             .expireAfterWrite(10, TimeUnit.MINUTES)
             .build();
 
-    public LocalLLMRewriter(EmbeddingModel embeddingModel) {
+    /** 复用 AsyncConfig 配置的线程池，用于 LLM 调用的超时控制 */
+    private final ThreadPoolTaskExecutor taskExecutor;
+
+    public LocalLLMRewriter(EmbeddingModel embeddingModel, ThreadPoolTaskExecutor taskExecutor) {
         this.embeddingModel = embeddingModel;
+        this.taskExecutor = taskExecutor;
     }
 
     /**
@@ -111,11 +121,23 @@ public class LocalLLMRewriter {
             return fallback(query);
         }
 
-        // 4. 后处理
-        rewritten = postProcess(rewritten, query);
+        // 4. 后处理 + 子查询提取
+        SubQueryParseResult parseResult = parseSubQueries(rewritten);
+        rewritten = postProcess(parseResult.mainQuery, query);
+
+        // 4.5 回答式输出检测：小模型可能无视指令直接回答问题，而非改写
+        if (isAnswerInsteadOfRewrite(rewritten, query)) {
+            log.warn("本地 LLM 未按要求改写(疑似直接回答)，回退到原查询: {} → {}",
+                    query, rewritten.substring(0, Math.min(80, rewritten.length())));
+            return fallback(query);
+        }
 
         // 5. 保真度校验
-        double fidelity = computeFidelity(query, rewritten);
+        // 分解场景：用全部子查询拼接文本计算保真度，避免单个子查询与原查询语义范围不匹配
+        String fidelityText = parseResult.subQueries.size() > 1
+                ? String.join(" ", parseResult.subQueries)
+                : rewritten;
+        double fidelity = computeFidelity(query, fidelityText);
         if (fidelity < fidelityThreshold) {
             log.info("改写保真度不足 ({} < {})，回退到原查询: {} → {}",
                     String.format("%.3f", fidelity), fidelityThreshold, query, rewritten);
@@ -125,14 +147,16 @@ public class LocalLLMRewriter {
         // 6. 构建结果
         QueryRewriteResult result = QueryRewriteResult.builder()
                 .rewrittenQuery(rewritten)
+                .subQueries(parseResult.subQueries)
                 .expandKeywords(extractExpandKeywords(rewritten))
                 .excludeKeywords(Collections.emptyList())
                 .confidence(fidelity)
-                .path(RewritePath.L3_LLM)  // 复用 L3 路径标识
+                .path(RewritePath.L3_LLM)
                 .build();
 
         cache.put(query, result);
-        log.info("本地 LLM 改写: {} → {} (保真度: {})", query, rewritten, String.format("%.3f", fidelity));
+        log.info("本地 LLM 改写: {} → {} (子查询: {}, 保真度: {})",
+                query, rewritten, parseResult.subQueries.size(), String.format("%.3f", fidelity));
         return result;
     }
 
@@ -152,22 +176,20 @@ public class LocalLLMRewriter {
     }
 
     private String callWithTimeout(String prompt) {
-        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<String> future = taskExecutor.submit(() ->
+                localRewriteModel.chat(
+                        dev.langchain4j.data.message.SystemMessage.from(REWRITE_SYSTEM_PROMPT),
+                        dev.langchain4j.data.message.UserMessage.from(prompt)
+                ).aiMessage().text()
+        );
         try {
-            Future<String> future = executor.submit(() ->
-                    localRewriteModel.chat(
-                            dev.langchain4j.data.message.SystemMessage.from(REWRITE_SYSTEM_PROMPT),
-                            dev.langchain4j.data.message.UserMessage.from(prompt)
-                    ).aiMessage().text()
-            );
             return future.get(rewriteTimeoutMs, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
+            future.cancel(true);
             log.warn("本地 LLM 改写超时 ({}ms)", rewriteTimeoutMs);
             throw new RuntimeException("改写超时", e);
         } catch (Exception e) {
             throw new RuntimeException("改写失败", e);
-        } finally {
-            executor.shutdownNow();
         }
     }
 
@@ -189,6 +211,40 @@ public class LocalLLMRewriter {
         }
 
         return result;
+    }
+
+    /**
+     * 检测 LLM 是否在回答而非改写
+     *
+     * <p>小模型（如 Qwen2.5 1.5B）可能无视 Prompt 指令，直接生成回答内容。
+     * 当改写结果远比原查询长且包含 markdown/答案特征时，判定为"回答式输出"。</p>
+     *
+     * @param rewritten LLM 输出
+     * @param original  原始查询
+     * @return true 表示是回答而非改写
+     */
+    private boolean isAnswerInsteadOfRewrite(String rewritten, String original) {
+        if (rewritten == null || rewritten.isEmpty()) {
+            return false;
+        }
+        // 与原文相同则不是回答
+        if (rewritten.equals(original)) {
+            return false;
+        }
+        // 指标1：长度远超原文（>1.5倍），说明在生成内容而非改写
+        boolean tooLong = rewritten.length() > original.length() * 1.5;
+        // 指标2：包含 markdown 格式（**加粗**、`代码`、#标题）
+        boolean hasMarkdown = rewritten.contains("**") || rewritten.contains("```")
+                || rewritten.startsWith("#");
+        // 指标3：包含长句（>50字），改写通常简短
+        boolean hasLongSentence = false;
+        for (String sentence : rewritten.split("[。；;，,！!？?]")) {
+            if (sentence.trim().length() > 50) {
+                hasLongSentence = true;
+                break;
+            }
+        }
+        return tooLong && (hasMarkdown || hasLongSentence);
     }
 
     /**
@@ -216,6 +272,49 @@ public class LocalLLMRewriter {
             normB += b[i] * b[i];
         }
         return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-8);
+    }
+
+    /**
+     * 从 LLM 返回的文本中解析子查询（| 分隔）
+     *
+     * <p>LLM 按 Prompt 约定用 | 分隔多个子查询时，
+     * 第一个作为主查询（rewrittenQuery），其余作为子查询列表（subQueries）。
+     * 如果没有 | 分隔符，整个文本作为唯一查询，subQueries 为空。</p>
+     */
+    private SubQueryParseResult parseSubQueries(String llmResponse) {
+        String trimmed = llmResponse.trim();
+        if (!trimmed.contains("|")) {
+            return new SubQueryParseResult(trimmed, Collections.emptyList());
+        }
+
+        String[] parts = trimmed.split("\\|");
+        List<String> subQueries = new ArrayList<>();
+        for (int i = 0; i < parts.length; i++) {
+            String part = parts[i].trim();
+            if (!part.isEmpty()) {
+                subQueries.add(part);
+            }
+        }
+
+        if (subQueries.isEmpty()) {
+            return new SubQueryParseResult(trimmed, Collections.emptyList());
+        }
+
+        String mainQuery = subQueries.get(0);
+        return new SubQueryParseResult(mainQuery, subQueries);
+    }
+
+    /**
+     * 子查询解析结果
+     */
+    private static class SubQueryParseResult {
+        final String mainQuery;
+        final List<String> subQueries;
+
+        SubQueryParseResult(String mainQuery, List<String> subQueries) {
+            this.mainQuery = mainQuery;
+            this.subQueries = subQueries;
+        }
     }
 
     /**

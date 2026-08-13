@@ -22,10 +22,8 @@ import org.springframework.stereotype.Service;
  * 纠错后的查询用于后续的意图识别和查询改写。
  *
  * <h2>设计说明</h2>
- * <ul>
- *   <li>使用 {@link ThreadLocal} 存储纠错状态，保证线程安全</li>
- *   <li>纠错逻辑委托给 {@link FunnelQueryCorrector}，本类只负责接口适配和状态追踪</li>
- * </ul>
+ * 纠错逻辑委托给 {@link FunnelQueryCorrector}，本类只负责接口适配。
+ * 调用方通过比较返回值与原始查询来判断是否发生了纠错，无需额外的状态查询 API。
  *
  * @see FunnelQueryCorrector 三层漏斗编排器
  * @see QueryRewriteService 查询改写服务（调用方）
@@ -38,36 +36,15 @@ public class QueryCorrector {
     private final FunnelQueryCorrector funnelQueryCorrector;
 
     /**
-     * 线程隔离的纠错状态标记
-     */
-    private final ThreadLocal<Boolean> lastCorrectionHappened = new ThreadLocal<>();
-
-    /**
      * 对查询进行纠错（委托给三层漏斗）
      *
      * @param query 原始查询文本，可能为 null 或空字符串
      * @return 纠错后的查询文本。如果未发生纠错，返回原始查询
      */
     public String correct(String query) {
-        lastCorrectionHappened.set(false);
-
         if (query == null || query.isBlank()) {
             return query != null ? query : "";
         }
-
-        String corrected = funnelQueryCorrector.correct(query);
-        if (!corrected.equals(query)) {
-            lastCorrectionHappened.set(true);
-        }
-
-        return corrected;
-    }
-
-    /**
-     * 判断最近一次 correct 调用是否发生了纠错
-     */
-    public boolean hasCorrection() {
-        Boolean result = lastCorrectionHappened.get();
-        return result != null && result;
+        return funnelQueryCorrector.correct(query);
     }
 }

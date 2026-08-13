@@ -55,7 +55,7 @@ langchain4j:
 
 # 查询改写配置
 query-rewrite:
-  enabled: true
+  enabled: false
   local-llm:
     enabled: true                          # 本地 LLM 改写开关
     base-url: http://localhost:11434       # Ollama 服务地址
@@ -86,13 +86,13 @@ corrector:
 
 # 混合检索配置（并行双路召回 + RRF 融合）
 hybrid-search:
-  enabled: true                      # 总开关：true=向量+关键词双路召回，false=仅向量检索
+  enabled: false                      # 总开关：true=向量+关键词双路召回，false=仅向量检索
   rrf:
     k: 60                            # RRF 常数 k，值越大排名差异越平滑（推荐 60）
 
 # 嵌入模型配置
 embedding:
-  model-path: models/onnx_model
+  model-path: models/bge-base-zh-v1.5
 
 
 # Cross-Encoder Rerank 精排配置
@@ -108,7 +108,7 @@ reranker:
 # Chat Prompt Token 预算控制
 chat:
   prompt:
-    max-context-tokens: 3000         # 检索上下文最大 token 数，超出按片段截断
+    max-context-tokens: 5000         # 检索上下文最大 token 数，超出按片段截断（复杂推理需更多上下文）
     max-history-tokens: 3000         # 历史对话最大 token 数，超出从最早的消息开始丢弃
     max-assistant-history-chars: 300  # 历史中 assistant 消息截断字符数（用于 LLM 输入和改写）
   retrieval:

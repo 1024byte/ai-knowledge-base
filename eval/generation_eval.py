@@ -31,6 +31,29 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import config
 
 
+def clean_ground_truth(text: str) -> str:
+    """
+    清理 expected_answer 格式，提取纯答案文本。
+    处理 "答案：xxx；原文依据：xxx"、 "文档中提到了xxx" 等元描述格式。
+    """
+    if not text:
+        return text
+    # 移除 "答案：" 前缀
+    if text.startswith("答案："):
+        text = text[3:]
+    elif text.startswith("答案:"):
+        text = text[3:]
+    # 移除 "原文依据：xxx" 部分
+    import re
+    text = re.sub(r'[；;]\s*原文依据：.+$', '', text)
+    text = re.sub(r'[；;]\s*原文依据:.+$', '', text)
+    # 移除常见的元描述前缀
+    text = re.sub(r'^文档中提到了[：:]?\s*', '', text)
+    text = re.sub(r'^文档中[：:]?\s*', '', text)
+    text = re.sub(r'^根据文档[，,]?\s*', '', text)
+    return text.strip()
+
+
 def load_test_queries(file_path: str) -> List[Dict]:
     with open(file_path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -193,7 +216,7 @@ def evaluate_with_ragas(samples: List[Dict]) -> Dict:
         eval_data["answer"].append(s["answer"])
         eval_data["contexts"].append(s["contexts"])
         if has_ground_truth:
-            eval_data["ground_truth"].append(s.get("ground_truth", ""))
+            eval_data["ground_truth"].append(clean_ground_truth(s.get("ground_truth", "")))
 
     dataset = Dataset.from_dict(eval_data)
 

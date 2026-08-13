@@ -476,6 +476,7 @@ public class DocumentService {
 
         LambdaQueryWrapper<DocumentMetadata> wrapper = new LambdaQueryWrapper<>();
         wrapper.orderByDesc(DocumentMetadata::getUploadTime);
+        wrapper.eq(DocumentMetadata::getStatus, "active");// 只查询处理完成的文档
         List<DocumentMetadata> list = documentMetadataMapper.selectList(wrapper);
 
         if (list.isEmpty()) {

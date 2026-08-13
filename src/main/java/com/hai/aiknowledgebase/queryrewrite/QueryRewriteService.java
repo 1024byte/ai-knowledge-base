@@ -144,10 +144,15 @@ public class QueryRewriteService{
     @Timed("查询改写")
     public QueryRewriteResult rewrite(RewriteRequest request){
 
+        // Step 0: 全局开关检查
+        if (!enabled) {
+            return buildNoneResult(request.getQuery());
+        }
+
         String query = request.getQuery();
         RewriteStrategyEnum strategy = request.getStrategy();
         List<CustomChatMessage> history = request.getTruncatedHistory();
-        // Step 0: 空值检查
+        // Step 1: 空值检查
         if (query == null || query.isBlank()) {
             return QueryRewriteResult.builder()
                     .rewrittenQuery("")

@@ -2,27 +2,31 @@
 测试集构建工具
 
 功能：
-  1. 从知识库 API 拉取文档列表，了解知识库内容范围
-  2. 生成测试集模板，供人工标注
-  3. 可选：用 LLM 根据文档名自动生成候选问题
+  1. 从知识库 API 拉取文档列表
+  2. --rag 模式：通过检索 API 获取每个文档的真实内容片段，用 LLM 自动生成问题 + 答案
+  3. --auto 模式：仅根据文档名生成问题（不含答案，需人工标注）
+  4. 默认模式：生成模板，供人工填写
 
 使用方式：
-  python build_dataset.py              # 拉取文档列表，生成模板
-  python build_dataset.py --auto       # 拉取文档列表 + LLM 自动生成候选问题
+  python build_dataset.py --rag          # 推荐：基于真实文档内容 + LLM 自动生成完整测试集
+  python build_dataset.py --auto         # 仅根据文档名生成问题，需人工补充答案
+  python build_dataset.py                # 生成模板，需人工填写
 """
 
 import json
 import os
 import sys
 import argparse
+import re
 from typing import List, Dict
 
 import requests
 
-# 允许从上级目录导入 config
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import config
 
+
+# ===================== 文档 API =====================
 
 def fetch_documents() -> List[Dict]:
     """从知识库 API 获取文档列表"""
@@ -44,8 +48,77 @@ def fetch_documents() -> List[Dict]:
         return []
 
 
+def fetch_document_chunks(doc_name: str, top_k: int = 5) -> List[str]:
+    """
+    通过检索 API 获取文档的内容片段。
+    用文档名作为查询词，检索出该文档的 chunk。
+    """
+    url = f"{config.api_base_url}/api/eval/retrieve"
+    payload = {
+        "query": doc_name,
+        "topK": top_k,
+        "mode": "no_rewrite"  # 不改写，直接用文档名搜
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=30)
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("code") == 0:
+            data = body["data"]
+            # 从 hybrid/results 中提取文本
+            hybrid = data.get("hybrid", {})
+            results = hybrid.get("results", [])
+            chunks = []
+            for r in results:
+                metadata = r.get("metadata", {})
+                text = metadata.get("text", "")
+                doc = metadata.get("document", "")
+                # 只保留当前文档的 chunk
+                if doc_name in doc or doc in doc_name:
+                    chunks.append(text)
+                elif not chunks:  # 前几个可能匹配不到，放宽条件
+                    chunks.append(text)
+            return chunks[:top_k]
+        return []
+    except Exception as e:
+        print(f"  获取文档内容失败: {e}")
+        return []
+
+
+# ===================== LLM 调用 =====================
+
+def call_llm(prompt: str, temperature: float = 0.7) -> str:
+    """调用 DeepSeek LLM"""
+    headers = {
+        "Authorization": f"Bearer {config.llm_api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": config.llm_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature
+    }
+    resp = requests.post(
+        f"{config.llm_api_base}/v1/chat/completions",
+        headers=headers, json=payload, timeout=120
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def extract_json(text: str) -> str:
+    """从 LLM 输出中提取 JSON 部分"""
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r'^```\w*\n?', '', text)
+        text = re.sub(r'\n?```$', '', text)
+    return text
+
+
+# ===================== 生成策略 =====================
+
 def generate_template(documents: List[Dict]) -> List[Dict]:
-    """根据文档列表生成测试集模板"""
+    """根据文档列表生成测试集模板（人工填写）"""
     template = []
     for doc in documents:
         filename = doc.get("filename", "unknown")
@@ -61,10 +134,10 @@ def generate_template(documents: List[Dict]) -> List[Dict]:
 
 
 def auto_generate_questions(documents: List[Dict]) -> List[Dict]:
-    """使用 LLM 根据文档名自动生成候选问题（需要 DEEPSEEK_API_KEY）"""
+    """使用 LLM 根据文档名生成问题（不含答案）"""
     api_key = config.llm_api_key
     if not api_key:
-        print("未设置 DEEPSEEK_API_KEY 环境变量，无法自动生成问题，改为生成模板")
+        print("未找到 API Key，改为生成模板")
         return generate_template(documents)
 
     filenames = [doc.get("filename", "unknown") for doc in documents]
@@ -73,16 +146,7 @@ def auto_generate_questions(documents: List[Dict]) -> List[Dict]:
 {chr(10).join(f'- {f}' for f in filenames)}
 
 请为每个文档生成 2~3 个用户可能提问的问题。问题要覆盖不同类型：
-- 事实查询（如"XX是什么"、"XX的定义"）
-- 流程查询（如"XX的流程是什么"、"怎么操作XX"）
-- 条件查询（如"什么情况下可以XX"、"满足什么条件才能XX"）
-- 比较查询（如"XX和YY有什么区别"）
-- 数值查询（如"XX有多少天"、"XX的金额是多少"）
-- 时间查询（如"XX的截止日期是什么"、"什么时候可以XX"）
-- 人员查询（如"XX由谁负责"、"找谁审批XX"）
-- 规则查询（如"XX的规定是什么"、"XX有什么限制"）
-- 多跳查询（如"新员工入职后如何申请XX"，需要结合多个文档）
-- 内容查询（如"XX的详细信息"、"XX的背景"等）
+- 事实查询、流程查询、条件查询、比较查询、数值查询、时间查询、规则查询、内容查询
 
 输出 JSON 数组，格式如下：
 [
@@ -91,51 +155,119 @@ def auto_generate_questions(documents: List[Dict]) -> List[Dict]:
     "query": "用户问题",
     "relevant_docs": ["文档名1"],
     "difficulty": "easy|medium|hard",
-    "category": "事实查询|流程查询|..."
+    "category": "事实查询"
   }}
 ]
 
 只输出 JSON，不要其他内容。"""
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": config.llm_model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.7
-    }
-
     try:
-        resp = requests.post(f"{config.llm_api_base}/v1/chat/completions",
-                             headers=headers, json=payload, timeout=60)
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
-        # 提取 JSON 部分
-        content = content.strip()
-        if content.startswith("```"):
-            content = content.split("\n", 1)[1]
-            if content.endswith("```"):
-                content = content[:-3]
-        return json.loads(content)
+        content = call_llm(prompt)
+        return json.loads(extract_json(content))
     except Exception as e:
         print(f"LLM 生成失败: {e}，改为生成模板")
         return generate_template(documents)
 
 
+def rag_generate_questions(documents: List[Dict], questions_per_doc: int = 5) -> List[Dict]:
+    """
+    基于真实文档内容生成问题 + 答案。
+    流程：
+      1. 对每个文档，通过检索 API 获取 chunk
+      2. 将 chunk 内容喂给 LLM，生成问题 + 答案 + 难度 + 分类
+    """
+    api_key = config.llm_api_key
+    if not api_key:
+        print("未找到 API Key，无法生成")
+        return []
+
+    all_questions = []
+    q_idx = 1
+
+    for doc in documents:
+        filename = doc.get("filename", "unknown")
+        print(f"\n处理文档: {filename}")
+
+        # 获取文档内容
+        print(f"  获取文档内容片段...")
+        chunks = fetch_document_chunks(filename, top_k=questions_per_doc)
+        if not chunks:
+            print(f"  ⚠️ 未获取到内容，跳过")
+            continue
+
+        # 合并 chunk（限制长度，避免超 token）
+        chunk_text = "\n\n---\n\n".join(chunks)
+        if len(chunk_text) > 8000:
+            chunk_text = chunk_text[:8000] + "\n\n...(内容截断)"
+
+        print(f"  获取到 {len(chunks)} 个片段，共 {len(chunk_text)} 字符")
+
+        # 让 LLM 生成问题
+        prompt = f"""你是一个 RAG 测试集构建助手。以下是文档《{filename}》的部分内容：
+
+{chunk_text}
+
+请根据上述内容，生成 3~5 个用户可能提问的问题。要求：
+1. 问题必须基于文档内容，答案必须能在文档中找到
+2. 覆盖不同难度：easy（简单事实查询）、medium（需要理解）、hard（需要推理或跨段落）
+3. 覆盖不同类别：事实查询、流程查询、条件查询、数值查询、时间查询、规则查询、内容查询、比较查询
+4. expected_answer 是直接答案，用自然语言描述，像是用户在问"答案是什么"时你会给出的回答
+5. **禁止**在 expected_answer 中使用"答案："、"原文依据："、"文档中提到了"、"根据文档"等元描述前缀
+6. **禁止**在 expected_answer 中引用出处或原文，只写答案本身
+
+输出 JSON 数组，格式如下：
+[
+  {{
+    "id": "q{filename}_01",
+    "query": "用户问题",
+    "relevant_docs": ["{filename}"],
+    "difficulty": "easy",
+    "category": "事实查询",
+    "expected_answer": "现在时、过去时、将来时、现在完成时、过去完成时、将来完成时"
+  }}
+]
+
+只输出 JSON，不要其他内容。"""
+
+        try:
+            llm_response = call_llm(prompt, temperature=0.8)
+            questions = json.loads(extract_json(llm_response))
+
+            # 重新编号
+            for q in questions:
+                q["id"] = f"q{q_idx:03d}"
+                q_idx += 1
+
+            all_questions.extend(questions)
+            print(f"  ✅ 生成了 {len(questions)} 个问题")
+
+        except Exception as e:
+            print(f"  ❌ 生成失败: {e}")
+
+    return all_questions
+
+
+# ===================== 保存 =====================
+
 def save_test_queries(test_queries: List[Dict], output_path: str):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(test_queries, f, ensure_ascii=False, indent=2)
-    print(f"测试集已保存至: {output_path}")
-    print(f"共 {len(test_queries)} 条候选问题")
+    print(f"\n测试集已保存至: {output_path}")
+    print(f"共 {len(test_queries)} 条问题")
 
+
+# ===================== 主流程 =====================
 
 def main():
     parser = argparse.ArgumentParser(description="构建 RAG 评估测试集")
-    parser.add_argument("--auto", action="store_true", help="使用 LLM 自动生成候选问题")
+    parser.add_argument("--rag", action="store_true",
+                        help="基于真实文档内容 + LLM 自动生成完整测试集（推荐）")
+    parser.add_argument("--auto", action="store_true",
+                        help="仅根据文档名生成问题，不含答案")
     parser.add_argument("--output", default=config.test_queries_path, help="输出路径")
+    parser.add_argument("--questions-per-doc", type=int, default=5,
+                        help="每个文档生成的问题数（仅 --rag 模式）")
     args = parser.parse_args()
 
     print("=" * 50)
@@ -153,23 +285,34 @@ def main():
     for doc in documents:
         print(f"  - {doc.get('filename')} ({doc.get('fileType', '?')}, {doc.get('chunkCount', 0)} chunks)")
 
-    # 2. 生成候选问题
+    # 2. 生成问题
     print(f"\n[2/3] 生成候选问题...")
-    if args.auto:
+    if args.rag:
+        print("模式: 基于真实文档内容 + LLM 自动生成")
+        test_queries = rag_generate_questions(documents, args.questions_per_doc)
+    elif args.auto:
+        print("模式: 仅根据文档名生成（需人工补充答案）")
         test_queries = auto_generate_questions(documents)
     else:
+        print("模式: 生成模板（需人工填写）")
         test_queries = generate_template(documents)
+
+    if not test_queries:
+        print("未生成任何问题")
+        return
 
     # 3. 保存
     print(f"\n[3/3] 保存测试集...")
     save_test_queries(test_queries, args.output)
 
     print("\n" + "=" * 50)
-    print("下一步:")
-    print("  1. 打开 data/test_queries.json")
-    print("  2. 人工审核每个问题，填写 relevant_docs 和 expected_answer")
-    print("  3. 删除不合适的问题")
-    print("  4. 运行 validate_dataset.py 校验格式")
+    print("统计:")
+    docs_covered = set(q["relevant_docs"][0] for q in test_queries if q.get("relevant_docs"))
+    print(f"  覆盖文档: {len(docs_covered)}/{len(documents)}")
+    if args.rag:
+        print(f"  已含答案: ✅")
+    else:
+        print(f"  已含答案: ❌ (需人工填写)")
     print("=" * 50)
 
 

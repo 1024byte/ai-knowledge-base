@@ -226,6 +226,7 @@ public class ChatService {
                 .query(question)
                 .truncatedHistory(truncatedHistory)
                 .sessionId(sessionId)
+                .strategy(RewriteStrategyEnum.SIMPLE_REWRITE)//默认策略为 SIMPLE_REWRITE
                 .build();
         QueryRewriteResult rewriteResult = queryRewriteService.rewrite(rewriteRequest);
 

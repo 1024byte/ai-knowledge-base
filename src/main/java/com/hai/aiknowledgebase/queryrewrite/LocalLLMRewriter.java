@@ -151,7 +151,7 @@ public class LocalLLMRewriter {
                 .expandKeywords(extractExpandKeywords(rewritten))
                 .excludeKeywords(Collections.emptyList())
                 .confidence(fidelity)
-                .path(RewritePath.L3_LLM)
+                .path(RewritePath.LLM_REWRITE)
                 .build();
 
         cache.put(query, result);

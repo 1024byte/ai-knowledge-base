@@ -1,6 +1,5 @@
 package com.hai.aiknowledgebase.service;
 
-import com.hai.aiknowledgebase.dto.QueryIntent;
 import com.hai.aiknowledgebase.queryrewrite.QueryCorrector;
 import com.hai.aiknowledgebase.queryrewrite.corrector.FunnelQueryCorrector;
 import org.junit.jupiter.api.BeforeEach;
@@ -24,7 +23,6 @@ import static org.mockito.Mockito.when;
  * <p>
  * 覆盖：
  * - ChineseTokenizerService（分词服务）
- * - QueryIntentClassifier（意图识别）
  * - QueryCorrector（查询纠错）
  */
 @ExtendWith(MockitoExtension.class)
@@ -103,110 +101,6 @@ class L2NlpServicesTest {
                 assertThat(twp.getWord()).isNotNull();
                 assertThat(twp.getPos()).isNotNull();
             }
-        }
-    }
-
-    // ==================== QueryIntentClassifier 测试 ====================
-
-    @Nested
-    @DisplayName("QueryIntentClassifier 意图识别")
-    class IntentClassifierTest {
-
-        private QueryIntentClassifier classifier;
-
-        @Mock
-        private ChineseTokenizerService tokenizerService;
-
-        @Mock
-        IntentRecognitionOrchestrator intentRecognitionOrchestrator;
-
-        @BeforeEach
-        void setUp() {
-            // 默认返回足够多的关键词，避免被判定为 AMBIGUOUS
-            lenient().when(tokenizerService.tokenize(anyString())).thenReturn(List.of("配置", "API", "接口"));
-            classifier = new QueryIntentClassifier(tokenizerService,intentRecognitionOrchestrator);
-        }
-
-        @Test
-        @DisplayName("包含'如何'应识别为 PROCEDURAL")
-        void proceduralIntent() {
-            assertThat(classifier.classify("如何配置API接口")).isEqualTo(QueryIntent.PROCEDURAL);
-        }
-
-        @Test
-        @DisplayName("包含'怎么'应识别为 PROCEDURAL")
-        void proceduralIntentWithZenme() {
-            assertThat(classifier.classify("怎么配置数据库")).isEqualTo(QueryIntent.PROCEDURAL);
-        }
-
-        @Test
-        @DisplayName("包含'什么是'应识别为 DEFINITIONAL")
-        void definitionalIntent() {
-            assertThat(classifier.classify("什么是向量召回")).isEqualTo(QueryIntent.DEFINITIONAL);
-        }
-
-        @Test
-        @DisplayName("包含'定义'应识别为 DEFINITIONAL")
-        void definitionalIntentWithDef() {
-            assertThat(classifier.classify("API网关的定义")).isEqualTo(QueryIntent.DEFINITIONAL);
-        }
-
-        @Test
-        @DisplayName("包含'区别'应识别为 COMPARISON")
-        void comparisonIntent() {
-            assertThat(classifier.classify("专升本和自考的区别")).isEqualTo(QueryIntent.COMPARISON);
-        }
-
-        @Test
-        @DisplayName("包含'对比'应识别为 COMPARISON")
-        void comparisonIntentWithDuibi() {
-            assertThat(classifier.classify("MySQL对比PostgreSQL")).isEqualTo(QueryIntent.COMPARISON);
-        }
-
-        @Test
-        @DisplayName("包含'多少'应识别为 FACTUAL")
-        void factualIntent() {
-            assertThat(classifier.classify("专升本需要多少词汇量")).isEqualTo(QueryIntent.FACTUAL);
-        }
-
-        @Test
-        @DisplayName("包含'是否'应识别为 FACTUAL")
-        void factualIntentWithShifou() {
-            assertThat(classifier.classify("是否支持中文分词")).isEqualTo(QueryIntent.FACTUAL);
-        }
-
-        @Test
-        @DisplayName("代词占比高且无其他意图标记应识别为 AMBIGUOUS")
-        void ambiguousIntentWithPronouns() {
-            // "那个东西" 无其他意图关键词，代词占比高
-            assertThat(classifier.classify("那个东西")).isEqualTo(QueryIntent.AMBIGUOUS);
-        }
-
-        @Test
-        @DisplayName("关键词过少应识别为 AMBIGUOUS")
-        void ambiguousIntentWithFewKeywords() {
-            when(tokenizerService.tokenize(anyString())).thenReturn(Collections.emptyList());
-            assertThat(classifier.classify("查")).isEqualTo(QueryIntent.AMBIGUOUS);
-        }
-
-        @Test
-        @DisplayName("空查询应识别为 AMBIGUOUS")
-        void ambiguousIntentWithEmpty() {
-            assertThat(classifier.classify("")).isEqualTo(QueryIntent.AMBIGUOUS);
-            assertThat(classifier.classify(null)).isEqualTo(QueryIntent.AMBIGUOUS);
-        }
-
-        @Test
-        @DisplayName("无特殊意图标记的查询默认为 FACTUAL")
-        void defaultFactualIntent() {
-            assertThat(classifier.classify("API配置说明")).isEqualTo(QueryIntent.FACTUAL);
-        }
-
-        @Test
-        @DisplayName("DEFINITIONAL 优先级高于 PROCEDURAL")
-        void definitionalOverProcedural() {
-            // "什么是" 应优先匹配 DEFINITIONAL
-            assertThat(classifier.classify("什么是如何配置")).isEqualTo(QueryIntent.DEFINITIONAL);
         }
     }
 

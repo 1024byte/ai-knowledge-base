@@ -1,0 +1,9 @@
+POST http://localhost:11434/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "qwen2.5:3b",
+  "messages": [{"role": "user", "content": "1+1等于几"}],
+  "max_tokens": 32,
+  "temperature": 0.1
+}

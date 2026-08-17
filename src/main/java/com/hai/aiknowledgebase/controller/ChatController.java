@@ -8,6 +8,7 @@ import com.hai.aiknowledgebase.dto.ChatSessionDTO;
 import com.hai.aiknowledgebase.dto.HaiChatResponse;
 import com.hai.aiknowledgebase.dto.SearchResult;
 import com.hai.aiknowledgebase.exception.BusinessException;
+import com.hai.aiknowledgebase.security.SecurityUtils;
 import com.hai.aiknowledgebase.service.ChatService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -29,7 +30,6 @@ public class ChatController {
     @Timed("请求 → 响应 总耗时")
     @PostMapping("/ask")
     public Result<HaiChatResponse> ask(@RequestBody ChatRequest request) {
-        // 参数校验
         if (request.getQuestion() == null || request.getQuestion().trim().isEmpty()) {
             throw new BusinessException(400, "问题内容不能为空");
         }
@@ -37,11 +37,13 @@ public class ChatController {
             throw new BusinessException(400, "会话ID不能为空");
         }
 
-        log.info("收到问答请求: sessionId={}, question={}", request.getSessionId(), request.getQuestion());
+        Long userId = SecurityUtils.getCurrentUserId();
+        log.info("收到问答请求: sessionId={}, userId={}, question={}", request.getSessionId(), userId, request.getQuestion());
 
         HaiChatResponse response = chatService.chat(
                 request.getSessionId(),
-                request.getQuestion()
+                request.getQuestion(),
+                userId
         );
 
         return Result.success(response);
@@ -85,10 +87,9 @@ public class ChatController {
      */
     @GetMapping("/sessions")
     public Result<List<ChatSessionDTO>> getSessions() {
-        log.info("获取会话列表");
-        // 如果接了用户系统，从 @AuthenticationPrincipal 或 SecurityContext 取 userId
-        // 这里先设为 null（匿名模式）
-        List<ChatSessionDTO> sessions = chatService.getSessions(null);
+        Long userId = SecurityUtils.getCurrentUserId();
+        log.info("获取会话列表, userId={}", userId);
+        List<ChatSessionDTO> sessions = chatService.getSessions(userId != null ? userId.toString() : null);
         return Result.success(sessions);
     }
 
@@ -109,8 +110,13 @@ public class ChatController {
 
     @DeleteMapping("/sessions")
     public Result<Void> deleteAllSessions(@RequestParam(required = false) String userId) {
-        log.info("删除历史会话, userId: {}", userId != null ? userId : "全部");
-        chatService.deleteAllSessions(userId);
+        Long currentUserId = SecurityUtils.getCurrentUserId();
+        String targetUserId = userId;
+        if (targetUserId == null && currentUserId != null) {
+            targetUserId = currentUserId.toString();
+        }
+        log.info("删除历史会话, userId: {}", targetUserId != null ? targetUserId : "全部");
+        chatService.deleteAllSessions(targetUserId);
         return Result.success();
     }
 }

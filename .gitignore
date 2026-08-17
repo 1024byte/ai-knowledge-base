@@ -44,3 +44,12 @@ models/
 models/bge-reranker-v2-m3/
 models/onnx_model/
 /.trae/skills/design-interface.md
+/eval/run_mteb.py
+/eval/run_eval.bat
+/eval/reports/
+/src/main/resources/schema-refresh-tokens.sql
+/src/main/resources/schema-users.sql
+/dev/langchain4j/model/embedding/onnx/OnnxBertBiEncoder$1.class
+/dev/langchain4j/model/embedding/onnx/OnnxBertBiEncoder$EmbeddingAndTokenCount.class
+/eval/results/no_model_name_available/no_revision_available/model_meta.json
+/.continue/agents/new-config.yaml

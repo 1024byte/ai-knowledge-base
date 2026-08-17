@@ -210,10 +210,11 @@ public class ChatService {
      *
      * @param sessionId 会话 ID，由前端生成（如 "user-001"），用于关联多轮对话历史
      * @param question  用户原始问题，不可为空
+     * @param userId    当前用户 ID（可为 null，表示匿名模式）
      * @return 包含 AI 回答、来源引用和会话 ID 的响应对象
      */
     @Timed("RAG 全流程")
-    public HaiChatResponse chat(String sessionId, String question) {
+    public HaiChatResponse chat(String sessionId, String question, Long userId) {
         long startTime = System.currentTimeMillis();
 
         // 步骤0：查询改写（含指代消解，使用对话历史）
@@ -289,7 +290,7 @@ public class ChatService {
                 .collect(Collectors.toList());
 
         // 步骤7：原子写入 DB + ChatMemory（失败时回滚 DB 中的 user 消息）
-        saveMessageWithMemory(sessionId, question, userPrompt, answer, sources, chatMemory);
+        saveMessageWithMemory(sessionId, question, userPrompt, answer, sources, chatMemory, userId);
 
         long processingTime = System.currentTimeMillis() - startTime;
         log.info("回答生成完成，耗时 {} ms", processingTime);
@@ -304,13 +305,14 @@ public class ChatService {
     // ==================== 消息保存（使用 MyBatis-Plus） ====================
 
     private void saveMessage(String sessionId, String role, String content) {
-        // 原有方法保持不变，调用重载方法，sourceInfo 传 null
-        saveMessage(sessionId, role, content, null);
+        saveMessage(sessionId, role, content, null, null);
     }
-    /**
-     * 保存单条消息到数据库
-     */
-    private void saveMessage(String sessionId, String role, String content,List<String> sources) {
+
+    private void saveMessage(String sessionId, String role, String content, List<String> sources) {
+        saveMessage(sessionId, role, content, sources, null);
+    }
+
+    private void saveMessage(String sessionId, String role, String content, List<String> sources, Long userId) {
         String sourceInfo = null;
         if (sources != null && !sources.isEmpty()) {
             sourceInfo = Json.toJson(sources);
@@ -320,7 +322,9 @@ public class ChatService {
         record.setRole(role);
         record.setContent(content);
         record.setSourceInfo(sourceInfo);
-        // userId 暂时为 null（匿名模式），后续接入用户系统后可设置
+        if (userId != null) {
+            record.setUserId(userId.toString());
+        }
         chatHistoryMapper.insert(record);
     }
 
@@ -340,18 +344,15 @@ public class ChatService {
      * <p>注：这不是严格的 ACID 事务（跨 DB 和内存），但通过回滚 DB 记录保证了最终一致性。</p>
      */
     private void saveMessageWithMemory(String sessionId, String question, String userPrompt,
-                                        String answer, List<String> sources, ChatMemory chatMemory) {
-        // 阶段1：写入 DB（user 消息）
-        saveMessage(sessionId, "user", question);
+                                        String answer, List<String> sources, ChatMemory chatMemory,
+                                        Long userId) {
+        saveMessage(sessionId, "user", question, null, userId);
         try {
-            // 阶段2：写入 ChatMemory（user + assistant）
             chatMemory.add(UserMessage.from(userPrompt));
             chatMemory.add(AiMessage.from(answer));
 
-            // 阶段3：写入 DB（assistant 消息）
-            saveMessage(sessionId, "assistant", answer, sources);
+            saveMessage(sessionId, "assistant", answer, sources, userId);
         } catch (Exception e) {
-            // 阶段4：回滚——删除 DB 中已写入的 user 消息
             log.warn("记忆写入失败，回滚 DB 中的 user 消息: sessionId={}", sessionId, e);
             try {
                 LambdaQueryWrapper<ChatHistory> wrapper = new LambdaQueryWrapper<>();

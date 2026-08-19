@@ -86,7 +86,7 @@ corrector:
 
 # 混合检索配置（并行双路召回 + RRF 融合）
 hybrid-search:
-  enabled: false                      # 总开关：true=向量+关键词双路召回，false=仅向量检索
+  enabled: true                      # 总开关：true=向量+关键词双路召回，false=仅向量检索
   rrf:
     k: 60                            # RRF 常数 k，值越大排名差异越平滑（推荐 60）
 

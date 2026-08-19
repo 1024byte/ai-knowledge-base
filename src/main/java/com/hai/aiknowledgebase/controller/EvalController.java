@@ -190,6 +190,9 @@ public class EvalController {
                     TextSegment seg = rr.getSegment();
                     Object source = seg.metadata().getString("source");
                     Object docId = seg.metadata().getString("documentId");
+                    if (docId == null) {
+                        docId = seg.metadata().getString("document_id");
+                    }
                     return RetrievedDoc.builder()
                             .text(seg.text())
                             .score(rr.getScore())

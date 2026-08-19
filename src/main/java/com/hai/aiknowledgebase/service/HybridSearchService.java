@@ -122,7 +122,7 @@ public class HybridSearchService {
      *   <li>从 PGVector embeddings 表查询所有 chunk（text + metadata）</li>
      *   <li>按 {@code metadata->>'document_id'} 分组，组内按 {@code embedding_id} 排序</li>
      *   <li>为每组内的 chunk 分配顺序索引（0, 1, 2...），
-     *       重构 chunkId 格式为 {@code "documentId_chunkIndex"}，
+     *       重构 chunkId 格式为 {@code "sourceFileName_chunkIndex"}，
      *       与 {@link VectorizationService} 入库时保持完全一致</li>
      *   <li>调用 {@link KeywordIndex#index} 逐条重建索引</li>
      * </ol>
@@ -155,9 +155,9 @@ public class HybridSearchService {
             long startTime = System.currentTimeMillis();
 
             // 查询所有 chunk：按 document_id 分组，组内按 embedding_id 排序
-            // 这样能保证同一文档的 chunk 顺序与原始入库时一致
+            // 同时查询 source（文件名）用于重建 chunkId
             String sql = String.format(
-                    "SELECT embedding_id, text, metadata->>'document_id' AS doc_id " +
+                    "SELECT embedding_id, text, metadata->>'source' AS source, metadata->>'document_id' AS doc_id " +
                     "FROM %s " +
                     "ORDER BY metadata->>'document_id', embedding_id",
                     tableName
@@ -176,6 +176,7 @@ public class HybridSearchService {
 
             for (Map<String, Object> row : rows) {
                 String docId = String.valueOf(row.get("doc_id"));
+                String source = String.valueOf(row.get("source"));
                 String text = String.valueOf(row.get("text"));
 
                 // 跳过空文本
@@ -189,9 +190,9 @@ public class HybridSearchService {
                     chunkIndex = 0;
                 }
 
-                // 重构 chunkId：格式与 VectorizationService 入库时一致
-                // 例如 docId="42", chunkIndex=0 → "42_0"
-                String chunkId = docId + "_" + chunkIndex;
+                // 重构 chunkId：格式为 "sourceFileName_chunkIndex"，与 VectorizationService 入库时一致
+                // 例如 source="时态.md", chunkIndex=0 → "时态.md_0"
+                String chunkId = source + "_" + chunkIndex;
                 keywordIndex.index(chunkId, text);
                 chunkIndex++;
                 indexedCount++;
@@ -336,31 +337,45 @@ public class HybridSearchService {
      * @param topK  返回结果数量上限
      * @return 带相似度分数的排序结果列表
      */
-    private List<RankedResult> vectorSearchRanked(String query, int topK) {
+    public List<RankedResult> vectorSearchRanked(String query, int topK) {
+        // 1. 前置校验
+        if (query == null || query.trim().isEmpty()) {
+            log.warn("Query is empty, return empty result");
+            return Collections.emptyList();
+        }
+        if (topK <= 0) {
+            throw new IllegalArgumentException("topK must be > 0");
+        }
+
         try {
-            // 步骤1：将查询文本转为向量（这是整个流程中最耗时的步骤，通常 10-50ms）
+            // 2. 嵌入（可考虑超时）
             Embedding queryEmbedding = embeddingModel.embed(query).content();
 
-            // 步骤2：构建检索请求，指定查询向量和返回数量上限
+            // 3. 构建请求（预留扩展）
             EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
                     .queryEmbedding(queryEmbedding)
                     .maxResults(topK)
                     .build();
 
-            // 步骤3：在向量库中执行 ANN 搜索，获取匹配结果
+            // 4. 检索
             List<EmbeddingMatch<TextSegment>> matches = embeddingStore.search(request).matches();
-
-            // 步骤4：将 EmbeddingMatch 转为内部 RankedResult 格式
-            List<RankedResult> results = new ArrayList<>();
-            for (int i = 0; i < matches.size(); i++) {
-                // EmbeddingMatch.embedded() 返回匹配的 TextSegment
-                // EmbeddingMatch.score() 返回余弦相似度分数 (0.0~1.0)
-                results.add(new RankedResult(matches.get(i).embedded(), matches.get(i).score()));
+            if (matches == null || matches.isEmpty()) {
+                return Collections.emptyList();
             }
+
+            // 5. 转换并过滤空值，同时显式排序
+            List<RankedResult> results = matches.stream()
+                    .filter(m -> m != null && m.embedded() != null)
+                    .map(m -> new RankedResult(m.embedded(), m.score()))
+                    .sorted((a, b) -> Double.compare(b.getScore(), a.getScore())) // 降序
+                    .collect(Collectors.toList());
+
+            log.debug("Vector search for '{}' returned {} results", query, results.size());
             return results;
         } catch (Exception e) {
-            log.error("向量检索失败", e);
-            return Collections.emptyList();
+            log.error("Vector search failed for query='{}'", query, e);
+            // 根据业务决定：抛出RuntimeException或返回空列表
+            throw new RuntimeException("Vector search failed", e);
         }
     }
 
@@ -408,7 +423,7 @@ public class HybridSearchService {
                 if (text == null) continue;
 
                 // 步骤3：从 docId 中提取 source 标识
-                // docId 格式: "documentName_chunkIndex"，如 "章程.pdf_5"
+                // docId 格式: "sourceFileName_chunkIndex"，如 "时态.md_5"
                 String source = extractSourceFromDocId(docId);
 
                 // 步骤4：包装为 TextSegment，与向量检索结果格式统一

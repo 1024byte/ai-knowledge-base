@@ -48,41 +48,133 @@ def fetch_documents() -> List[Dict]:
         return []
 
 
-def fetch_document_chunks(doc_name: str, top_k: int = 5) -> List[str]:
+def fetch_document_chunks(doc_id: int, doc_name: str, top_k: int = 5) -> List[str]:
     """
-    通过检索 API 获取文档的内容片段。
-    用文档名作为查询词，检索出该文档的 chunk。
+    获取文档的内容片段。
+
+    策略：
+      1. .md / .txt 文件：直接通过文档内容 API 获取原文，按段落分块（最可靠）
+      2. .pdf 等非文本文件：LLM 生成查询词 + 检索 API + documentId 精确过滤
     """
+    ext = os.path.splitext(doc_name)[1].lower()
+
+    if ext in ('.md', '.txt'):
+        chunks = _fetch_text_content(doc_id, doc_name, top_k)
+        if chunks:
+            return chunks
+        print(f"    直接获取失败，降级为检索方式")
+
+    return _fetch_via_retrieval(doc_id, doc_name, top_k)
+
+
+def _fetch_text_content(doc_id: int, doc_name: str, top_k: int) -> List[str]:
+    """通过文档内容 API 直接获取文本文件内容，按段落分块"""
+    url = f"{config.api_base_url}/api/documents/{doc_id}/content"
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        content = resp.text
+
+        if not content or len(content.strip()) == 0:
+            return []
+
+        # 按双换行分段（保留 Markdown 结构）
+        raw_paragraphs = [p.strip() for p in content.split('\n\n') if p.strip()]
+
+        # 合并过短的段落，使每个 chunk 至少有足够信息量
+        chunks = []
+        buffer = ""
+        for p in raw_paragraphs:
+            if len(buffer) + len(p) < 200:
+                buffer += ("\n\n" if buffer else "") + p
+            else:
+                if buffer:
+                    chunks.append(buffer)
+                buffer = p
+        if buffer:
+            chunks.append(buffer)
+
+        print(f"    直接获取到 {len(chunks)} 个段落（原始 {len(raw_paragraphs)} 段）")
+        return chunks[:top_k]
+
+    except Exception:
+        return []
+
+
+def _fetch_via_retrieval(doc_id: int, doc_name: str, top_k: int) -> List[str]:
+    """
+    通过检索 API 获取文档内容（用于 PDF 等非文本文件，或直接获取失败的文本文件）。
+
+    改进点：
+      1. 用 LLM 根据文件名生成语义相关的查询词，而非直接用文件名搜索
+      2. 用 documentId 精确过滤，而非文件名模糊匹配
+      3. 取 finalRanked（精排后）结果，而非中间 hybrid 结果
+    """
+    query = _generate_search_query(doc_name) if config.llm_api_key else os.path.splitext(doc_name)[0]
+
     url = f"{config.api_base_url}/api/eval/retrieve"
     payload = {
-        "query": doc_name,
-        "topK": top_k,
-        "mode": "no_rewrite"  # 不改写，直接用文档名搜
+        "query": query,
+        "topK": max(top_k * 3, 15),  # 扩大召回范围，确保能命中目标文档
+        "mode": "no_rewrite"
     }
     try:
         resp = requests.post(url, json=payload, timeout=30)
         resp.raise_for_status()
         body = resp.json()
-        if body.get("code") == 0:
-            data = body["data"]
-            # 从 hybrid/results 中提取文本
-            hybrid = data.get("hybrid", {})
-            results = hybrid.get("results", [])
-            chunks = []
-            for r in results:
-                metadata = r.get("metadata", {})
-                text = metadata.get("text", "")
-                doc = metadata.get("document", "")
-                # 只保留当前文档的 chunk
-                if doc_name in doc or doc in doc_name:
-                    chunks.append(text)
-                elif not chunks:  # 前几个可能匹配不到，放宽条件
-                    chunks.append(text)
+        if body.get("code") != 0:
+            return []
+
+        data = body["data"]
+        # 优先取精排后的最终结果，其次取混合检索中间结果
+        results = data.get("finalRanked", []) or data.get("hybrid", {}).get("results", [])
+
+        # 策略1：按 documentId 精确过滤
+        chunks = []
+        for r in results:
+            if str(r.get("documentId", "")) == str(doc_id):
+                chunks.append(r.get("text", ""))
+
+        if chunks:
+            print(f"    检索获取到 {len(chunks)} 个片段（documentId 精确匹配）")
             return chunks[:top_k]
-        return []
+
+        # 策略2：降级为文件名模糊匹配
+        chunks = []
+        basename = os.path.splitext(doc_name)[0]
+        for r in results:
+            source = r.get("source", "")
+            if doc_name in source or basename in source:
+                chunks.append(r.get("text", ""))
+
+        if chunks:
+            print(f"    检索获取到 {len(chunks)} 个片段（文件名模糊匹配）")
+            return chunks[:top_k]
+
+        # 策略3：最后兜底，取前 top_k 个结果
+        print(f"    ⚠️ 无法匹配到目标文档，取前 {top_k} 个结果")
+        return [r.get("text", "") for r in results[:top_k]]
+
     except Exception as e:
-        print(f"  获取文档内容失败: {e}")
+        print(f"  检索失败: {e}")
         return []
+
+
+def _generate_search_query(doc_name: str) -> str:
+    """使用 LLM 根据文档名生成 1 个代表性检索查询词"""
+    prompt = f"""根据文件名推断文档内容主题，生成一个简短的检索查询词（5-15个字），用于从该文档中检索出有代表性的内容。
+
+只返回查询词本身，不要任何解释或标点。
+
+文件名：{doc_name}
+查询词："""
+    try:
+        result = call_llm(prompt, temperature=0.3)
+        query = result.strip().strip('"').strip("'")
+        print(f"    LLM 生成查询词: {query}")
+        return query if query else os.path.splitext(doc_name)[0]
+    except Exception:
+        return os.path.splitext(doc_name)[0]
 
 
 # ===================== LLM 调用 =====================
@@ -185,12 +277,13 @@ def rag_generate_questions(documents: List[Dict], questions_per_doc: int = 5) ->
     q_idx = 1
 
     for doc in documents:
+        doc_id = doc.get("id", 0)
         filename = doc.get("filename", "unknown")
-        print(f"\n处理文档: {filename}")
+        print(f"\n处理文档: {filename} (id={doc_id})")
 
         # 获取文档内容
         print(f"  获取文档内容片段...")
-        chunks = fetch_document_chunks(filename, top_k=questions_per_doc)
+        chunks = fetch_document_chunks(doc_id, filename, top_k=questions_per_doc)
         if not chunks:
             print(f"  ⚠️ 未获取到内容，跳过")
             continue

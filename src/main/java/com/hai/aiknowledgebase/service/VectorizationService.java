@@ -187,10 +187,10 @@ public class VectorizationService {
             // ===== 步骤6：BM25 关键词索引 =====
             // 从 HybridSearchService 获取 BM25 关键词倒排索引实例
             KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
-            // 将每个片段加入索引，chunkId 格式为 "docId_chunkIndex"
-            // 例如 docId=42，第3个片段 → chunkId="42_2"
+            // 将每个片段加入索引，chunkId 格式为 "sourceFileName_chunkIndex"
+            // 例如 sourceFileName="时态.md"，第3个片段 → chunkId="时态.md_2"
             for (int i = 0; i < segments.size(); i++) {
-                String chunkId = docId + "_" + i;
+                String chunkId = sourceFileName + "_" + i;
                 // keywordIndex.index() 内部会：
                 // 1. 对文本进行中文分词
                 // 2. 更新每个词在倒排索引中的文档频率

@@ -53,3 +53,5 @@ models/onnx_model/
 /dev/langchain4j/model/embedding/onnx/OnnxBertBiEncoder$EmbeddingAndTokenCount.class
 /eval/results/no_model_name_available/no_revision_available/model_meta.json
 /.continue/agents/new-config.yaml
+test-docs/
+

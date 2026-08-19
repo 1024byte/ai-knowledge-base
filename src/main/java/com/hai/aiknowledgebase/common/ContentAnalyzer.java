@@ -8,7 +8,7 @@ import java.util.List;
 import java.util.regex.Pattern;
 
 @Slf4j
-public class ContentAnalyzer {
+public class  ContentAnalyzer {
 
     private static final Pattern CODE_BLOCK_PATTERN = Pattern.compile("```[a-zA-Z]*\\s*[\\s\\S]*?```");
     private static final Pattern INLINE_CODE_PATTERN = Pattern.compile("`[^`]+`");

@@ -2,6 +2,7 @@ package com.hai.aiknowledgebase.queryrewrite;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.hai.aiknowledgebase.config.ThresholdsConfig;
 import com.hai.aiknowledgebase.dto.QueryRewriteResult;
 import com.hai.aiknowledgebase.dto.RewritePath;
 import dev.langchain4j.data.embedding.Embedding;
@@ -59,9 +60,7 @@ public class LocalLLMRewriter {
     private OllamaChatModel localRewriteModel;
 
     private final EmbeddingModel embeddingModel;
-
-    @Value("${query-rewrite.local-llm.fidelity-threshold:0.75}")
-    private double fidelityThreshold;
+    private final ThresholdsConfig thresholdsConfig;
 
     @Value("${query-rewrite.local-llm.rewrite-timeout-ms:10000}")
     private long rewriteTimeoutMs;
@@ -78,9 +77,11 @@ public class LocalLLMRewriter {
     /** 复用 AsyncConfig 配置的线程池，用于 LLM 调用的超时控制 */
     private final ThreadPoolTaskExecutor taskExecutor;
 
-    public LocalLLMRewriter(EmbeddingModel embeddingModel, ThreadPoolTaskExecutor taskExecutor) {
+    public LocalLLMRewriter(EmbeddingModel embeddingModel, ThreadPoolTaskExecutor taskExecutor,
+                               ThresholdsConfig thresholdsConfig) {
         this.embeddingModel = embeddingModel;
         this.taskExecutor = taskExecutor;
+        this.thresholdsConfig = thresholdsConfig;
     }
 
     /**
@@ -138,6 +139,7 @@ public class LocalLLMRewriter {
                 ? String.join(" ", parseResult.subQueries)
                 : rewritten;
         double fidelity = computeFidelity(query, fidelityText);
+        double fidelityThreshold = thresholdsConfig.getQueryRewrite().getFidelity();
         if (fidelity < fidelityThreshold) {
             log.info("改写保真度不足 ({} < {})，回退到原查询: {} → {}",
                     String.format("%.3f", fidelity), fidelityThreshold, query, rewritten);

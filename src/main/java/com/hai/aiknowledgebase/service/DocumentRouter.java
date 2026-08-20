@@ -4,6 +4,7 @@ import com.hai.aiknowledgebase.common.ContentAnalyzer;
 import com.hai.aiknowledgebase.common.ContentCategory;
 import com.hai.aiknowledgebase.common.CustomDocument;
 import com.hai.aiknowledgebase.config.ChunkingConfig;
+import com.hai.aiknowledgebase.config.ThresholdsConfig;
 import dev.langchain4j.model.TokenCountEstimator;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import jakarta.annotation.Resource;
@@ -76,8 +77,8 @@ public class DocumentRouter {
      */
     private final EmbeddingModel embeddingModel;
 
-    /** 默认语义阈值，当 ChunkingConfig 未指定时使用 */
-    private final double defaultSemanticThreshold = 0.75;
+    /** 统一阈值配置 */
+    private final ThresholdsConfig thresholdsConfig;
 
     /**
      * Chunker 实例缓存。
@@ -209,19 +210,34 @@ public class DocumentRouter {
      * @return 对应的切分配置
      */
     private ChunkingConfig getConfigForCategory(ContentCategory category) {
+        ChunkingConfig config;
+        double semanticThreshold;
         switch (category) {
             case TECHNICAL:
-                return ChunkingConfig.TECHNICAL;
+                config = ChunkingConfig.TECHNICAL;
+                semanticThreshold = thresholdsConfig.getChunking().getTechnical();
+                break;
             case LEGAL:
-                return ChunkingConfig.LEGAL;
+                config = ChunkingConfig.LEGAL;
+                semanticThreshold = thresholdsConfig.getChunking().getLegal();
+                break;
             case TABLE_HEAVY:
-                return ChunkingConfig.TABLE_HEAVY;
+                config = ChunkingConfig.TABLE_HEAVY;
+                semanticThreshold = thresholdsConfig.getChunking().getTableHeavy();
+                break;
             case EXAM_PAPER:
-                return ChunkingConfig.EXAM_PAPER;
+                config = ChunkingConfig.EXAM_PAPER;
+                semanticThreshold = thresholdsConfig.getChunking().getExamPaper();
+                break;
             case GENERAL:
             default:
-                return ChunkingConfig.GENERAL;
+                config = ChunkingConfig.GENERAL;
+                semanticThreshold = thresholdsConfig.getChunking().getGeneral();
+                break;
         }
+        // 用 yml 配置的阈值覆盖预设值
+        config.setSemanticThreshold(semanticThreshold);
+        return config;
     }
 
     /**

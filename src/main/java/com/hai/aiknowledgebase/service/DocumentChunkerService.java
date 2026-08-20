@@ -2,6 +2,7 @@ package com.hai.aiknowledgebase.service;
 
 import com.hai.aiknowledgebase.common.CustomDocument;
 import com.hai.aiknowledgebase.common.FileUtils;
+import com.hai.aiknowledgebase.config.ThresholdsConfig;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.Metadata;
@@ -35,8 +36,7 @@ public class DocumentChunkerService implements DocumentSplitter {
     @Value("${document.chunk.overlap-ratio:0.2}")
     private double overlapRatio;
 
-    @Value("${document.chunk.semantic-threshold:0.65}")
-    private double semanticThreshold;
+    private final ThresholdsConfig thresholdsConfig;
 
     // 复用估算器实例（无状态，可共享）
     private final TokenCountEstimator  tokenCountEstimator;
@@ -49,10 +49,12 @@ public class DocumentChunkerService implements DocumentSplitter {
     // 构造器注入（Spring 4.3+ 自动注入，无需 @Autowired）
     public DocumentChunkerService(TokenCountEstimator tokenEstimator,
                                   EmbeddingModel embeddingModel,
-                                  DocumentRouter documentRouter) {
+                                  DocumentRouter documentRouter,
+                                  ThresholdsConfig thresholdsConfig) {
         this.tokenCountEstimator = tokenEstimator;
         this.embeddingModel = embeddingModel;
         this.documentRouter = documentRouter;
+        this.thresholdsConfig = thresholdsConfig;
     }
 
     /**
@@ -137,7 +139,7 @@ public class DocumentChunkerService implements DocumentSplitter {
                 overlapRatio,
                 tokenCountEstimator ,
                 embeddingModel,
-                semanticThreshold
+                thresholdsConfig.getChunking().getSemantic()
         );
     }
 

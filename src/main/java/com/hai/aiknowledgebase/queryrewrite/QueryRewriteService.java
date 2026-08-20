@@ -1,6 +1,7 @@
 package com.hai.aiknowledgebase.queryrewrite;
 
 import com.hai.aiknowledgebase.annotation.Timed;
+import com.hai.aiknowledgebase.config.ThresholdsConfig;
 import com.hai.aiknowledgebase.dto.*;
 import com.hai.aiknowledgebase.service.QueryRewriteConfigLoader;
 import dev.langchain4j.data.message.SystemMessage;
@@ -69,9 +70,7 @@ public class QueryRewriteService{
 
     // ==================== 配置属性 ====================
 
-    /** L1 规则改写置信度阈值，默认 0.85 */
-    @Value("${query-rewrite.l1.confidence-threshold:0.85}")
-    private double l1ConfidenceThreshold;
+    private final ThresholdsConfig thresholdsConfig;
 
     /** 全局改写开关，默认 true。设为 false 则所有查询直接返回原始文本 */
     @Value("${query-rewrite.enabled:true}")

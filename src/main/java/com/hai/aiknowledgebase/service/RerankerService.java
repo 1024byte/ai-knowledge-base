@@ -1,6 +1,7 @@
 package com.hai.aiknowledgebase.service;
 
 import com.hai.aiknowledgebase.annotation.Timed;
+import com.hai.aiknowledgebase.config.ThresholdsConfig;
 import ai.djl.huggingface.tokenizers.HuggingFaceTokenizer;
 import ai.onnxruntime.OnnxTensor;
 import ai.onnxruntime.OrtEnvironment;
@@ -73,9 +74,11 @@ public class RerankerService {
     @Value("${reranker.gpu-device-id:-1}")
     private int gpuDeviceId;
 
-    /** Rerank 最低分数阈值，低于此分视为不相关 */
-    @Value("${reranker.min-score:-3.5}")
-    private double minScore;
+    private final ThresholdsConfig thresholdsConfig;
+
+    public RerankerService(ThresholdsConfig thresholdsConfig) {
+        this.thresholdsConfig = thresholdsConfig;
+    }
 
     private HuggingFaceTokenizer tokenizer;
     private OrtEnvironment ortEnv;
@@ -376,6 +379,6 @@ public class RerankerService {
      * Rerank 最低分数阈值
      */
     public double getMinScore() {
-        return minScore;
+        return thresholdsConfig.getReranker().getMinScore();
     }
 }

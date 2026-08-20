@@ -1,6 +1,7 @@
 package com.hai.aiknowledgebase.service;
 
 import com.hai.aiknowledgebase.annotation.Timed;
+import com.hai.aiknowledgebase.config.ThresholdsConfig;
 import com.hai.aiknowledgebase.dto.SearchResult;
 import com.hai.aiknowledgebase.queryrewrite.QueryRewriteService;
 import dev.langchain4j.data.embedding.Embedding;
@@ -78,8 +79,12 @@ public class RAGSearchService {
     /** 文件名过滤模式下的检索返回数量（扩大范围以提高命中率） */
     private static final int MAX_RESULTS_WHEN_FILTERED = 20;
 
-    /** 向量检索最低余弦相似度阈值，低于此值的片段视为无关结果（0.6 分仍无关则需 &gt; 0.6） */
-    private static final double MIN_VECTOR_SCORE = 0.3;
+    private final ThresholdsConfig thresholdsConfig; // 阈值配置
+
+    /** 向量检索最低余弦相似度阈值，由 ThresholdsConfig 统一管理 */
+    private double getMinVectorScore() {
+        return thresholdsConfig.getRetrieval().getVectorMinScore();
+    }
 
     // ==================== 核心检索方法 ====================
 
@@ -130,7 +135,7 @@ public class RAGSearchService {
         // minVectorScore 过滤掉余弦相似度低于阈值的向量结果，避免无关片段进入融合
 
         List<HybridSearchService.RankedResult> allResults = new ArrayList<>(
-                hybridSearchService.hybridSearchRanked(userQuery, topK, MIN_VECTOR_SCORE));
+                hybridSearchService.hybridSearchRanked(userQuery, topK, getMinVectorScore()));
 
         log.info("混合检索召回 {} 个片段", allResults.size());
 

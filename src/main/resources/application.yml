@@ -37,13 +37,35 @@ vectorstore:
   pgvector:
     table-name: embeddings
 
+# ============================================================
+# 统一阈值配置（所有相似度/分数阈值集中管理）
+# ============================================================
+thresholds:
+  retrieval:
+    vector-min-score: 0.7         # 向量检索最低余弦相似度阈值（0.0~1.0），低于此值视为无关
+  reranker:
+    min-score: -3.5               # [-10, 10] Rerank 最低分数阈值（Cross-Encoder 输出），低于此分不送入 LLM
+  chunking:
+    semantic: 0.6                 # 语义切分默认阈值（句子与累积向量相似度低于此值时触发切分）
+    technical: 0.7                # 技术文档语义切分阈值
+    legal: 0.75                   # 法律文档语义切分阈值
+    table-heavy: 0.7              # 表格密集文档语义切分阈值
+    general: 0.7                  # 通用文档语义切分阈值
+    exam-paper: 0.7               # 试卷文档语义切分阈值
+  query-rewrite:
+    fidelity: 0.75                # 改写保真度阈值（cosine similarity），低于此值丢弃改写结果
+    l1-confidence: 0.85           # L1 规则改写置信度阈值
+    l2-confidence: 0.80           # L2 规则改写置信度阈值
+  corrector:
+    l1: 0.85                      # L1 word-checker 纠错置信度阈值
+    l2: 0.80                      # L2 拼音匹配纠错置信度阈值
+
 # 文档配置
 document:
   chunk:
     min-tokens: 400
     max-tokens: 800
     overlap-ratio: 0.2
-    semantic-threshold: 0.6 # 推荐 0.7-0.8，需要根据数据调优
   parser:
     max-output-size-mb: 200      # Python 进程输出上限，超过则终止解析
   upload:
@@ -63,23 +85,15 @@ query-rewrite:
     temperature: 0.1                       # 改写需要确定性，越低越好
     max-tokens: 128                        # 改写结果不需要长文本
     timeout-ms: 2000                        # 严格超时（ms）
-    fidelity-threshold: 0.75              # 改写保真度阈值（cosine similarity）
     rewrite-timeout-ms: 3000               # 改写超时时间（毫秒）
-    # 以下配置保留但降级为辅助
-  l1:
-    confidence-threshold: 0.85
-  l2:
-    confidence-threshold: 0.80
 
 
 
 # 三层漏斗纠错配置
 corrector:
   l1:
-    threshold: 0.85                  # L1 word-checker 置信度阈值
     timeout-ms: 50                   # L1 超时时间（毫秒）
   l2:
-    threshold: 0.80                  # L2 拼音匹配 置信度阈值
     timeout-ms: 200                  # L2 超时时间（毫秒）
   l3:
     timeout-ms: 2000                 # L3 LLM 超时时间（毫秒）
@@ -101,7 +115,6 @@ reranker:
   model-path: models/bge-reranker-v2-m3  # ONNX 模型目录（含 model.onnx + tokenizer.json）
   timeout-ms: 15000                  # Rerank 超时时间（毫秒，GPU 首次推理需 CUDA 预热）
   max-docs: 5                       # 单次 Rerank 最大文档数（防止 OOM）
-  min-score: -4.5                   # Rerank 最低分数阈值，低于此分视为不相关，不送入 LLM
   max-seq-length: 512                # 模型最大序列长度
   gpu-device-id: 0                 # GPU 设备 ID：-1=CPU 推理，>=0=指定 GPU（需安装 CUDA 12.x + cuDNN 9.x）
 

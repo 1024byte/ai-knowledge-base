@@ -2,6 +2,7 @@ package com.hai.aiknowledgebase.queryrewrite.corrector;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import com.hai.aiknowledgebase.config.ThresholdsConfig;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -35,15 +36,10 @@ public class FunnelQueryCorrector {
 
     private final L1WordCheckerCorrector l1;
     private final L2PinyinCorrector l2;
-
-    @Value("${corrector.l1.threshold:0.85}")
-    private double l1Threshold;
+    private final ThresholdsConfig thresholdsConfig;
 
     @Value("${corrector.l1.timeout-ms:50}")
     private long l1TimeoutMs;
-
-    @Value("${corrector.l2.threshold:0.80}")
-    private double l2Threshold;
 
     @Value("${corrector.l2.timeout-ms:200}")
     private long l2TimeoutMs;
@@ -64,7 +60,7 @@ public class FunnelQueryCorrector {
 
         // L1: word-checker 词典 + 编辑距离
         CorrectionResult r1 = executeWithTimeout(l1, query, l1TimeoutMs);
-        if (r1 != null && r1.getConfidence() >= l1Threshold) {
+        if (r1 != null && r1.getConfidence() >= thresholdsConfig.getCorrector().getL1()) {
             log.info("L1 纠错命中 | {} → {} | 置信度: {}",
                     query, r1.getCorrectedQuery(), r1.getConfidence());
             return r1.getCorrectedQuery();
@@ -73,7 +69,7 @@ public class FunnelQueryCorrector {
 
         // L2: 拼音匹配
         CorrectionResult r2 = executeWithTimeout(l2, query, l2TimeoutMs);
-        if (r2 != null && r2.getConfidence() >= l2Threshold) {
+        if (r2 != null && r2.getConfidence() >= thresholdsConfig.getCorrector().getL2()) {
             log.info("L2 纠错命中 | {} → {} | 置信度: {}",
                     query, r2.getCorrectedQuery(), r2.getConfidence());
             return r2.getCorrectedQuery();

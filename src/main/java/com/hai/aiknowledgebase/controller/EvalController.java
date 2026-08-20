@@ -1,6 +1,7 @@
 package com.hai.aiknowledgebase.controller;
 
 import com.hai.aiknowledgebase.common.Result;
+import com.hai.aiknowledgebase.config.ThresholdsConfig;
 import com.hai.aiknowledgebase.dto.EvalRetrieveRequest;
 import com.hai.aiknowledgebase.dto.EvalRetrieveResponse;
 import com.hai.aiknowledgebase.dto.EvalRetrieveResponse.ExcludeFilterResult;
@@ -40,8 +41,7 @@ public class EvalController {
     private final ChineseTokenizerService tokenizerService;
     private final EmbeddingStore<TextSegment> embeddingStore;
     private final EmbeddingModel embeddingModel;
-
-    private static final double MIN_VECTOR_SCORE = 0.3;
+    private final ThresholdsConfig thresholdsConfig;
 
     @PostMapping("/retrieve")
     public Result<EvalRetrieveResponse> retrieve(@RequestBody EvalRetrieveRequest request) {
@@ -97,7 +97,7 @@ public class EvalController {
         List<HybridSearchService.RankedResult> hybridResults;
         if (doHybrid) {
             hybridResults = new ArrayList<>(
-                    hybridSearchService.hybridSearchRanked(searchQuery, topK, MIN_VECTOR_SCORE));
+                    hybridSearchService.hybridSearchRanked(searchQuery, topK, thresholdsConfig.getRetrieval().getVectorMinScore()));
         } else {
             hybridResults = vectorOnlySearch(searchQuery, topK);
         }
@@ -156,9 +156,19 @@ public class EvalController {
         }
         builder.rerank(toStageResult(rerankedResults));
 
+        // 阶段4：Rerank 分数阈值过滤
+        double minRerankScore = thresholdsConfig.getReranker().getMinScore();
+        List<HybridSearchService.RankedResult> finalResults = rerankedResults.stream()
+                .filter(r -> r.getScore() >= minRerankScore)
+                .collect(Collectors.toList());
+        if (finalResults.isEmpty() && !rerankedResults.isEmpty()) {
+            log.warn("Rerank 阈值过滤({})导致所有片段被剔除，降级保留原始结果", minRerankScore);
+            finalResults = rerankedResults;
+        }
+
         // 最终排序
-        rerankedResults.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
-        builder.finalRanked(toRetrievedDocList(rerankedResults));
+        finalResults.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
+        builder.finalRanked(toRetrievedDocList(finalResults));
 
         return builder.build();
     }

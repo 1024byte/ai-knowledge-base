@@ -22,8 +22,10 @@ import dev.langchain4j.memory.ChatMemory;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
 import dev.langchain4j.model.TokenCountEstimator;
 import dev.langchain4j.model.chat.response.ChatResponse;
+import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
+import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
 import dev.langchain4j.model.output.Response;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingSearchResult;
@@ -33,7 +35,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -46,6 +50,7 @@ import java.util.stream.Collectors;
 public class ChatService {
 
     private final OpenAiChatModel chatModel;
+    private final OpenAiStreamingChatModel streamingChatModel;
     private final EmbeddingStore<TextSegment> embeddingStore;
     private final EmbeddingModel embeddingModel;
     private final ChatHistoryMapper chatHistoryMapper;
@@ -95,6 +100,7 @@ public class ChatService {
             """;
 
     public ChatService(OpenAiChatModel chatModel,
+                       OpenAiStreamingChatModel streamingChatModel,
                        EmbeddingStore<TextSegment> embeddingStore,
                        EmbeddingModel embeddingModel,
                        ChatHistoryMapper chatHistoryMapper,
@@ -104,6 +110,7 @@ public class ChatService {
                        TokenCountEstimator tokenCountEstimator,
                        ThreadPoolTaskExecutor taskExecutor) {
         this.chatModel = chatModel;
+        this.streamingChatModel = streamingChatModel;
         this.embeddingStore = embeddingStore;
         this.embeddingModel = embeddingModel;
         this.chatHistoryMapper = chatHistoryMapper;
@@ -300,6 +307,163 @@ public class ChatService {
                 .answer(answer)
                 .sources(sources)
                 .build();
+    }
+
+    /**
+     * RAG 流式问答核心方法
+     *
+     * <p>前置阶段（查询改写、检索、上下文构建）在异步线程执行，
+     * LLM 生成阶段通过 {@link SseEmitter} 逐 token 实时推送给客户端。</p>
+     *
+     * @param sessionId 会话 ID
+     * @param question  用户原始问题
+     * @param userId    当前用户 ID（可为 null）
+     * @return SseEmitter 流式响应对象
+     */
+    public SseEmitter chatStream(String sessionId, String question, Long userId) {
+        SseEmitter emitter = new SseEmitter(120_000L);
+
+        taskExecutor.execute(() -> {
+            try {
+                // ===== 步骤0-4：RAG 前置阶段 =====
+                ChatMemory chatMemory = getChatMemory(sessionId);
+                List<CustomChatMessage> truncatedHistory = extractTruncatedHistory(chatMemory);
+
+                RewriteRequest rewriteRequest = RewriteRequest.builder()
+                        .query(question)
+                        .truncatedHistory(truncatedHistory)
+                        .sessionId(sessionId)
+                        .strategy(RewriteStrategyEnum.SIMPLE_REWRITE)
+                        .build();
+                QueryRewriteResult rewriteResult = queryRewriteService.rewrite(rewriteRequest);
+
+                String searchQuery = rewriteResult.getRewrittenQuery();
+                List<String> expandKeywords = rewriteResult.getExpandKeywords();
+                List<String> excludeKeywords = rewriteResult.getExcludeKeywords();
+                List<String> subQueries = rewriteResult.getSubQueries();
+                log.info("查询改写(stream) | 原始: {} | 改写: {} | 扩展词: {} | 排除词: {} | 子查询: {}",
+                        question, searchQuery, expandKeywords, excludeKeywords,
+                        subQueries != null ? subQueries.size() : 0);
+
+                List<HybridSearchService.RankedResult> rankedResults;
+                if (subQueries != null && !subQueries.isEmpty()) {
+                    rankedResults = multiQueryRetrieve(subQueries, topK, expandKeywords, excludeKeywords);
+                    log.info("多子查询检索(stream): {} 个子查询, 合并后 {} 个片段", subQueries.size(), rankedResults.size());
+                } else {
+                    rankedResults = ragSearchService.retrieveSegments(searchQuery, topK, expandKeywords, excludeKeywords);
+                    log.info("检索到(stream) {} 个相关文档片段", rankedResults.size());
+                }
+                List<TextSegment> segments = rankedResults.stream()
+                        .map(HybridSearchService.RankedResult::getSegment)
+                        .collect(Collectors.toList());
+
+                ContextBuildResult contextResult = buildContextWithinBudget(segments, maxContextTokens);
+                String context = contextResult.context();
+                log.info("上下文构建(stream): {}/{} 个片段使用, {}/{} token 预算",
+                        contextResult.usedSegments(), segments.size(),
+                        contextResult.usedTokens(), maxContextTokens);
+
+                String userPrompt = buildPrompt(context, question);
+
+                List<ChatMessage> historyMessages = truncateHistoryByTokenBudget(
+                        chatMemory.messages(), maxHistoryTokens);
+                List<ChatMessage> allMessages = new ArrayList<>();
+                allMessages.add(SystemMessage.from(SYSTEM_PROMPT));
+                allMessages.addAll(historyMessages);
+                allMessages.add(UserMessage.from(userPrompt));
+
+                int totalTokens = estimateMessagesTokenCount(allMessages);
+                log.info("LLM 流式输入: 历史消息={}, 上下文={}/{}, 总估算 token={}",
+                        historyMessages.size(), contextResult.usedTokens(), maxContextTokens, totalTokens);
+
+                List<String> sources = segments.stream()
+                        .map(seg -> {
+                            Object source = seg.metadata().getString("source");
+                            return source != null ? source.toString() : null;
+                        })
+                        .filter(Objects::nonNull)
+                        .distinct()
+                        .collect(Collectors.toList());
+
+                // ===== 发送 start 事件 =====
+                emitter.send(SseEmitter.event()
+                        .name("start")
+                        .data("{\"sessionId\":\"" + sessionId + "\"}"));
+
+                // ===== 步骤5：流式 LLM 生成 =====
+                StringBuilder fullAnswer = new StringBuilder();
+                long startTime = System.currentTimeMillis();
+                log.info("LLM 流式调用开始");
+
+                streamingChatModel.chat(allMessages, new StreamingChatResponseHandler() {
+                    @Override
+                    public void onPartialResponse(String token) {
+                        log.info("SSE token -> {}", token);
+                        fullAnswer.append(token);
+                        try {
+                            emitter.send(SseEmitter.event()
+                                    .name("token")
+                                    .data(token));
+                        } catch (IOException e) {
+                            log.warn("SSE 推送 token 失败, 客户端可能已断开: sessionId={}", sessionId);
+                            throw new RuntimeException("SSE send failed", e);
+                        }
+                    }
+
+                    @Override
+                    public void onCompleteResponse(ChatResponse response) {
+                        try {
+                            long elapsed = System.currentTimeMillis() - startTime;
+                            log.info("LLM 流式生成完成，耗时 {} ms, 总字符数 {}", elapsed, fullAnswer.length());
+
+                            emitter.send(SseEmitter.event()
+                                    .name("done")
+                                    .data("{\"sessionId\":\"" + sessionId + "\"}"));
+
+                            CompletableFuture.runAsync(() -> {
+                                try {
+                                    saveMessageWithMemory(sessionId, question, userPrompt,
+                                            fullAnswer.toString(), sources, chatMemory, userId);
+                                } catch (Exception e) {
+                                    log.error("流式回答消息保存失败: sessionId={}", sessionId, e);
+                                }
+                            }, taskExecutor);
+
+                            emitter.complete();
+                        } catch (IOException e) {
+                            log.warn("SSE 发送 done 事件失败: sessionId={}", sessionId);
+                            emitter.completeWithError(e);
+                        }
+                    }
+
+                    @Override
+                    public void onError(Throwable error) {
+                        try {
+                            log.error("LLM 流式生成异常: sessionId={}", sessionId, error);
+                            emitter.send(SseEmitter.event()
+                                    .name("error")
+                                    .data("{\"error\":\"服务器内部错误\"}"));
+                        } catch (IOException ignored) {
+                            // 客户端已断开，忽略
+                        } finally {
+                            emitter.completeWithError(error);
+                        }
+                    }
+                });
+
+            } catch (Exception e) {
+                log.error("流式问答前置阶段异常: sessionId={}", sessionId, e);
+                try {
+                    emitter.send(SseEmitter.event()
+                            .name("error")
+                            .data("{\"error\":\"服务器内部错误\"}"));
+                } catch (IOException ignored) {
+                }
+                emitter.completeWithError(e);
+            }
+        });
+
+        return emitter;
     }
 
     // ==================== 消息保存（使用 MyBatis-Plus） ====================

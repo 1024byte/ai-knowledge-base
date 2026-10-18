@@ -13,6 +13,7 @@ import com.hai.aiknowledgebase.service.ChatService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.List;
 
@@ -47,6 +48,56 @@ public class ChatController {
         );
 
         return Result.success(response);
+    }
+
+    /**
+     * SSE 流式问答接口
+     *
+     * <p>与 {@link #ask(ChatRequest)} 共享相同的 RAG 前置流程，
+     * 但 LLM 生成阶段通过 Server-Sent Events 逐 token 实时推送，
+     * 用户无需等待完整答案即可看到首 token 内容。</p>
+     *
+     * <h3>SSE 事件</h3>
+     * <ul>
+     *   <li><b>start</b>：回答开始（含 sessionId）</li>
+     *   <li><b>token</b>：逐 token 的 AI 回答内容</li>
+     *   <li><b>done</b>：回答完成</li>
+     *   <li><b>error</b>：异常信息（参数校验错误或服务器错误）</li>
+     * </ul>
+     */
+    @Timed("请求 → 首token 耗时")
+    @PostMapping("/ask/stream")
+    public SseEmitter askStream(@RequestBody ChatRequest request) {
+        if (request.getQuestion() == null || request.getQuestion().trim().isEmpty()) {
+            SseEmitter errorEmitter = new SseEmitter();
+            try {
+                errorEmitter.send(SseEmitter.event()
+                        .name("error")
+                        .data("{\"error\":\"问题内容不能为空\"}"));
+            } catch (java.io.IOException e) {
+                // 忽略
+            }
+            errorEmitter.complete();
+            return errorEmitter;
+        }
+        if (request.getSessionId() == null || request.getSessionId().trim().isEmpty()) {
+            SseEmitter errorEmitter = new SseEmitter();
+            try {
+                errorEmitter.send(SseEmitter.event()
+                        .name("error")
+                        .data("{\"error\":\"会话ID不能为空\"}"));
+            } catch (java.io.IOException e) {
+                // 忽略
+            }
+            errorEmitter.complete();
+            return errorEmitter;
+        }
+
+        Long userId = SecurityUtils.getCurrentUserId();
+        String sessionId = request.getSessionId();
+        log.info("收到流式问答请求: sessionId={}, userId={}, question={}", sessionId, userId, request.getQuestion());
+
+        return chatService.chatStream(sessionId, request.getQuestion(), userId);
     }
 
     /**

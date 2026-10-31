@@ -10,6 +10,7 @@ import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.ollama.OllamaChatModel;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Service;
@@ -74,13 +75,14 @@ public class LocalLLMRewriter {
             .expireAfterWrite(10, TimeUnit.MINUTES)
             .build();
 
-    /** 复用 AsyncConfig 配置的线程池，用于 LLM 调用的超时控制 */
-    private final ThreadPoolTaskExecutor taskExecutor;
+    /** 查询改写专用线程池，用于 LLM 调用的超时控制 */
+    private final ThreadPoolTaskExecutor rewriteTaskExecutor;
 
-    public LocalLLMRewriter(EmbeddingModel embeddingModel, ThreadPoolTaskExecutor taskExecutor,
+    public LocalLLMRewriter(EmbeddingModel embeddingModel,
+                               @Qualifier("rewriteTaskExecutor") ThreadPoolTaskExecutor rewriteTaskExecutor,
                                ThresholdsConfig thresholdsConfig) {
         this.embeddingModel = embeddingModel;
-        this.taskExecutor = taskExecutor;
+        this.rewriteTaskExecutor = rewriteTaskExecutor;
         this.thresholdsConfig = thresholdsConfig;
     }
 
@@ -178,7 +180,7 @@ public class LocalLLMRewriter {
     }
 
     private String callWithTimeout(String prompt) {
-        Future<String> future = taskExecutor.submit(() ->
+        Future<String> future = rewriteTaskExecutor.submit(() ->
                 localRewriteModel.chat(
                         dev.langchain4j.data.message.SystemMessage.from(REWRITE_SYSTEM_PROMPT),
                         dev.langchain4j.data.message.UserMessage.from(prompt)

@@ -32,6 +32,7 @@ import dev.langchain4j.store.embedding.EmbeddingSearchResult;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.memory.chat.ChatMemoryStore;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Service;
@@ -60,12 +61,17 @@ public class ChatService {
             .removalListener((String key, ChatMemory value, RemovalCause cause) ->
                     log.debug("ChatMemory 缓存过期: sessionId={}, cause={}", key, cause))
             .build();
+
+    private final Cache<String, List<SourceSegment>> sourceSegmentCache = Caffeine.newBuilder()
+            .maximumSize(500)
+            .expireAfterWrite(10, TimeUnit.MINUTES)
+            .build();
     private final ChatMemoryStore chatMemoryStore;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private final RAGSearchService ragSearchService;
     private final QueryRewriteService queryRewriteService;
     private final TokenCountEstimator tokenCountEstimator;
-    private final ThreadPoolTaskExecutor taskExecutor;
+    private final ThreadPoolTaskExecutor chatTaskExecutor;
 
     @Value("${chat.prompt.max-context-tokens:3000}")
     private int maxContextTokens;
@@ -108,7 +114,7 @@ public class ChatService {
                        RAGSearchService ragSearchService,
                        QueryRewriteService queryRewriteService,
                        TokenCountEstimator tokenCountEstimator,
-                       ThreadPoolTaskExecutor taskExecutor) {
+                       @Qualifier("chatTaskExecutor") ThreadPoolTaskExecutor chatTaskExecutor) {
         this.chatModel = chatModel;
         this.streamingChatModel = streamingChatModel;
         this.embeddingStore = embeddingStore;
@@ -118,7 +124,7 @@ public class ChatService {
         this.ragSearchService = ragSearchService;
         this.queryRewriteService = queryRewriteService;
         this.tokenCountEstimator = tokenCountEstimator;
-        this.taskExecutor = taskExecutor;
+        this.chatTaskExecutor = chatTaskExecutor;
     }
 
 
@@ -221,7 +227,10 @@ public class ChatService {
      * @return 包含 AI 回答、来源引用和会话 ID 的响应对象
      */
     @Timed("RAG 全流程")
-    public HaiChatResponse chat(String sessionId, String question, Long userId) {
+    public HaiChatResponse chat(String sessionId, String question, Long userId,
+                               Integer requestTopK, Double requestMinScore) {
+        int effectiveTopK = (requestTopK != null && requestTopK > 0) ? requestTopK : this.topK;
+        double effectiveMinScore = (requestMinScore != null) ? requestMinScore : -1;
         long startTime = System.currentTimeMillis();
 
         // 步骤0：查询改写（含指代消解，使用对话历史）
@@ -252,10 +261,10 @@ public class ChatService {
         // 步骤1：混合检索（支持多子查询分别检索 + 合并去重）
         List<HybridSearchService.RankedResult> rankedResults;
         if (subQueries != null && !subQueries.isEmpty()) {// 多子查询检索：分别对每个子查询进行检索，合并结果并重新排序
-            rankedResults = multiQueryRetrieve(subQueries, topK, expandKeywords, excludeKeywords);//多子查询检索
+            rankedResults = multiQueryRetrieve(subQueries, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords);//多子查询检索
                        log.info("多子查询检索: {} 个子查询, 合并后 {} 个片段", subQueries.size(), rankedResults.size());
         } else {
-            rankedResults = ragSearchService.retrieveSegments(searchQuery, topK, expandKeywords, excludeKeywords);
+            rankedResults = ragSearchService.retrieveSegments(searchQuery, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords);
             log.info("检索到 {} 个相关文档片段", rankedResults.size());
         }
         List<TextSegment> segments = rankedResults.stream()
@@ -296,14 +305,17 @@ public class ChatService {
                 .distinct()
                 .collect(Collectors.toList());
 
+        String messageId = UUID.randomUUID().toString();
+
         // 步骤7：原子写入 DB + ChatMemory（失败时回滚 DB 中的 user 消息）
-        saveMessageWithMemory(sessionId, question, userPrompt, answer, sources, chatMemory, userId);
+        saveMessageWithMemory(sessionId, messageId, question, userPrompt, answer, sources, chatMemory, userId);
 
         long processingTime = System.currentTimeMillis() - startTime;
         log.info("回答生成完成，耗时 {} ms", processingTime);
 
         return HaiChatResponse.builder()
                 .sessionId(sessionId)
+                .messageId(messageId)
                 .answer(answer)
                 .sources(sources)
                 .build();
@@ -320,10 +332,14 @@ public class ChatService {
      * @param userId    当前用户 ID（可为 null）
      * @return SseEmitter 流式响应对象
      */
-    public SseEmitter chatStream(String sessionId, String question, Long userId) {
+    public SseEmitter chatStream(String sessionId, String question, Long userId,
+                                  Integer requestTopK, Double requestMinScore) {
+        int effectiveTopK = (requestTopK != null && requestTopK > 0) ? requestTopK : this.topK;
+        double effectiveMinScore = (requestMinScore != null) ? requestMinScore : -1;
         SseEmitter emitter = new SseEmitter(120_000L);
+        String messageId = UUID.randomUUID().toString();
 
-        taskExecutor.execute(() -> {
+        chatTaskExecutor.execute(() -> {
             try {
                 // ===== 步骤0-4：RAG 前置阶段 =====
                 ChatMemory chatMemory = getChatMemory(sessionId);
@@ -347,12 +363,17 @@ public class ChatService {
 
                 List<HybridSearchService.RankedResult> rankedResults;
                 if (subQueries != null && !subQueries.isEmpty()) {
-                    rankedResults = multiQueryRetrieve(subQueries, topK, expandKeywords, excludeKeywords);
+                    rankedResults = multiQueryRetrieve(subQueries, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords);
                     log.info("多子查询检索(stream): {} 个子查询, 合并后 {} 个片段", subQueries.size(), rankedResults.size());
                 } else {
-                    rankedResults = ragSearchService.retrieveSegments(searchQuery, topK, expandKeywords, excludeKeywords);
+                    rankedResults = ragSearchService.retrieveSegments(searchQuery, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords);
                     log.info("检索到(stream) {} 个相关文档片段", rankedResults.size());
                 }
+
+                // 缓存命中片段，供前端 /api/chat/sources/{messageId} 接口查询
+                List<SourceSegment> sourceSegments = buildSourceSegments(rankedResults);
+                sourceSegmentCache.put(messageId, sourceSegments);
+
                 List<TextSegment> segments = rankedResults.stream()
                         .map(HybridSearchService.RankedResult::getSegment)
                         .collect(Collectors.toList());
@@ -385,10 +406,10 @@ public class ChatService {
                         .distinct()
                         .collect(Collectors.toList());
 
-                // ===== 发送 start 事件 =====
+                // ===== 发送 start 事件（携带 messageId 供前端查询来源片段） =====
                 emitter.send(SseEmitter.event()
                         .name("start")
-                        .data("{\"sessionId\":\"" + sessionId + "\"}"));
+                        .data("{\"sessionId\":\"" + sessionId + "\",\"messageId\":\"" + messageId + "\"}"));
 
                 // ===== 步骤5：流式 LLM 生成 =====
                 StringBuilder fullAnswer = new StringBuilder();
@@ -398,7 +419,7 @@ public class ChatService {
                 streamingChatModel.chat(allMessages, new StreamingChatResponseHandler() {
                     @Override
                     public void onPartialResponse(String token) {
-                        log.info("SSE token -> {}", token);
+//                        log.info("SSE token -> {}", token);
                         fullAnswer.append(token);
                         try {
                             emitter.send(SseEmitter.event()
@@ -422,12 +443,12 @@ public class ChatService {
 
                             CompletableFuture.runAsync(() -> {
                                 try {
-                                    saveMessageWithMemory(sessionId, question, userPrompt,
+                                    saveMessageWithMemory(sessionId, messageId, question, userPrompt,
                                             fullAnswer.toString(), sources, chatMemory, userId);
                                 } catch (Exception e) {
                                     log.error("流式回答消息保存失败: sessionId={}", sessionId, e);
                                 }
-                            }, taskExecutor);
+                            }, chatTaskExecutor);
 
                             emitter.complete();
                         } catch (IOException e) {
@@ -469,20 +490,21 @@ public class ChatService {
     // ==================== 消息保存（使用 MyBatis-Plus） ====================
 
     private void saveMessage(String sessionId, String role, String content) {
-        saveMessage(sessionId, role, content, null, null);
+        saveMessage(sessionId, null, role, content, null, null);
     }
 
     private void saveMessage(String sessionId, String role, String content, List<String> sources) {
-        saveMessage(sessionId, role, content, sources, null);
+        saveMessage(sessionId, null, role, content, sources, null);
     }
 
-    private void saveMessage(String sessionId, String role, String content, List<String> sources, Long userId) {
+    private void saveMessage(String sessionId, String messageId, String role, String content, List<String> sources, Long userId) {
         String sourceInfo = null;
         if (sources != null && !sources.isEmpty()) {
             sourceInfo = Json.toJson(sources);
         }
         ChatHistory record = new ChatHistory();
         record.setSessionId(sessionId);
+        record.setMessageId(messageId);
         record.setRole(role);
         record.setContent(content);
         record.setSourceInfo(sourceInfo);
@@ -507,15 +529,15 @@ public class ChatService {
      *
      * <p>注：这不是严格的 ACID 事务（跨 DB 和内存），但通过回滚 DB 记录保证了最终一致性。</p>
      */
-    private void saveMessageWithMemory(String sessionId, String question, String userPrompt,
+    private void saveMessageWithMemory(String sessionId, String messageId, String question, String userPrompt,
                                         String answer, List<String> sources, ChatMemory chatMemory,
                                         Long userId) {
-        saveMessage(sessionId, "user", question, null, userId);
+        saveMessage(sessionId, messageId, "user", question, null, userId);
         try {
             chatMemory.add(UserMessage.from(userPrompt));
             chatMemory.add(AiMessage.from(answer));
 
-            saveMessage(sessionId, "assistant", answer, sources, userId);
+            saveMessage(sessionId, messageId, "assistant", answer, sources, userId);
         } catch (Exception e) {
             log.warn("记忆写入失败，回滚 DB 中的 user 消息: sessionId={}", sessionId, e);
             try {
@@ -533,6 +555,39 @@ public class ChatService {
             }
             throw new RuntimeException("记忆写入失败", e);
         }
+    }
+
+
+    // ==================== 命中片段缓存与查询 ====================
+
+    /**
+     * 将检索结果转换为 SourceSegment 列表（按 content 去重，保留首次出现顺序）
+     */
+    private List<SourceSegment> buildSourceSegments(List<HybridSearchService.RankedResult> rankedResults) {
+        Set<String> seen = new LinkedHashSet<>();
+        return rankedResults.stream()
+                .filter(r -> {
+                    String text = r.getSegment().text();
+                    if (text == null || text.isBlank()) return false;
+                    return seen.add(text);
+                })
+                .map(r -> SourceSegment.builder()
+                        .content(r.getSegment().text())
+                        .source(r.getSegment().metadata().getString("source"))
+                        .score(r.getScore())
+                        .build())
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * 获取指定消息的命中知识片段
+     *
+     * @param messageId 由 chatStream 生成的每轮问答唯一标识
+     * @return 命中片段列表，未命中时返回空列表
+     */
+    public List<SourceSegment> getSources(String messageId) {
+        List<SourceSegment> segments = sourceSegmentCache.getIfPresent(messageId);
+        return segments != null ? segments : Collections.emptyList();
     }
 
 
@@ -809,15 +864,15 @@ public class ChatService {
      * 并行执行以降低多子查询场景的总延迟，最终按分数降序排列返回。</p>
      */
     private List<HybridSearchService.RankedResult> multiQueryRetrieve(
-            List<String> subQueries, int totalTopK,
+            List<String> subQueries, int totalTopK, double minScore,
             List<String> expandKeywords, List<String> excludeKeywords) {
         int perQueryTopK = Math.max(3, totalTopK / subQueries.size());
 
         List<CompletableFuture<List<HybridSearchService.RankedResult>>> futures = new ArrayList<>();
         for (String subQuery : subQueries) {
             futures.add(CompletableFuture.supplyAsync(
-                    () -> ragSearchService.retrieveSegments(subQuery, perQueryTopK, expandKeywords, excludeKeywords),
-                    taskExecutor));
+                    () -> ragSearchService.retrieveSegments(subQuery, perQueryTopK, minScore, expandKeywords, excludeKeywords),
+                    chatTaskExecutor));
         }
 
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();

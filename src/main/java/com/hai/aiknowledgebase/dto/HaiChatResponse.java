@@ -14,6 +14,7 @@ import java.util.List;
 public class HaiChatResponse {
     private String answer;
     private String sessionId;
+    private String messageId;
     private List<String> sources;
     private long processingTimeMs;
 }

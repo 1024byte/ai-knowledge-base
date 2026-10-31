@@ -12,6 +12,7 @@ public class ChatHistory {
     private Long id;
 
     private String sessionId;
+    private String messageId;
     private String userId;
     private String role;
     private String content;

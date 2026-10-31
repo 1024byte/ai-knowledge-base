@@ -7,6 +7,7 @@ import com.hai.aiknowledgebase.dto.ChatRequest;
 import com.hai.aiknowledgebase.dto.ChatSessionDTO;
 import com.hai.aiknowledgebase.dto.HaiChatResponse;
 import com.hai.aiknowledgebase.dto.SearchResult;
+import com.hai.aiknowledgebase.dto.SourceSegment;
 import com.hai.aiknowledgebase.exception.BusinessException;
 import com.hai.aiknowledgebase.security.SecurityUtils;
 import com.hai.aiknowledgebase.service.ChatService;
@@ -44,7 +45,9 @@ public class ChatController {
         HaiChatResponse response = chatService.chat(
                 request.getSessionId(),
                 request.getQuestion(),
-                userId
+                userId,
+                request.getTopK(),
+                request.getMinScore()
         );
 
         return Result.success(response);
@@ -97,7 +100,7 @@ public class ChatController {
         String sessionId = request.getSessionId();
         log.info("收到流式问答请求: sessionId={}, userId={}, question={}", sessionId, userId, request.getQuestion());
 
-        return chatService.chatStream(sessionId, request.getQuestion(), userId);
+        return chatService.chatStream(sessionId, request.getQuestion(), userId, request.getTopK(), request.getMinScore());
     }
 
     /**
@@ -116,6 +119,24 @@ public class ChatController {
 
         List<SearchResult> results = chatService.search(query, topK);
         return Result.success(results);
+    }
+
+    /**
+     * 获取当前轮问答的命中知识片段（参考来源）
+     *
+     * <p>配合流式问答接口使用：前端建立 SSE 连接并收到 start 事件中的 messageId 后，
+     * 调用此接口获取 RAG 检索命中的知识片段列表。</p>
+     *
+     * @param messageId 由后端在 chatStream 中生成的每轮问答唯一标识
+     * @return 命中片段列表（含片段正文、来源文档、相关性分数）
+     */
+    @GetMapping("/sources/{messageId}")
+    public Result<List<SourceSegment>> getSources(@PathVariable String messageId) {
+        if (messageId == null || messageId.trim().isEmpty()) {
+            throw new BusinessException(400, "消息ID不能为空");
+        }
+        List<SourceSegment> sources = chatService.getSources(messageId);
+        return Result.success(sources);
     }
 
     /**

@@ -132,7 +132,7 @@ public class VectorizationService {
      * @param filePath 上传文件的本地路径（处理完成后该文件可能被删除或保留）
      * @param category 文档分类标签（如 "技术文档"、"规章制度"）
      */
-    @Async
+    @Async("vectorizationTaskExecutor")
     public void processVectorizationAsync(Long docId, Path filePath, String category) {
         try {
             // ===== 步骤1：文档解析 =====

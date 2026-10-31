@@ -98,7 +98,7 @@ public class RAGSearchService {
      * @return 检索到的文档片段列表
      */
     public List<HybridSearchService.RankedResult> retrieveSegments(String userQuery, int topK) {
-        return retrieveSegments(userQuery, topK, null, null);
+        return retrieveSegments(userQuery, topK, -1, null, null);
     }
 
     /**
@@ -119,23 +119,26 @@ public class RAGSearchService {
      *
      * @param userQuery       用户原始查询（经查询改写后的 rewrittenQuery）
      * @param topK            返回结果数量上限
+     * @param minScore        最低相似度阈值（0.0~1.0），≤0 时使用服务端默认值
      * @param expandKeywords  扩展关键词（已废弃，由阶段1混合检索的BM25覆盖）
      * @param excludeKeywords 排除关键词列表
      * @return 按分数降序排列的带分数文档片段列表
      */
     @Timed("混合检索+Rerank")
     public List<HybridSearchService.RankedResult> retrieveSegments(String userQuery, int topK,
+                                              double minScore,
                                               List<String> expandKeywords,
                                               List<String> excludeKeywords) {
-        log.info("开始检索，用户查询: {} | 扩展词: {} | 排除词: {}",
-                userQuery, expandKeywords, excludeKeywords);
+        double effectiveMinScore = (minScore > 0) ? minScore : getMinVectorScore();
+        log.info("开始检索，用户查询: {} | topK: {} | minScore: {} | 扩展词: {} | 排除词: {}",
+                userQuery, topK, effectiveMinScore, expandKeywords, excludeKeywords);
 
         // ===== 阶段1：混合检索（主路径）=====
         // 并行执行向量检索 + BM25 关键词检索，RRF 融合排序
         // minVectorScore 过滤掉余弦相似度低于阈值的向量结果，避免无关片段进入融合
 
         List<HybridSearchService.RankedResult> allResults = new ArrayList<>(
-                hybridSearchService.hybridSearchRanked(userQuery, topK, getMinVectorScore()));
+                hybridSearchService.hybridSearchRanked(userQuery, topK, effectiveMinScore));
 
         log.info("混合检索召回 {} 个片段", allResults.size());
 

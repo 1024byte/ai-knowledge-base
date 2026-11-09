@@ -68,4 +68,24 @@ public class AsyncConfig {
         executor.initialize();
         return executor;
     }
+
+    /**
+     * 文档解析专用线程池
+     * - 核心线程 1：解析是重 IO 任务（Python 子进程），串行执行避免资源争抢
+     * - 最大线程 2：允许两个文档并行解析
+     * - 队列 10
+     */
+    @Bean(name = "parseTaskExecutor")
+    public ThreadPoolTaskExecutor parseTaskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(2);
+        executor.setQueueCapacity(10);
+        executor.setThreadNamePrefix("Parse-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(60);
+        executor.initialize();
+        return executor;
+    }
 }

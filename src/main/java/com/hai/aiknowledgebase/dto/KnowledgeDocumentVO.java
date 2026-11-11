@@ -29,13 +29,13 @@ public class KnowledgeDocumentVO {
     /** 解析状态：0-待处理, 1-处理中, 2-已完成, 3-失败 */
     private Integer status;
 
-    /** 向量化状态：NULL=未触发, 0=待向量化, 1=向量化中, 2=已完成 */
+    /** 向量化状态：NULL=未触发, 0=待向量化, 1=向量化中, 2=已完成, 3=失败 */
     private Integer isVectorized;
 
-    /** 解析状态：unparsed / parsing / parsed */
+    /** 解析状态：unparsed / parsing / parsed / failed */
     private String parseStatus;
 
-    /** 向量化状态：unvectorized / vectorizing / vectorized */
+    /** 向量化状态：unvectorized / vectorizing / vectorized / failed */
     private String vectorStatus;
 
     private String errorMessage;
@@ -44,4 +44,7 @@ public class KnowledgeDocumentVO {
     private Long createdBy;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
+
+    /** 逻辑删除标记：0-正常, 1-已删除 */
+    private Integer isDeleted;
 }

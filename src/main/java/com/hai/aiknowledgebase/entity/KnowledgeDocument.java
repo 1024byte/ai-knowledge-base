@@ -56,7 +56,7 @@ public class KnowledgeDocument {
     /** 解析状态：0-待处理, 1-处理中, 2-已完成, 3-失败 */
     private Integer status;
 
-    /** 向量化状态：NULL=未触发, 0=待向量化, 1=向量化中, 2=已完成 */
+    /** 向量化状态：NULL=未触发, 0=待向量化, 1=向量化中, 2=已完成, 3=失败 */
     private Integer isVectorized;
 
     private String errorMessage;

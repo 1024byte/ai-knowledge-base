@@ -15,7 +15,7 @@ import lombok.NoArgsConstructor;
  *   <tr><td>0（待处理）</td><td>unparsed</td><td>unvectorized</td></tr>
  *   <tr><td>1（处理中）</td><td>parsing</td><td>unvectorized</td></tr>
  *   <tr><td>2（已完成）</td><td>parsed</td><td>vectorized</td></tr>
- *   <tr><td>3（失败）</td><td>unparsed</td><td>unvectorized</td></tr>
+ *   <tr><td>3（失败）</td><td>failed</td><td>unvectorized</td></tr>
  * </table>
  */
 @Data
@@ -30,10 +30,10 @@ public class KnowledgeDocumentUploadVO {
     private String fileType;
     private Long fileSize;
 
-    /** 解析状态：parsed / unparsed / parsing */
+    /** 解析状态：unparsed / parsing / parsed / failed */
     private String parseStatus;
 
-    /** 向量化状态：vectorized / unvectorized / vectorizing */
+    /** 向量化状态：unvectorized / vectorizing / vectorized / failed */
     private String vectorStatus;
 
     /** 创建时间，格式 YYYY-MM-DD HH:mm:ss */

@@ -5,6 +5,8 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.hai.aiknowledgebase.common.CustomDocument;
 import com.hai.aiknowledgebase.common.HashType;
 import com.hai.aiknowledgebase.dto.KnowledgeDocumentChunksVO;
+import com.hai.aiknowledgebase.dto.KnowledgeDocumentContentUpdateDTO;
+import com.hai.aiknowledgebase.dto.KnowledgeDocumentContentVO;
 import com.hai.aiknowledgebase.dto.KnowledgeDocumentUploadVO;
 import com.hai.aiknowledgebase.dto.KnowledgeDocumentVO;
 import com.hai.aiknowledgebase.dto.BatchChunkResult;
@@ -382,18 +384,20 @@ public class KnowledgeDocumentService {
     // ======================== 删除 ========================
 
     /**
-     * <h3>删除文档（逻辑删除 + 物理文件清理）</h3>
+     * <h3>删除文档（逻辑删除 + 关联资源清理）</h3>
      *
-     * <p>执行逻辑删除的同时清理磁盘上的原始文件和解析文件，避免磁盘空间泄露。</p>
+     * <p>执行逻辑删除的同时清理物理文件、切片、向量及哈希等派生资源，避免磁盘与向量库泄露。</p>
      *
      * <h4>删除步骤</h4>
      * <ol>
      *   <li>查询文档记录（含 is_deleted=1，用原生查询绕过逻辑删除过滤）</li>
      *   <li>幂等判断：已逻辑删除的记录返回 400</li>
-     *   <li>清理物理文件（best-effort）：
+     *   <li>清理关联资源（best-effort）：
      *     <ul>
-     *       <li>删除原始文件（{@code file_url}）</li>
-     *       <li>删除解析文件（{@code parsed_text_url}）</li>
+     *       <li>物理文件：原始文件（{@code file_url}）、解析文件（{@code parsed_text_url}）</li>
+     *       <li>切片数据：{@code knowledge_document_chunk}</li>
+     *       <li>向量数据：PGVector 向量 + BM25 关键词索引</li>
+     *       <li>文件哈希去重记录</li>
      *     </ul>
      *   </li>
      *   <li>逻辑删除数据库记录（is_deleted=1）</li>
@@ -404,12 +408,13 @@ public class KnowledgeDocumentService {
      * 远端 URL 文件不处理（无法删除服务端资源）。</p>
      *
      * @param id 文档 ID
-     * @return 被删除的文档信息
+     * @return 被删除的文档信息（isDeleted=1）
      * @throws BusinessException 文件不存在或已删除时抛出
      */
+    @Transactional
     public KnowledgeDocumentVO delete(Long id) {
         // ===== 1. 查询文档（绕过逻辑删除过滤） =====
-        KnowledgeDocument doc = knowledgeDocumentMapper.selectById(id);
+        KnowledgeDocument doc = knowledgeDocumentMapper.selectByIdIncludeDeleted(id);
         if (doc == null) {
             throw new BusinessException(404, "文件不存在");
         }
@@ -422,17 +427,46 @@ public class KnowledgeDocumentService {
         log.info("删除知识库文件: id={}, fileName={}, fileUrl={}, parsedTextUrl={}",
                 id, doc.getFileName(), doc.getFileUrl(), doc.getParsedTextUrl());
 
-        // ===== 3. 清理原始上传文件 =====
-        deleteFileIfLocal(doc.getFileUrl(), "原始文件");
+        // ===== 3. 清理关联资源（物理文件 + 切片 + 向量 + 哈希） =====
+        cleanupDocumentResources(doc);
 
-        // ===== 4. 清理解析输出文件 =====
-        deleteFileIfLocal(doc.getParsedTextUrl(), "解析文件");
-
-        // ===== 5. 逻辑删除数据库记录 =====
+        // ===== 4. 逻辑删除数据库记录 =====
         knowledgeDocumentMapper.deleteById(id);
         log.info("知识库文件已逻辑删除: id={}, fileName={}", id, doc.getFileName());
 
+        // 标记已删除，让返回 VO 反映删除状态
+        doc.setIsDeleted(1);
         return toVO(doc);
+    }
+
+    /**
+     * <h3>清理文档关联资源（best-effort）</h3>
+     *
+     * <p>清理文档的所有派生资源，供单个删除与知识库级联删除复用：</p>
+     * <ol>
+     *   <li>物理文件：原始上传文件 + 解析输出文件</li>
+     *   <li>切片数据：{@code knowledge_document_chunk} 物理删除</li>
+     *   <li>向量数据：PGVector 向量 + BM25 关键词索引</li>
+     *   <li>文件哈希去重记录</li>
+     * </ol>
+     *
+     * @param doc 待清理的文档实体
+     */
+    private void cleanupDocumentResources(KnowledgeDocument doc) {
+        deleteFileIfLocal(doc.getFileUrl(), "原始文件");
+        deleteFileIfLocal(doc.getParsedTextUrl(), "解析文件");
+
+        knowledgeDocumentChunkMapper.delete(new LambdaQueryWrapper<KnowledgeDocumentChunk>()
+                .eq(KnowledgeDocumentChunk::getDocumentId, doc.getId()));
+
+        jdbcTemplate.update(
+                "DELETE FROM " + vectorTableName + " WHERE metadata->>'document_id' = ?",
+                String.valueOf(doc.getId()));
+
+        String fileName = doc.getFileName() != null ? doc.getFileName() : "document";
+        hybridSearchService.getKeywordIndex().removeByPrefix(fileName + "_");
+
+        documentHashService.deleteByFileName(doc.getId());
     }
 
     /**
@@ -460,7 +494,7 @@ public class KnowledgeDocumentService {
             } else {
                 log.debug("{}不存在，跳过: {}", label, path);
             }
-        } catch (IOException e) {
+        } catch (Exception e) {
             log.warn("{}删除失败: path={}, error={}", label, filePath, e.getMessage());
         }
     }
@@ -472,14 +506,165 @@ public class KnowledgeDocumentService {
      *
      * @param kbId 知识库 ID
      */
+    @Transactional
     public void deleteByKbId(Long kbId) {
         log.info("级联删除知识库文件: kbId={}", kbId);
 
         LambdaQueryWrapper<KnowledgeDocument> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(KnowledgeDocument::getKbId, kbId);
+        List<KnowledgeDocument> docs = knowledgeDocumentMapper.selectList(wrapper);
+        for (KnowledgeDocument doc : docs) {
+            cleanupDocumentResources(doc);
+        }
         knowledgeDocumentMapper.delete(wrapper);
 
         log.info("知识库文件已全部逻辑删除: kbId={}", kbId);
+    }
+
+    // ======================== 文档解析内容预览 ========================
+
+    /**
+     * <h3>读取解析后的文档内容</h3>
+     *
+     * <p>读取文档已解析的 Markdown 原文，供前端"预览"渲染。
+     * 纯本地文件读取，同步返回。</p>
+     *
+     * <h4>执行步骤</h4>
+     * <ol>
+     *   <li>查询文档 → 404 "文件不存在"</li>
+     *   <li>校验 parsedTextUrl 非空 → 400 "请先完成文档解析"</li>
+     *   <li>校验 status=2（解析完成）→ 400 "文档未完成解析，无法预览"</li>
+     *   <li>校验解析文件存在 → 400 "解析文件已丢失，请重新解析"</li>
+     *   <li>读取 Markdown 文本 → 返回内容</li>
+     * </ol>
+     *
+     * @param documentId 文档 ID
+     * @return 解析内容（含文档 ID、文件名、Markdown 原文）
+     * @throws BusinessException 文档未完成解析或解析文件丢失时抛出
+     */
+    public KnowledgeDocumentContentVO getParsedContent(Long documentId) {
+        KnowledgeDocument doc = knowledgeDocumentMapper.selectById(documentId);
+        if (doc == null) {
+            throw new BusinessException(404, "文件不存在");
+        }
+
+        String parsedTextUrl = doc.getParsedTextUrl();
+        if (parsedTextUrl == null || parsedTextUrl.isBlank()) {
+            throw new BusinessException(400, "请先完成文档解析");
+        }
+
+        if (!Integer.valueOf(2).equals(doc.getStatus())) {
+            throw new BusinessException(400, "文档未完成解析，无法预览");
+        }
+
+        Path mdPath = Paths.get(parsedTextUrl);
+        if (!Files.exists(mdPath)) {
+            throw new BusinessException(400, "解析文件已丢失，请重新解析");
+        }
+
+        String markdown;
+        try {
+            markdown = Files.readString(mdPath, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            log.error("读取解析文件失败: path={}", mdPath, e);
+            throw new BusinessException(500, "读取解析文件失败");
+        }
+
+        log.info("读取解析内容: documentId={}, fileName={}, chars={}",
+                documentId, doc.getFileName(), markdown.length());
+
+        return new KnowledgeDocumentContentVO(documentId, doc.getFileName(), markdown);
+    }
+
+    /**
+     * <h3>保存编辑后的解析内容</h3>
+     *
+     * <p>将前端编辑后的 Markdown 原文写回解析文件，并清空该文档已有的切片，
+     * 因为内容变更后旧切片已失效，需用户重新切片/向量化。</p>
+     *
+     * <h4>执行步骤</h4>
+     * <ol>
+     *   <li>查询文档 → 404 "文件不存在"</li>
+     *   <li>校验未向量化（isVectorized != 2）→ 400 "文档已向量化，无法编辑"</li>
+     *   <li>校验 parsedTextUrl 非空 → 400 "请先完成文档解析"</li>
+     *   <li>校验 status=2 → 400 "文档未完成解析，无法编辑"</li>
+     *   <li>校验 content 非空 → 400 "内容不能为空"</li>
+     *   <li>校验解析文件存在 → 400 "解析文件已丢失，请重新解析"</li>
+     *   <li>若存在已保存切片且 confirm 不为 true → 400 提示确认</li>
+     *   <li>写回 Markdown 文件 + 删除切片 + 重置 chunkCount/tokenCount/isVectorized</li>
+     * </ol>
+     *
+     * <h4>设计考量</h4>
+     * <ul>
+     *   <li><b>confirm 确认机制</b>：存在切片时首次提交返回提示，前端弹框后带 confirm=true 重试。</li>
+     *   <li><b>事务保护</b>：写文件、删切片、更新文档字段在同一事务内，写文件失败整体回滚。</li>
+     * </ul>
+     *
+     * @param documentId 文档 ID
+     * @param request    编辑请求（含 content、confirm）
+     * @throws BusinessException 校验未通过或写文件失败时抛出
+     */
+    @Transactional
+    public void updateParsedContent(Long documentId, KnowledgeDocumentContentUpdateDTO request) {
+        KnowledgeDocument doc = knowledgeDocumentMapper.selectById(documentId);
+        if (doc == null) {
+            throw new BusinessException(404, "文件不存在");
+        }
+
+        if (Integer.valueOf(2).equals(doc.getIsVectorized())) {
+            throw new BusinessException(400, "文档已向量化，无法编辑");
+        }
+
+        String parsedTextUrl = doc.getParsedTextUrl();
+        if (parsedTextUrl == null || parsedTextUrl.isBlank()) {
+            throw new BusinessException(400, "请先完成文档解析");
+        }
+
+        if (!Integer.valueOf(2).equals(doc.getStatus())) {
+            throw new BusinessException(400, "文档未完成解析，无法编辑");
+        }
+
+        if (request == null || request.getContent() == null || request.getContent().isBlank()) {
+            throw new BusinessException(400, "内容不能为空");
+        }
+
+        Path mdPath = Paths.get(parsedTextUrl);
+        if (!Files.exists(mdPath)) {
+            throw new BusinessException(400, "解析文件已丢失，请重新解析");
+        }
+
+        // ===== 存在切片时要求用户确认 =====
+        LambdaQueryWrapper<KnowledgeDocumentChunk> chunkQuery = new LambdaQueryWrapper<>();
+        chunkQuery.eq(KnowledgeDocumentChunk::getDocumentId, documentId);
+        Long chunkCount = knowledgeDocumentChunkMapper.selectCount(chunkQuery);
+        boolean hasChunks = chunkCount != null && chunkCount > 0;
+        if (hasChunks && !Boolean.TRUE.equals(request.getConfirm())) {
+            throw new BusinessException(400, "文档已有切片，保存后将清空切片并需重新向量化");
+        }
+
+        // ===== 1. 写回 Markdown 文件 =====
+        try {
+            Files.writeString(mdPath, request.getContent(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            log.error("保存解析内容失败: documentId={}, path={}", documentId, mdPath, e);
+            throw new BusinessException(500, "保存解析内容失败");
+        }
+
+        // ===== 2. 清空已有切片 =====
+        if (hasChunks) {
+            LambdaQueryWrapper<KnowledgeDocumentChunk> deleteWrapper = new LambdaQueryWrapper<>();
+            deleteWrapper.eq(KnowledgeDocumentChunk::getDocumentId, documentId);
+            knowledgeDocumentChunkMapper.delete(deleteWrapper);
+        }
+
+        // ===== 3. 重置文档统计与向量化状态 =====
+        doc.setChunkCount(0);
+        doc.setTokenCount(0);
+        doc.setIsVectorized(0);
+        knowledgeDocumentMapper.updateById(doc);
+
+        log.info("解析内容保存完成: documentId={}, fileName={}, chars={}",
+                documentId, doc.getFileName(), request.getContent().length());
     }
 
     // ======================== 文档切片预览 ========================
@@ -637,25 +822,30 @@ public class KnowledgeDocumentService {
      *   <li>查询文档 → 404</li>
      *   <li>校验 status=2（解析完成）→ 400 "文档未完成解析，无法保存切片"</li>
      *   <li>校验切片列表非空 → 400 "切片列表不能为空"</li>
+     *   <li>已向量化（isVectorized == 2）且未确认 → 400 "文档已向量化，重新保存切片将清除向量化数据，需重新向量化"</li>
+     *   <li>清理该文档向量化数据（PGVector + BM25 索引）</li>
      *   <li>删除该文档下所有旧切片（先删后插 = 全量覆盖）</li>
      *   <li>按数组顺序插入新切片，chunkIndex 从 0 开始递增</li>
-     *   <li>更新 knowledge_document.chunkCount / tokenCount</li>
+     *   <li>更新 knowledge_document.chunkCount / tokenCount / isVectorized=0</li>
      * </ol>
      *
      * <h4>设计考量</h4>
      * <ul>
      *   <li><b>全量覆盖而非增量更新</b>：前端审校后切片可能完全不同（合并、拆分、新增、删除），
      *       增量比较逻辑复杂且易出错，全量覆盖更可靠。</li>
+     *   <li><b>重新向量化入口</b>：保存切片会无条件清理向量化数据并重置 isVectorized=0，
+     *       后续用户可重新触发向量化。</li>
      *   <li><b>事务保护</b>：{@code @Transactional} 确保删除 + 批量插入 + 更新文档计数字段
      *       在同一事务中原子完成。</li>
      * </ul>
      *
      * @param documentId 文档 ID
      * @param chunks     前端审校后的切片列表
+     * @param confirm    用户确认标记（已向量化文档重新保存需为 true）
      * @throws BusinessException 文档状态异常或切片为空时抛出
      */
     @Transactional
-    public void saveChunks(Long documentId, List<KnowledgeDocumentChunksVO.ChunkItem> chunks) {
+    public void saveChunks(Long documentId, List<KnowledgeDocumentChunksVO.ChunkItem> chunks, boolean confirm) {
         KnowledgeDocument doc = knowledgeDocumentMapper.selectById(documentId);
         if (doc == null) {
             throw new BusinessException(404, "文件不存在");
@@ -669,7 +859,22 @@ public class KnowledgeDocumentService {
             throw new BusinessException(400, "切片列表不能为空");
         }
 
-        log.info("开始保存切片: documentId={}, chunkCount={}", documentId, chunks.size());
+        if (Integer.valueOf(2).equals(doc.getIsVectorized()) && !confirm) {
+            throw new BusinessException(400, "文档已向量化，重新保存切片将清除向量化数据，需重新向量化");
+        }
+
+        log.info("开始保存切片: documentId={}, chunkCount={}, confirm={}", documentId, chunks.size(), confirm);
+
+        // 清理该文档向量化数据（PGVector + BM25 索引），避免与新切片不一致
+        String fileName = doc.getFileName() != null ? doc.getFileName() : "document";
+        jdbcTemplate.update(
+                "DELETE FROM " + vectorTableName + " WHERE metadata->>'document_id' = ?",
+                String.valueOf(documentId));
+        log.debug("保存切片: 清理旧向量完成, id={}, table={}", documentId, vectorTableName);
+
+        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+        keywordIndex.removeByPrefix(fileName + "_");
+        log.debug("保存切片: 清理旧 BM25 索引完成, prefix={}_", fileName);
 
         LambdaQueryWrapper<KnowledgeDocumentChunk> deleteWrapper = new LambdaQueryWrapper<>();
         deleteWrapper.eq(KnowledgeDocumentChunk::getDocumentId, documentId);
@@ -735,6 +940,7 @@ public class KnowledgeDocumentService {
      * <table>
      *   <tr><td>条件</td><td>HTTP</td><td>message</td></tr>
      *   <tr><td>文档不存在</td><td>404</td><td>文件不存在</td></tr>
+     *   <tr><td>已向量化</td><td>400</td><td>文档已向量化，无法快速切片</td></tr>
      *   <tr><td>status != 2</td><td>400</td><td>文档未完成解析，无法切片</td></tr>
      *   <tr><td>parsedTextUrl 为空</td><td>400</td><td>请先完成文档解析</td></tr>
      *   <tr><td>解析文件不存在</td><td>400</td><td>解析文件已丢失，请重新解析</td></tr>
@@ -748,6 +954,10 @@ public class KnowledgeDocumentService {
         KnowledgeDocument doc = knowledgeDocumentMapper.selectById(documentId);
         if (doc == null) {
             throw new BusinessException(404, "文件不存在");
+        }
+
+        if (Integer.valueOf(2).equals(doc.getIsVectorized())) {
+            throw new BusinessException(400, "文档已向量化，无法快速切片");
         }
 
         if (!Integer.valueOf(2).equals(doc.getStatus())) {
@@ -827,10 +1037,24 @@ public class KnowledgeDocumentService {
      * <p>遍历文档 ID 列表，逐个调用 {@link #autoChunkAndSave}。单个文档失败
      * 只记录失败明细，不中断其他文档的处理（best-effort）。</p>
      *
+     * <h4>预检规则</h4>
+     * <p>开始处理前预检，只要列表中存在任意已向量化（isVectorized == 2）的文档，
+     * 整个批次直接拒绝，一个都不处理。</p>
+     *
      * @param documentIds 文档 ID 列表
      * @return 批量处理结果（总数、成功数、失败明细）
+     * @throws BusinessException 列表中存在已向量化文档时抛出
      */
     public BatchChunkResult autoChunkBatch(List<Long> documentIds) {
+        // ===== 预检：存在已向量化文档则整体拒绝 =====
+        for (Long id : documentIds) {
+            KnowledgeDocument doc = knowledgeDocumentMapper.selectById(id);
+            if (doc != null && Integer.valueOf(2).equals(doc.getIsVectorized())) {
+                log.warn("批量快速切片被拒绝: 存在已向量化文档, id={}", id);
+                throw new BusinessException(400, "存在已向量化的文档，无法快速切片");
+            }
+        }
+
         int total = documentIds.size();
         List<BatchChunkResult.Failure> failures = new java.util.ArrayList<>();
 
@@ -930,7 +1154,7 @@ public class KnowledgeDocumentService {
      *
      * <h4>异常处理</h4>
      *
-     * <p>任何步骤失败都会将 isVectorized 回滚为 0 并记录 errorMessage，status 保持不动</p>
+     * <p>任何步骤失败都会将 isVectorized 置为 3（失败）并记录 errorMessage，status 保持不动</p>
      *
      * @param documentId 文档 ID
      */
@@ -1011,11 +1235,10 @@ public class KnowledgeDocumentService {
     }
 
     /**
-     *
-     *  <li>更新 isVectorized=2（status 保持不动）</li>
+     * 向量化失败：isVectorized 置为 3（失败）并记录错误信息，status 保持不动
      */
     private void failVectorize(KnowledgeDocument doc, String errorMessage) {
-        doc.setIsVectorized(0);
+        doc.setIsVectorized(3);
         doc.setErrorMessage(errorMessage);
         knowledgeDocumentMapper.updateById(doc);
     }
@@ -1043,6 +1266,10 @@ public class KnowledgeDocumentService {
         String fileUrl = doc.getFileUrl();
         if (fileUrl == null || fileUrl.isBlank()) {
             throw new BusinessException(400, "文档原始文件路径为空，无法解析");
+        }
+
+        if (Integer.valueOf(2).equals(doc.getIsVectorized())) {
+            throw new BusinessException(400, "文档已向量化，如需重新解析请先重新保存切片");
         }
 
         log.info("启动文档解析: id={}, fileUrl={}", documentId, fileUrl);
@@ -1097,9 +1324,7 @@ public class KnowledgeDocumentService {
                 sourcePath = Paths.get(fileUrl);
                 if (!Files.exists(sourcePath)) {
                     log.error("原始文件不存在: {}", sourcePath);
-                    doc.setStatus(3);
-                    doc.setErrorMessage("原始文件不存在: " + fileUrl);
-                    knowledgeDocumentMapper.updateById(doc);
+                    handleParseFailure(doc, "原始文件不存在: " + fileUrl);
                     return;
                 }
             }
@@ -1129,18 +1354,14 @@ public class KnowledgeDocumentService {
 
         } catch (BusinessException e) {
             log.error("文档解析业务异常: id={}", documentId, e);
-            doc.setStatus(3);
-            doc.setErrorMessage(e.getMessage());
-            knowledgeDocumentMapper.updateById(doc);
+            handleParseFailure(doc, e.getMessage());
         } catch (Exception e) {
             log.error("文档解析失败: id={}", documentId, e);
             String errorMsg = e.getMessage();
             if (errorMsg == null || errorMsg.isBlank()) {
                 errorMsg = e.getClass().getSimpleName();
             }
-            doc.setStatus(3);
-            doc.setErrorMessage(errorMsg);
-            knowledgeDocumentMapper.updateById(doc);
+            handleParseFailure(doc, errorMsg);
         } finally {
             if (needCleanup && sourcePath != null) {
                 try {
@@ -1150,6 +1371,28 @@ public class KnowledgeDocumentService {
                 }
             }
         }
+    }
+
+    /**
+     * <h3>解析失败处理（回滚保留旧结果）</h3>
+     *
+     * <p>若此前存在解析成功的旧结果（{@code parsedTextUrl} 非空），
+     * 则回滚状态为 2（已解析）并保留旧结果，仅记录本次失败信息；
+     * 否则（首次解析失败）将状态置为 3（失败）。</p>
+     *
+     * @param doc      当前文档实体
+     * @param errorMsg 本次解析失败原因
+     */
+    private void handleParseFailure(KnowledgeDocument doc, String errorMsg) {
+        String oldParsedTextUrl = doc.getParsedTextUrl();
+        if (oldParsedTextUrl != null && !oldParsedTextUrl.isBlank()) {
+            doc.setStatus(2);
+            doc.setErrorMessage("重新解析失败，已保留上次解析结果: " + errorMsg);
+        } else {
+            doc.setStatus(3);
+            doc.setErrorMessage(errorMsg);
+        }
+        knowledgeDocumentMapper.updateById(doc);
     }
 
     /**
@@ -1252,9 +1495,8 @@ public class KnowledgeDocumentService {
         vo.setFileType(doc.getFileExt());
         vo.setFileSize(doc.getFileSize());
 
-        String[] statuses = mapStatus(doc);
-        vo.setParseStatus(statuses[0]);
-        vo.setVectorStatus(statuses[1]);
+        vo.setParseStatus(mapParseStatus(doc.getStatus()));
+        vo.setVectorStatus(mapVectorStatus(doc.getIsVectorized()));
 
         if (doc.getCreatedAt() != null) {
             vo.setCreatedAt(doc.getCreatedAt().format(DATETIME_FORMATTER));
@@ -1263,32 +1505,28 @@ public class KnowledgeDocumentService {
     }
 
     /**
-     * 内部 status → (parseStatus, vectorStatus) 双状态映射
+     * status → parseStatus 映射（仅由解析状态字段决定）
      */
-    private String[] mapStatus(KnowledgeDocument doc) {
-        Integer status = doc.getStatus();
-        if (status == null) return new String[]{"unparsed", "unvectorized"};
+    private String mapParseStatus(Integer status) {
+        if (status == null) return "unparsed";
         return switch (status) {
-            case 0 -> new String[]{"unparsed", "unvectorized"};
-            case 1 -> {
-                boolean parsed = doc.getParsedTextUrl() != null && !doc.getParsedTextUrl().isBlank();
-                yield parsed
-                        ? new String[]{"parsed", "vectorizing"}
-                        : new String[]{"parsing", "unvectorized"};
-            }
-            case 2 -> {
-                String vs;
-                if (Integer.valueOf(1).equals(doc.getIsVectorized())) {
-                    vs = "vectorizing";
-                } else if (Integer.valueOf(2).equals(doc.getIsVectorized())) {
-                    vs = "vectorized";
-                } else {
-                    vs = "unvectorized";
-                }
-                yield new String[]{"parsed", vs};
-            }
-            case 3 -> new String[]{"unparsed", "unvectorized"};
-            default -> new String[]{"unparsed", "unvectorized"};
+            case 1  -> "parsing";
+            case 2  -> "parsed";
+            case 3  -> "failed";
+            default -> "unparsed";
+        };
+    }
+
+    /**
+     * isVectorized → vectorStatus 映射（仅由向量化状态字段决定）
+     */
+    private String mapVectorStatus(Integer isVectorized) {
+        if (isVectorized == null) return "unvectorized";
+        return switch (isVectorized) {
+            case 1  -> "vectorizing";
+            case 2  -> "vectorized";
+            case 3  -> "failed";
+            default -> "unvectorized";
         };
     }
 
@@ -1309,9 +1547,8 @@ public class KnowledgeDocumentService {
         vo.setStatus(doc.getStatus());
         vo.setIsVectorized(doc.getIsVectorized());
 
-        String[] statuses = mapStatus(doc);
-        vo.setParseStatus(statuses[0]);
-        vo.setVectorStatus(statuses[1]);
+        vo.setParseStatus(mapParseStatus(doc.getStatus()));
+        vo.setVectorStatus(mapVectorStatus(doc.getIsVectorized()));
 
         vo.setErrorMessage(doc.getErrorMessage());
         vo.setChunkCount(doc.getChunkCount());
@@ -1319,6 +1556,7 @@ public class KnowledgeDocumentService {
         vo.setCreatedBy(doc.getCreatedBy());
         vo.setCreatedAt(doc.getCreatedAt());
         vo.setUpdatedAt(doc.getUpdatedAt());
+        vo.setIsDeleted(doc.getIsDeleted());
         return vo;
     }
 }

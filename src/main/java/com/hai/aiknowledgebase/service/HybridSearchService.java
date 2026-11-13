@@ -7,6 +7,7 @@ import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingStore;
+import dev.langchain4j.store.embedding.filter.MetadataFilterBuilder;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -157,9 +158,10 @@ public class HybridSearchService {
             // 查询所有 chunk：按 document_id 分组，组内按 embedding_id 排序
             // 同时查询 source（文件名）用于重建 chunkId
             String sql = String.format(
-                    "SELECT embedding_id, text, metadata->>'source' AS source, metadata->>'document_id' AS doc_id " +
+                    "SELECT embedding_id, text, metadata->>'source' AS source, metadata->>'document_id' AS doc_id, " +
+                    "metadata->>'kb_id' AS kb_id " +
                     "FROM %s " +
-                    "ORDER BY metadata->>'document_id', embedding_id",
+                    "ORDER BY metadata->>'kb_id', metadata->>'document_id', embedding_id",
                     tableName
             );
             List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql);
@@ -177,6 +179,7 @@ public class HybridSearchService {
             for (Map<String, Object> row : rows) {
                 String docId = String.valueOf(row.get("doc_id"));
                 String source = String.valueOf(row.get("source"));
+                String kbId = (String) row.get("kb_id");
                 String text = String.valueOf(row.get("text"));
 
                 // 跳过空文本
@@ -190,9 +193,12 @@ public class HybridSearchService {
                     chunkIndex = 0;
                 }
 
-                // 重构 chunkId：格式为 "sourceFileName_chunkIndex"，与 VectorizationService 入库时一致
-                // 例如 source="时态.md", chunkIndex=0 → "时态.md_0"
-                String chunkId = source + "_" + chunkIndex;
+                // 重构 chunkId：格式为 "kbId_sourceFileName_chunkIndex"，与 VectorizationService 入库时一致
+                // 旧数据无 kb_id 时退化为 "sourceFileName_chunkIndex" 格式
+                // 例如 kbId="1", source="时态.md", chunkIndex=0 → "1_时态.md_0"
+                String chunkId = (kbId != null && !kbId.isBlank())
+                        ? kbId + "_" + source + "_" + chunkIndex
+                        : source + "_" + chunkIndex;
                 keywordIndex.index(chunkId, text);
                 chunkIndex++;
                 indexedCount++;
@@ -244,19 +250,23 @@ public class HybridSearchService {
      * @return 按 RRF 融合分数降序排列的 RankedResult 列表
      */
     public List<RankedResult> hybridSearchRanked(String query, int topK, double minVectorScore) {
+        return hybridSearchRanked(query, topK, minVectorScore, null);
+    }
+
+    public List<RankedResult> hybridSearchRanked(String query, int topK, double minVectorScore, Set<Long> kbIds) {
         // 降级判断：如果混合检索关闭或关键词索引为空，直接走纯向量检索
         if (!hybridEnabled || keywordIndex.size() == 0) {
             log.info("混合检索已关闭或关键词索引为空，降级为纯向量检索");
-            return vectorSearchRanked(query, topK).stream()
+            return vectorSearchRanked(query, topK, kbIds).stream()
                     .filter(r -> r.getScore() >= minVectorScore)
                     .collect(Collectors.toList());
         }
 
         // 并行发起两路检索：向量路径 + 关键词路径
         CompletableFuture<List<RankedResult>> vectorFuture =
-                CompletableFuture.supplyAsync(() -> vectorSearchRanked(query, topK));
+                CompletableFuture.supplyAsync(() -> vectorSearchRanked(query, topK, kbIds));
         CompletableFuture<List<RankedResult>> keywordFuture =
-                CompletableFuture.supplyAsync(() -> keywordSearchRanked(query, topK));
+                CompletableFuture.supplyAsync(() -> keywordSearchRanked(query, topK, kbIds));
 
         List<RankedResult> vectorResults = vectorFuture.join().stream()
                 .filter(r -> r.getScore() >= minVectorScore)
@@ -338,6 +348,10 @@ public class HybridSearchService {
      * @return 带相似度分数的排序结果列表
      */
     public List<RankedResult> vectorSearchRanked(String query, int topK) {
+        return vectorSearchRanked(query, topK, null);
+    }
+
+    public List<RankedResult> vectorSearchRanked(String query, int topK, Set<Long> kbIds) {
         // 1. 前置校验
         if (query == null || query.trim().isEmpty()) {
             log.warn("Query is empty, return empty result");
@@ -352,10 +366,21 @@ public class HybridSearchService {
             Embedding queryEmbedding = embeddingModel.embed(query).content();
 
             // 3. 构建请求（预留扩展）
-            EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
+            var requestBuilder = EmbeddingSearchRequest.builder()
                     .queryEmbedding(queryEmbedding)
-                    .maxResults(topK)
-                    .build();
+                    .maxResults(topK);
+            // 知识库隔离：kbIds == null 表示不过滤；空集合表示无可见知识库（返回空）；
+            // 非空集合通过 metadata filter 的 isIn 在向量库层过滤
+            if (kbIds != null) {
+                if (kbIds.isEmpty()) {
+                    return Collections.emptyList();
+                }
+                List<String> kbIdValues = kbIds.stream()
+                        .map(String::valueOf)
+                        .collect(Collectors.toList());
+                requestBuilder.filter(MetadataFilterBuilder.metadataKey("kb_id").isIn(kbIdValues));
+            }
+            EmbeddingSearchRequest request = requestBuilder.build();
 
             // 4. 检索
             List<EmbeddingMatch<TextSegment>> matches = embeddingStore.search(request).matches();
@@ -409,10 +434,11 @@ public class HybridSearchService {
      * @param topK  返回结果数量上限
      * @return 带 BM25 分数的排序结果列表
      */
-    private List<RankedResult> keywordSearchRanked(String query, int topK) {
+    private List<RankedResult> keywordSearchRanked(String query, int topK, Set<Long> kbIds) {
         try {
             // 步骤1：在 BM25 倒排索引中检索，返回 (docId, BM25分数) 的有序列表
-            List<Map.Entry<String, Double>> entries = keywordIndex.search(query, topK);
+            // kbIds == null 表示不过滤；空集合表示无可见知识库；否则按 kbId 前缀集合过滤
+            List<Map.Entry<String, Double>> entries = keywordIndex.search(query, topK, kbIds);
 
             List<RankedResult> results = new ArrayList<>();
             for (var entry : entries) {
@@ -569,23 +595,49 @@ public class HybridSearchService {
     /**
      * <h3>从 docId 中提取文档来源标识</h3>
      *
-     * <p>docId 的命名规则为：{@code "documentName_chunkIndex"}，例如：</p>
+     * <p>docId 的命名规则有两种：</p>
      * <ul>
-     *   <li>{@code "章程.pdf_0"} → 提取为 {@code "章程.pdf"}</li>
-     *   <li>{@code "技术文档_v2_5"} → 提取为 {@code "技术文档_v2"}（取最后一个下划线之前的部分）</li>
+     *   <li>知识库隔离格式：{@code "kbId_documentName_chunkIndex"}，如 {@code "1_时态.md_0"}</li>
+     *   <li>旧版格式：{@code "documentName_chunkIndex"}，如 {@code "章程.pdf_0"}</li>
      * </ul>
      *
-     * <p>提取逻辑：<b>取最后一个下划线之前的所有字符</b>。
-     * 如果 docId 中没有下划线，则返回原始 docId。</p>
+     * <p>提取逻辑：先去掉最后一个下划线之后的 chunkIndex；若剩余部分第一个下划线之前
+     * 为纯数字（kbId 前缀），则继续去掉该前缀，最终返回文档来源标识。</p>
      *
-     * @param docId 文档唯一标识，格式为 "source_chunkIndex"
+     * @param docId 文档唯一标识
      * @return 提取出的文档来源标识
      */
     private String extractSourceFromDocId(String docId) {
-        // 找到最后一个下划线的位置
+        if (docId == null || docId.isEmpty()) {
+            return docId;
+        }
         int lastUnderscore = docId.lastIndexOf("_");
-        // 如果存在下划线，截取之前的部分；否则返回原始 docId
-        return lastUnderscore > 0 ? docId.substring(0, lastUnderscore) : docId;
+        if (lastUnderscore <= 0) {
+            return docId;
+        }
+        // 去掉 chunkIndex 后缀
+        String withoutChunkIndex = docId.substring(0, lastUnderscore);
+        // 若第一个下划线之前为纯数字（kbId 前缀），则继续去掉 kbId 前缀
+        int firstUnderscore = withoutChunkIndex.indexOf("_");
+        if (firstUnderscore > 0 && isNumeric(withoutChunkIndex.substring(0, firstUnderscore))) {
+            return withoutChunkIndex.substring(firstUnderscore + 1);
+        }
+        return withoutChunkIndex;
+    }
+
+    /**
+     * 判断字符串是否为纯数字（用于识别 chunkId 中的 kbId 前缀）
+     */
+    private boolean isNumeric(String s) {
+        if (s == null || s.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < s.length(); i++) {
+            if (!Character.isDigit(s.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // ==================== 内部类 ====================

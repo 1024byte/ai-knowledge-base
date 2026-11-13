@@ -48,6 +48,9 @@ public class KnowledgeBase {
     @TableField(fill = FieldFill.INSERT_UPDATE)
     private LocalDateTime updatedAt;
 
+    /** 是否公开：true-所有登录用户可只读访问，false-仅成员可访问 */
+    private Boolean isPublic;
+
     @TableLogic
     private Integer isDeleted;
 }

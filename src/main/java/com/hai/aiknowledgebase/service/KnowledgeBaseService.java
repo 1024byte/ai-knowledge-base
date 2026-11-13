@@ -1,15 +1,23 @@
 package com.hai.aiknowledgebase.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.hai.aiknowledgebase.common.Role;
 import com.hai.aiknowledgebase.dto.KnowledgeBaseRequest;
 import com.hai.aiknowledgebase.dto.KnowledgeBaseVO;
+import com.hai.aiknowledgebase.entity.ChatHistory;
+import com.hai.aiknowledgebase.entity.KbMember;
 import com.hai.aiknowledgebase.entity.KnowledgeBase;
 import com.hai.aiknowledgebase.entity.KnowledgeBaseConfig;
 import com.hai.aiknowledgebase.exception.BusinessException;
+import com.hai.aiknowledgebase.mapper.ChatHistoryMapper;
+import com.hai.aiknowledgebase.mapper.KbMemberMapper;
 import com.hai.aiknowledgebase.mapper.KnowledgeBaseConfigMapper;
 import com.hai.aiknowledgebase.mapper.KnowledgeBaseMapper;
+import com.hai.aiknowledgebase.security.SecurityUtils;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -41,6 +49,14 @@ public class KnowledgeBaseService {
 
     private final KnowledgeBaseMapper knowledgeBaseMapper;
     private final KnowledgeBaseConfigMapper knowledgeBaseConfigMapper;
+    private final KbMemberMapper kbMemberMapper;
+    private final KbPermissionService kbPermissionService;
+    private final ChatHistoryMapper chatHistoryMapper;
+
+    /** 文档级联清理服务（@Lazy 打破与 KnowledgeDocumentService 的循环依赖） */
+    @Lazy
+    @Autowired
+    private KnowledgeDocumentService knowledgeDocumentService;
 
     // ======================== 创建 ========================
 
@@ -67,12 +83,18 @@ public class KnowledgeBaseService {
     public KnowledgeBaseVO create(KnowledgeBaseRequest request) {
         log.info("创建知识库: name={}", request.getName());
 
+        Long userId = SecurityUtils.getCurrentUserId();
+        if (userId == null) {
+            throw new BusinessException(401, "未登录");
+        }
+
         KnowledgeBase kb = new KnowledgeBase();
         kb.setName(request.getName());
         kb.setDescription(request.getDescription());
         kb.setChunkLength(request.getChunkLength());
         kb.setOverlapLength(request.getOverlapLength());
         kb.setStatus(1);
+        kb.setCreatedBy(userId);
         kb.setUpdatedAt(LocalDateTime.now());
         kb.setCreatedAt(LocalDateTime.now());
 
@@ -92,6 +114,15 @@ public class KnowledgeBaseService {
         config.setUpdatedAt(LocalDateTime.now());
         config.setCreatedAt(LocalDateTime.now());
         knowledgeBaseConfigMapper.insert(config);
+
+        KbMember owner = new KbMember();
+        owner.setKbId(kb.getId());
+        owner.setUserId(userId);
+        owner.setRole(Role.OWNER.getCode());
+        owner.setCreatedBy(userId);
+        owner.setCreatedAt(LocalDateTime.now());
+        owner.setUpdatedAt(LocalDateTime.now());
+        kbMemberMapper.insert(owner);
 
         log.info("知识库创建成功: id={}, name={}", kb.getId(), kb.getName());
         return getById(kb.getId());
@@ -117,6 +148,7 @@ public class KnowledgeBaseService {
         if (kb == null) {
             throw new BusinessException(404, "知识库不存在");
         }
+        kbPermissionService.checkPermission(SecurityUtils.getCurrentUserId(), id, Role.ADMIN);
 
         if (request.getName() != null) kb.setName(request.getName());
         if (request.getDescription() != null) kb.setDescription(request.getDescription());
@@ -186,6 +218,7 @@ public class KnowledgeBaseService {
         if (kb == null) {
             throw new BusinessException(404, "知识库不存在");
         }
+        kbPermissionService.checkPermission(SecurityUtils.getCurrentUserId(), id, Role.VIEWER);
 
         KnowledgeBaseConfig config = knowledgeBaseConfigMapper.selectById(id);
 
@@ -217,8 +250,15 @@ public class KnowledgeBaseService {
      * @return 知识库详情列表
      */
     public List<KnowledgeBaseVO> listAll() {
+        Long userId = SecurityUtils.getCurrentUserId();
+        List<Long> visibleKbIds = kbPermissionService.getVisibleKbIds(userId);
+        if (visibleKbIds.isEmpty()) {
+            return List.of();
+        }
+
         LambdaQueryWrapper<KnowledgeBase> wrapper = new LambdaQueryWrapper<>();
-        wrapper.orderByDesc(KnowledgeBase::getUpdatedAt);
+        wrapper.in(KnowledgeBase::getId, visibleKbIds)
+                .orderByDesc(KnowledgeBase::getUpdatedAt);
         List<KnowledgeBase> kbList = knowledgeBaseMapper.selectList(wrapper);
 
         return kbList.stream().map(kb -> {
@@ -248,14 +288,22 @@ public class KnowledgeBaseService {
     // ======================== 删除 ========================
 
     /**
-     * <h3>逻辑删除知识库</h3>
+     * <h3>逻辑删除知识库（S8：级联清理关联数据）</h3>
      *
-     * <p>使用 MyBatis-Plus 逻辑删除，自动设置 {@code is_deleted=1}。
-     * 关联的 {@code knowledge_base_config} 记录不会被删除（保留历史配置）。</p>
+     * <p>使用 MyBatis-Plus 逻辑删除，自动设置 {@code is_deleted=1}。</p>
+     *
+     * <p>在同一个事务中级联清理以下关联数据（数据库操作原子性，失败整体回滚）：</p>
+     * <ol>
+     *   <li>文档及派生资源（切片、向量、BM25 索引、文件、哈希）—— 文档逻辑删除，其余物理删除</li>
+     *   <li>会话历史（{@code chat_history}）—— 物理删除</li>
+     *   <li>成员关系（{@code kb_members}）—— 物理删除</li>
+     * </ol>
+     * <p>{@code knowledge_base_config} 记录不会被删除（保留历史配置）。</p>
      *
      * @param id 知识库 ID
      * @throws BusinessException 知识库不存在或已删除时抛出
      */
+    @Transactional
     public void delete(Long id) {
         log.info("删除知识库: id={}", id);
 
@@ -263,7 +311,22 @@ public class KnowledgeBaseService {
         if (kb == null) {
             throw new BusinessException(404, "知识库不存在");
         }
+        kbPermissionService.checkPermission(SecurityUtils.getCurrentUserId(), id, Role.OWNER);
 
+        // 1. 级联清理文档及派生资源（复用 KnowledgeDocumentService.deleteByKbId）
+        knowledgeDocumentService.deleteByKbId(id);
+
+        // 2. 清理该知识库下的会话历史（chat_history 物理删除）
+        int chatDeleted = chatHistoryMapper.delete(
+                new LambdaQueryWrapper<ChatHistory>().eq(ChatHistory::getKbId, id));
+        log.info("级联删除会话历史: kbId={}, count={}", id, chatDeleted);
+
+        // 3. 清理成员关系（kb_members 物理删除）
+        int memberDeleted = kbMemberMapper.delete(
+                new LambdaQueryWrapper<KbMember>().eq(KbMember::getKbId, id));
+        log.info("级联删除成员关系: kbId={}, count={}", id, memberDeleted);
+
+        // 4. 最后逻辑删除主表
         knowledgeBaseMapper.deleteById(id);
         log.info("知识库已逻辑删除: id={}, name={}", id, kb.getName());
     }
@@ -288,6 +351,7 @@ public class KnowledgeBaseService {
         if (kb == null) {
             throw new BusinessException(404, "知识库不存在");
         }
+        kbPermissionService.checkPermission(SecurityUtils.getCurrentUserId(), id, Role.ADMIN);
 
         kb.setStatus(status);
         knowledgeBaseMapper.updateById(kb);

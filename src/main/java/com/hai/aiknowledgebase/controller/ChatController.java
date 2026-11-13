@@ -47,7 +47,8 @@ public class ChatController {
                 request.getQuestion(),
                 userId,
                 request.getTopK(),
-                request.getMinScore()
+                request.getMinScore(),
+                request.getKbId()
         );
 
         return Result.success(response);
@@ -100,7 +101,7 @@ public class ChatController {
         String sessionId = request.getSessionId();
         log.info("收到流式问答请求: sessionId={}, userId={}, question={}", sessionId, userId, request.getQuestion());
 
-        return chatService.chatStream(sessionId, request.getQuestion(), userId, request.getTopK(), request.getMinScore());
+        return chatService.chatStream(sessionId, request.getQuestion(), userId, request.getTopK(), request.getMinScore(), request.getKbId());
     }
 
     /**
@@ -150,7 +151,8 @@ public class ChatController {
             throw new BusinessException(400, "会话ID不能为空");
         }
 
-        List<ChatMessageDTO> history = chatService.getHistory(sessionId);
+        Long userId = SecurityUtils.getCurrentUserId();
+        List<ChatMessageDTO> history = chatService.getHistory(sessionId, userId);
         return Result.success(history);
     }
 
@@ -161,7 +163,7 @@ public class ChatController {
     public Result<List<ChatSessionDTO>> getSessions() {
         Long userId = SecurityUtils.getCurrentUserId();
         log.info("获取会话列表, userId={}", userId);
-        List<ChatSessionDTO> sessions = chatService.getSessions(userId != null ? userId.toString() : null);
+        List<ChatSessionDTO> sessions = chatService.getSessions(userId);
         return Result.success(sessions);
     }
 
@@ -176,19 +178,16 @@ public class ChatController {
             throw new BusinessException(400, "会话ID不能为空");
         }
 
-        chatService.deleteSession(sessionId);
+        Long userId = SecurityUtils.getCurrentUserId();
+        chatService.deleteSession(sessionId, userId);
         return Result.success();
     }
 
     @DeleteMapping("/sessions")
-    public Result<Void> deleteAllSessions(@RequestParam(required = false) String userId) {
+    public Result<Void> deleteAllSessions() {
         Long currentUserId = SecurityUtils.getCurrentUserId();
-        String targetUserId = userId;
-        if (targetUserId == null && currentUserId != null) {
-            targetUserId = currentUserId.toString();
-        }
-        log.info("删除历史会话, userId: {}", targetUserId != null ? targetUserId : "全部");
-        chatService.deleteAllSessions(targetUserId);
+        log.info("删除当前用户历史会话, userId={}", currentUserId);
+        chatService.deleteAllSessions(currentUserId);
         return Result.success();
     }
 }

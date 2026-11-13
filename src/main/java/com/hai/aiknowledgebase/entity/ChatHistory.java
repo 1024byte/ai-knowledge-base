@@ -17,6 +17,9 @@ public class ChatHistory {
     private String role;
     private String content;
 
+    @TableField("kb_id")
+    private Long kbId;
+
     @TableField("source_info")
     private String sourceInfo;  // JSON 字符串
 

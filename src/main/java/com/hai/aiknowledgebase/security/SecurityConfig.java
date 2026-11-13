@@ -47,12 +47,11 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers(
                                 "/api/auth/login",
-                                "/api/auth/register",
                                 "/api/auth/refresh",
                                 "/api/auth/logout"
                         ).permitAll()
                         .requestMatchers("/api/documents/**").permitAll()
-                        .requestMatchers("/api/chat/**").permitAll()
+                        .requestMatchers("/api/chat/**").authenticated()
                         .requestMatchers("/api/eval/**").permitAll()
                         .requestMatchers("/api/auth/debug/fix-password/**").permitAll()
                         .requestMatchers(

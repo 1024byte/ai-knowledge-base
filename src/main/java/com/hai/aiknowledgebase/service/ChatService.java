@@ -4,8 +4,10 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hai.aiknowledgebase.annotation.Timed;
+import com.hai.aiknowledgebase.common.Role;
 import com.hai.aiknowledgebase.dto.*;
 import com.hai.aiknowledgebase.entity.ChatHistory;
+import com.hai.aiknowledgebase.exception.BusinessException;
 import com.hai.aiknowledgebase.mapper.ChatHistoryMapper;
 import com.hai.aiknowledgebase.queryrewrite.QueryRewriteService;
 import dev.langchain4j.data.embedding.Embedding;
@@ -72,6 +74,7 @@ public class ChatService {
     private final QueryRewriteService queryRewriteService;
     private final TokenCountEstimator tokenCountEstimator;
     private final ThreadPoolTaskExecutor chatTaskExecutor;
+    private final KbPermissionService kbPermissionService;
 
     @Value("${chat.prompt.max-context-tokens:3000}")
     private int maxContextTokens;
@@ -114,7 +117,8 @@ public class ChatService {
                        RAGSearchService ragSearchService,
                        QueryRewriteService queryRewriteService,
                        TokenCountEstimator tokenCountEstimator,
-                       @Qualifier("chatTaskExecutor") ThreadPoolTaskExecutor chatTaskExecutor) {
+                       @Qualifier("chatTaskExecutor") ThreadPoolTaskExecutor chatTaskExecutor,
+                       KbPermissionService kbPermissionService) {
         this.chatModel = chatModel;
         this.streamingChatModel = streamingChatModel;
         this.embeddingStore = embeddingStore;
@@ -125,6 +129,7 @@ public class ChatService {
         this.queryRewriteService = queryRewriteService;
         this.tokenCountEstimator = tokenCountEstimator;
         this.chatTaskExecutor = chatTaskExecutor;
+        this.kbPermissionService = kbPermissionService;
     }
 
 
@@ -228,10 +233,13 @@ public class ChatService {
      */
     @Timed("RAG 全流程")
     public HaiChatResponse chat(String sessionId, String question, Long userId,
-                               Integer requestTopK, Double requestMinScore) {
+                               Integer requestTopK, Double requestMinScore, Long kbId) {
         int effectiveTopK = (requestTopK != null && requestTopK > 0) ? requestTopK : this.topK;
         double effectiveMinScore = (requestMinScore != null) ? requestMinScore : -1;
         long startTime = System.currentTimeMillis();
+
+        // 知识库隔离：指定 kbId 时校验权限；未指定时回退到当前用户可见的知识库范围
+        Set<Long> kbIds = resolveSearchScope(userId, kbId);
 
         // 步骤0：查询改写（含指代消解，使用对话历史）
         // 0.1 获取当前会话的 ChatMemory，提取最近 2 轮对话历史
@@ -261,10 +269,10 @@ public class ChatService {
         // 步骤1：混合检索（支持多子查询分别检索 + 合并去重）
         List<HybridSearchService.RankedResult> rankedResults;
         if (subQueries != null && !subQueries.isEmpty()) {// 多子查询检索：分别对每个子查询进行检索，合并结果并重新排序
-            rankedResults = multiQueryRetrieve(subQueries, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords);//多子查询检索
+            rankedResults = multiQueryRetrieve(subQueries, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);//多子查询检索
                        log.info("多子查询检索: {} 个子查询, 合并后 {} 个片段", subQueries.size(), rankedResults.size());
         } else {
-            rankedResults = ragSearchService.retrieveSegments(searchQuery, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords);
+            rankedResults = ragSearchService.retrieveSegments(searchQuery, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
             log.info("检索到 {} 个相关文档片段", rankedResults.size());
         }
         List<TextSegment> segments = rankedResults.stream()
@@ -308,7 +316,7 @@ public class ChatService {
         String messageId = UUID.randomUUID().toString();
 
         // 步骤7：原子写入 DB + ChatMemory（失败时回滚 DB 中的 user 消息）
-        saveMessageWithMemory(sessionId, messageId, question, userPrompt, answer, sources, chatMemory, userId);
+        saveMessageWithMemory(sessionId, messageId, question, userPrompt, answer, sources, chatMemory, userId, kbId);
 
         long processingTime = System.currentTimeMillis() - startTime;
         log.info("回答生成完成，耗时 {} ms", processingTime);
@@ -333,11 +341,14 @@ public class ChatService {
      * @return SseEmitter 流式响应对象
      */
     public SseEmitter chatStream(String sessionId, String question, Long userId,
-                                  Integer requestTopK, Double requestMinScore) {
+                                  Integer requestTopK, Double requestMinScore, Long kbId) {
         int effectiveTopK = (requestTopK != null && requestTopK > 0) ? requestTopK : this.topK;
         double effectiveMinScore = (requestMinScore != null) ? requestMinScore : -1;
         SseEmitter emitter = new SseEmitter(120_000L);
         String messageId = UUID.randomUUID().toString();
+
+        // 知识库隔离：指定 kbId 时校验权限；未指定时回退到当前用户可见的知识库范围
+        Set<Long> kbIds = resolveSearchScope(userId, kbId);
 
         chatTaskExecutor.execute(() -> {
             try {
@@ -363,10 +374,10 @@ public class ChatService {
 
                 List<HybridSearchService.RankedResult> rankedResults;
                 if (subQueries != null && !subQueries.isEmpty()) {
-                    rankedResults = multiQueryRetrieve(subQueries, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords);
+                    rankedResults = multiQueryRetrieve(subQueries, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
                     log.info("多子查询检索(stream): {} 个子查询, 合并后 {} 个片段", subQueries.size(), rankedResults.size());
                 } else {
-                    rankedResults = ragSearchService.retrieveSegments(searchQuery, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords);
+                    rankedResults = ragSearchService.retrieveSegments(searchQuery, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
                     log.info("检索到(stream) {} 个相关文档片段", rankedResults.size());
                 }
 
@@ -444,7 +455,7 @@ public class ChatService {
                             CompletableFuture.runAsync(() -> {
                                 try {
                                     saveMessageWithMemory(sessionId, messageId, question, userPrompt,
-                                            fullAnswer.toString(), sources, chatMemory, userId);
+                                            fullAnswer.toString(), sources, chatMemory, userId, kbId);
                                 } catch (Exception e) {
                                     log.error("流式回答消息保存失败: sessionId={}", sessionId, e);
                                 }
@@ -490,14 +501,14 @@ public class ChatService {
     // ==================== 消息保存（使用 MyBatis-Plus） ====================
 
     private void saveMessage(String sessionId, String role, String content) {
-        saveMessage(sessionId, null, role, content, null, null);
+        saveMessage(sessionId, null, role, content, null, null, null);
     }
 
     private void saveMessage(String sessionId, String role, String content, List<String> sources) {
-        saveMessage(sessionId, null, role, content, sources, null);
+        saveMessage(sessionId, null, role, content, sources, null, null);
     }
 
-    private void saveMessage(String sessionId, String messageId, String role, String content, List<String> sources, Long userId) {
+    private void saveMessage(String sessionId, String messageId, String role, String content, List<String> sources, Long userId, Long kbId) {
         String sourceInfo = null;
         if (sources != null && !sources.isEmpty()) {
             sourceInfo = Json.toJson(sources);
@@ -508,6 +519,7 @@ public class ChatService {
         record.setRole(role);
         record.setContent(content);
         record.setSourceInfo(sourceInfo);
+        record.setKbId(kbId);
         if (userId != null) {
             record.setUserId(userId.toString());
         }
@@ -531,13 +543,13 @@ public class ChatService {
      */
     private void saveMessageWithMemory(String sessionId, String messageId, String question, String userPrompt,
                                         String answer, List<String> sources, ChatMemory chatMemory,
-                                        Long userId) {
-        saveMessage(sessionId, messageId, "user", question, null, userId);
+                                        Long userId, Long kbId) {
+        saveMessage(sessionId, messageId, "user", question, null, userId, kbId);
         try {
             chatMemory.add(UserMessage.from(userPrompt));
             chatMemory.add(AiMessage.from(answer));
 
-            saveMessage(sessionId, messageId, "assistant", answer, sources, userId);
+            saveMessage(sessionId, messageId, "assistant", answer, sources, userId, kbId);
         } catch (Exception e) {
             log.warn("记忆写入失败，回滚 DB 中的 user 消息: sessionId={}", sessionId, e);
             try {
@@ -594,16 +606,28 @@ public class ChatService {
     // ==================== 会话历史查询（使用 MyBatis-Plus） ====================
 
     /**
-     * 获取某个会话的历史消息
+     * 获取某个会话的历史消息（S7：含归属校验 + kbId 可见性过滤）
+     *
+     * @param sessionId 会话 ID
+     * @param userId    当前登录用户 ID
      */
-    public List<ChatMessageDTO> getHistory(String sessionId) {
+    public List<ChatMessageDTO> getHistory(String sessionId, Long userId) {
+        requireLogin(userId);
+
         LambdaQueryWrapper<ChatHistory> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(ChatHistory::getSessionId, sessionId)
                 .orderByAsc(ChatHistory::getCreateTime);
 
         List<ChatHistory> list = chatHistoryMapper.selectList(wrapper);
 
+        // 会话归属校验（无消息 404 / 跨用户或无主 403）
+        checkSessionOwnership(list, userId);
+
+        // 按知识库可见性过滤（kbId 为 null 的历史数据保留）
+        Set<Long> visibleKbIds = new HashSet<>(kbPermissionService.getVisibleKbIds(userId));
+
         return list.stream()
+                .filter(record -> record.getKbId() == null || visibleKbIds.contains(record.getKbId()))
                 .map(record -> new ChatMessageDTO(
                         record.getRole(),
                         record.getContent(),
@@ -628,14 +652,26 @@ public class ChatService {
         }
     }
     /**
-     * 获取当前用户的所有会话列表
-     * @param userId 如果为 null，则查询所有会话（匿名模式）
+     * 获取当前用户的所有会话列表（S7：要求登录，并按知识库可见性过滤）
+     *
+     * @param userId 当前登录用户 ID
      */
-    public List<ChatSessionDTO> getSessions(String userId) {
-        // ✅ 使用 Mapper 中的自定义方法（XML 或注解 SQL）
-        List<Map<String, Object>> rows = chatHistoryMapper.selectSessionList(userId);
+    public List<ChatSessionDTO> getSessions(Long userId) {
+        requireLogin(userId);
+
+        List<Map<String, Object>> rows = chatHistoryMapper.selectSessionList(userId.toString());
+
+        Set<Long> visibleKbIds = new HashSet<>(kbPermissionService.getVisibleKbIds(userId));
 
         return rows.stream()
+                .filter(row -> {
+                    Object kbIdObj = row.get("kb_id");
+                    if (kbIdObj == null) {
+                        return true; // 历史数据（无 kb_id）保留
+                    }
+                    Long kbId = ((Number) kbIdObj).longValue();
+                    return visibleKbIds.contains(kbId);
+                })
                 .map(row -> {
                     String sessionId = String.valueOf(row.get("session_id"));
                     String lastContent = row.get("last_content") != null
@@ -660,12 +696,21 @@ public class ChatService {
     }
 
     /**
-     * 删除某个会话及其所有消息
+     * 删除某个会话及其所有消息（S7：新增归属校验）
+     *
+     * @param sessionId 会话 ID
+     * @param userId    当前登录用户 ID
      */
-    public void deleteSession(String sessionId) {
-        //使用 MyBatis-Plus 删除
+    public void deleteSession(String sessionId, Long userId) {
+        requireLogin(userId);
+
         LambdaQueryWrapper<ChatHistory> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(ChatHistory::getSessionId, sessionId);
+        List<ChatHistory> list = chatHistoryMapper.selectList(wrapper);
+
+        checkSessionOwnership(list, userId);
+
+        // 使用 MyBatis-Plus 删除
         chatHistoryMapper.delete(wrapper);
 
         // 清除内存中的 ChatMemory
@@ -677,39 +722,70 @@ public class ChatService {
     }
 
     /**
-     * 删除历史会话及其消息
+     * 删除当前登录用户的所有历史会话（S7：强制删除自己的会话，忽略前端 userId 参数）
      *
-     * @param userId 指定用户ID则只删除该用户的记录，为 null 则删除全部
+     * @param userId 当前登录用户 ID
      */
-    public void deleteAllSessions(String userId) {
-        if (userId == null || userId.isBlank()) {
-            // 删除全部
-            chatHistoryMapper.delete(new LambdaQueryWrapper<>());
-            chatMemoryCache.invalidateAll();
-            log.info("已删除所有历史会话");
-        } else {
-            // 按用户删除：先查该用户的所有 sessionId，再逐条清理
-            LambdaQueryWrapper<ChatHistory> queryWrapper = new LambdaQueryWrapper<>();
-            queryWrapper.select(ChatHistory::getSessionId)
-                    .eq(ChatHistory::getUserId, userId)
-                    .groupBy(ChatHistory::getSessionId);
-            List<String> sessionIds = chatHistoryMapper.selectList(queryWrapper).stream()
-                    .map(ChatHistory::getSessionId)
-                    .distinct()
-                    .collect(Collectors.toList());
+    public void deleteAllSessions(Long userId) {
+        requireLogin(userId);
+        String uid = userId.toString();
 
-            // 删除数据库记录
-            LambdaQueryWrapper<ChatHistory> deleteWrapper = new LambdaQueryWrapper<>();
-            deleteWrapper.eq(ChatHistory::getUserId, userId);
-            chatHistoryMapper.delete(deleteWrapper);
+        // 按用户删除：先查该用户的所有 sessionId，再逐条清理
+        LambdaQueryWrapper<ChatHistory> queryWrapper = new LambdaQueryWrapper<>();
+        queryWrapper.select(ChatHistory::getSessionId)
+                .eq(ChatHistory::getUserId, uid)
+                .groupBy(ChatHistory::getSessionId);
+        List<String> sessionIds = chatHistoryMapper.selectList(queryWrapper).stream()
+                .map(ChatHistory::getSessionId)
+                .distinct()
+                .collect(Collectors.toList());
 
-            // 清除缓存
-            for (String sessionId : sessionIds) {
-                chatMemoryCache.invalidate(sessionId);
-                chatMemoryStore.deleteMessages(sessionId);
+        // 删除数据库记录
+        LambdaQueryWrapper<ChatHistory> deleteWrapper = new LambdaQueryWrapper<>();
+        deleteWrapper.eq(ChatHistory::getUserId, uid);
+        chatHistoryMapper.delete(deleteWrapper);
+
+        // 清除缓存
+        for (String sessionId : sessionIds) {
+            chatMemoryCache.invalidate(sessionId);
+            chatMemoryStore.deleteMessages(sessionId);
+        }
+
+        log.info("已删除用户 {} 的历史会话，共 {} 个会话", uid, sessionIds.size());
+    }
+
+    /**
+     * 登录校验：未登录时抛出 401。
+     */
+    private void requireLogin(Long userId) {
+        if (userId == null) {
+            throw new BusinessException(401, "未登录");
+        }
+    }
+
+    /**
+     * 会话归属校验（S7）：
+     * <ul>
+     *   <li>无任何消息 → 404 会话不存在</li>
+     *   <li>存在属于其他用户的消息，或全部消息无主（匿名）→ 403 无权访问该会话</li>
+     * </ul>
+     */
+    private void checkSessionOwnership(List<ChatHistory> list, Long userId) {
+        if (list.isEmpty()) {
+            throw new BusinessException(404, "会话不存在");
+        }
+        String currentUserId = userId.toString();
+        boolean hasOwner = false;
+        for (ChatHistory record : list) {
+            if (record.getUserId() != null) {
+                hasOwner = true;
+                if (!currentUserId.equals(record.getUserId())) {
+                    throw new BusinessException(403, "无权访问该会话");
+                }
             }
-
-            log.info("已删除用户 {} 的历史会话，共 {} 个会话", userId, sessionIds.size());
+        }
+        if (!hasOwner) {
+            throw new BusinessException(403, "无权访问该会话");
         }
     }
 
@@ -865,13 +941,13 @@ public class ChatService {
      */
     private List<HybridSearchService.RankedResult> multiQueryRetrieve(
             List<String> subQueries, int totalTopK, double minScore,
-            List<String> expandKeywords, List<String> excludeKeywords) {
+            List<String> expandKeywords, List<String> excludeKeywords, Set<Long> kbIds) {
         int perQueryTopK = Math.max(3, totalTopK / subQueries.size());
 
         List<CompletableFuture<List<HybridSearchService.RankedResult>>> futures = new ArrayList<>();
         for (String subQuery : subQueries) {
             futures.add(CompletableFuture.supplyAsync(
-                    () -> ragSearchService.retrieveSegments(subQuery, perQueryTopK, minScore, expandKeywords, excludeKeywords),
+                    () -> ragSearchService.retrieveSegments(subQuery, perQueryTopK, minScore, expandKeywords, excludeKeywords, kbIds),
                     chatTaskExecutor));
         }
 
@@ -896,6 +972,25 @@ public class ChatService {
         log.debug("多子查询检索合并: {} 路并行, 去重后={}",
                 subQueries.size(), merged.size());
         return merged;
+    }
+
+    /**
+     * 解析本轮问答的检索范围（知识库隔离兜底）。
+     *
+     * <p>显式传入 kbId 时校验当前用户是否有 VIEWER 权限，通过后仅在该知识库内检索；
+     * 未传入 kbId 时回退到当前用户可见的知识库集合（成员/创建者/公开），
+     * 避免越权检索到无权访问的知识库。</p>
+     *
+     * @param userId 当前用户 ID（可为 null）
+     * @param kbId   前端显式传入的知识库 ID（可为 null）
+     * @return 允许检索的知识库 ID 集合；无任何可见知识库时返回空集合
+     */
+    private Set<Long> resolveSearchScope(Long userId, Long kbId) {
+        if (kbId != null) {
+            kbPermissionService.checkPermission(userId, kbId, Role.VIEWER);
+            return Set.of(kbId);
+        }
+        return new HashSet<>(kbPermissionService.getVisibleKbIds(userId));
     }
 
     private ContextBuildResult buildContextWithinBudget(List<TextSegment> segments, int maxTokens) {

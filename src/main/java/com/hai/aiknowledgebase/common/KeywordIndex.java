@@ -257,10 +257,35 @@ public class KeywordIndex {
      * @return 按得分降序排列的 (docId, score) 列表
      */
     public List<Map.Entry<String, Double>> search(String query, int topK) {
+        return search(query, topK, null);
+    }
+
+    /**
+     * <h3>BM25 关键词检索（支持知识库隔离）</h3>
+     *
+     * <p>当 {@code kbIds} 非空时，仅返回 chunkId 属于目标知识库集合的文档，
+     * 实现知识库级数据隔离。chunkId 格式为 {@code "kbId_source_chunkIndex"}。</p>
+     *
+     * @param query 查询文本
+     * @param topK  返回前 K 个结果
+     * @param kbIds 知识库 ID 集合，可为 null（null 表示不过滤，空集合表示无可见知识库）
+     * @return 按得分降序排列的 (docId, score) 列表
+     */
+    public List<Map.Entry<String, Double>> search(String query, int topK, Set<Long> kbIds) {
         // 对查询文本分词
         Map<String, Integer> queryTerms = analyze(query);
         if (queryTerms.isEmpty()) {
             return Collections.emptyList();
+        }
+
+        // 知识库隔离：chunkId 格式为 "kbId_source_chunkIndex"
+        // kbIds == null 表示不过滤；空集合表示无可见知识库（返回空）；否则按 kbId 前缀集合过滤
+        Set<String> kbIdSet = null;
+        if (kbIds != null) {
+            if (kbIds.isEmpty()) {
+                return Collections.emptyList();
+            }
+            kbIdSet = kbIds.stream().map(String::valueOf).collect(Collectors.toSet());
         }
 
         Map<String, Double> scores = new HashMap<>();
@@ -286,6 +311,10 @@ public class KeywordIndex {
             // 对每个包含该词条的文档计算 BM25 得分
             for (var docEntry : postings.entrySet()) {
                 String docId = docEntry.getKey();
+                // 知识库隔离过滤：跳过不属于目标知识库的文档
+                if (kbIdSet != null && !belongsToKb(docId, kbIdSet)) {
+                    continue;
+                }
                 int tf = docEntry.getValue();  // 词频
                 int docLen = docs.get(docId).length();  // 文档长度
 
@@ -307,6 +336,25 @@ public class KeywordIndex {
                 .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
                 .limit(topK)
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * 判断 chunkId 是否属于给定的知识库集合。
+     *
+     * <p>chunkId 格式为 {@code "kbId_source_chunkIndex"}，取第一个下划线之前的部分作为 kbId。
+     * 与旧的单 kbId 前缀匹配（{@code startsWith(kbId + "_")}）语义一致，可正确区分
+     * kbId "1" 与 "10"。</p>
+     *
+     * @param docId   文档唯一标识
+     * @param kbIdSet 允许的知识库 ID 集合（字符串形式）
+     * @return 属于该集合返回 true；docId 不含下划线时返回 false
+     */
+    private boolean belongsToKb(String docId, Set<String> kbIdSet) {
+        int idx = docId.indexOf('_');
+        if (idx <= 0) {
+            return false;
+        }
+        return kbIdSet.contains(docId.substring(0, idx));
     }
 
     // ======================== 查询方法 ========================

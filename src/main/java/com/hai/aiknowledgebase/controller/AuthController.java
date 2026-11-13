@@ -79,61 +79,6 @@ public class AuthController {
                 .build());
     }
 
-    @PostMapping("/register")
-    public Result<LoginResponse> register(@RequestBody RegisterRequest request,
-                                          HttpServletRequest httpRequest) {
-        if (request.getUsername() == null || request.getUsername().trim().isEmpty()) {
-            throw new BusinessException(400, "用户名不能为空");
-        }
-        if (request.getPassword() == null || request.getPassword().trim().isEmpty()) {
-            throw new BusinessException(400, "密码不能为空");
-        }
-        if (request.getPassword().length() < 6) {
-            throw new BusinessException(400, "密码长度至少6位");
-        }
-
-        Long count = userMapper.selectCount(
-                new LambdaQueryWrapper<User>().eq(User::getUsername, request.getUsername())
-        );
-        if (count > 0) {
-            throw new BusinessException(400, "用户名已存在");
-        }
-
-        String deviceId = request.getDeviceId() != null && !request.getDeviceId().trim().isEmpty()
-                ? request.getDeviceId().trim() : UUID.randomUUID().toString();
-        String loginIp = getClientIp(httpRequest);
-
-        log.info("用户注册: username={}, deviceId={}", request.getUsername(), deviceId);
-
-        User user = new User();
-        user.setUsername(request.getUsername());
-        user.setPassword(passwordEncoder.encode(request.getPassword()));
-        user.setEmail(request.getEmail());
-        user.setRole("USER");
-        user.setStatus("active");
-        userMapper.insert(user);
-
-        String accessToken = jwtTokenUtil.generateAccessToken(
-                user.getId(), user.getUsername(), user.getRole(), deviceId, 0);
-        String refreshToken = jwtTokenUtil.generateRefreshToken(
-                user.getId(), user.getUsername(), deviceId, 0);
-
-        refreshTokenService.saveOrUpdate(user.getId(), deviceId, refreshToken, 0,
-                request.getDeviceName(), loginIp);
-
-        log.info("用户注册成功: userId={}, username={}, deviceId={}",
-                user.getId(), user.getUsername(), deviceId);
-
-        return Result.success(LoginResponse.builder()
-                .accessToken(accessToken)
-                .refreshToken(refreshToken)
-                .deviceId(deviceId)
-                .userId(user.getId())
-                .username(user.getUsername())
-                .role("USER")
-                .build());
-    }
-
     @PostMapping("/refresh")
     public Result<LoginResponse> refresh(@RequestBody RefreshTokenRequest request) {
         if (request.getRefreshToken() == null || !jwtTokenUtil.validateToken(request.getRefreshToken())) {

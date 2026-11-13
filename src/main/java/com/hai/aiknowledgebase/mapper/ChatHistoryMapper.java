@@ -13,15 +13,11 @@ import java.util.Map;
 public interface ChatHistoryMapper extends BaseMapper<ChatHistory> {
 
     /**
-     * 获取每个会话的最后一条消息及最后活跃时间
-     * 用于侧边栏会话列表展示
-     */
-    /**
-     * 获取每个会话的最后一条消息及最后活跃时间
-     * 用于侧边栏会话列表展示
+     * 获取每个会话的最后一条消息、最后活跃时间及代表知识库 ID（kb_id）
+     * 用于侧边栏会话列表展示。
      *
-     * 当 userId 为 null 时，查询所有会话（匿名模式）
-     * 当 userId 非 null 时，只查询该用户的会话
+     * 仅查询指定用户的会话；kb_id 取该会话下最新一条非空 kb_id，
+     * 供上层按知识库可见性过滤（S7 会话隔离）。
      */
     @Select("""
         <script>
@@ -30,7 +26,10 @@ public interface ChatHistoryMapper extends BaseMapper<ChatHistory> {
             MAX(create_time) as last_active,
             (SELECT content FROM chat_history c2 
              WHERE c2.session_id = c1.session_id 
-             ORDER BY create_time DESC LIMIT 1) as last_content
+             ORDER BY create_time DESC LIMIT 1) as last_content,
+            (SELECT kb_id FROM chat_history c3 
+             WHERE c3.session_id = c1.session_id AND c3.kb_id IS NOT NULL 
+             ORDER BY create_time DESC LIMIT 1) as kb_id
         FROM chat_history c1
         <where>
             <if test="userId != null">

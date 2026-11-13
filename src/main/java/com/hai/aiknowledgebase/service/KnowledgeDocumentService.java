@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.hai.aiknowledgebase.common.CustomDocument;
 import com.hai.aiknowledgebase.common.HashType;
+import com.hai.aiknowledgebase.common.Role;
 import com.hai.aiknowledgebase.dto.KnowledgeDocumentChunksVO;
 import com.hai.aiknowledgebase.dto.KnowledgeDocumentContentUpdateDTO;
 import com.hai.aiknowledgebase.dto.KnowledgeDocumentContentVO;
@@ -16,6 +17,7 @@ import com.hai.aiknowledgebase.entity.KnowledgeDocumentChunk;
 import com.hai.aiknowledgebase.exception.BusinessException;
 import com.hai.aiknowledgebase.mapper.KnowledgeDocumentChunkMapper;
 import com.hai.aiknowledgebase.mapper.KnowledgeDocumentMapper;
+import com.hai.aiknowledgebase.security.SecurityUtils;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.Metadata;
 import dev.langchain4j.data.embedding.Embedding;
@@ -88,6 +90,7 @@ public class KnowledgeDocumentService {
     private final KnowledgeDocumentMapper knowledgeDocumentMapper;
     private final KnowledgeDocumentChunkMapper knowledgeDocumentChunkMapper;
     private final KnowledgeBaseService knowledgeBaseService;
+    private final KbPermissionService kbPermissionService;
     private final DocumentParserService documentParserService;
     private final DocumentChunkerService documentChunkerService;
 
@@ -170,6 +173,7 @@ public class KnowledgeDocumentService {
         if (kb == null) {
             throw new BusinessException(400, "知识库不存在");
         }
+        kbPermissionService.checkPermission(SecurityUtils.getCurrentUserId(), kbId, Role.EDITOR);
 
         // ===== 2. 文件基础校验 =====
         if (file == null || file.isEmpty()) {
@@ -310,9 +314,20 @@ public class KnowledgeDocumentService {
      * @return 文件列表
      */
     public List<KnowledgeDocumentVO> listByKbId(Long kbId) {
+        Long userId = SecurityUtils.getCurrentUserId();
         LambdaQueryWrapper<KnowledgeDocument> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(kbId != null, KnowledgeDocument::getKbId, kbId)
-                .orderByDesc(KnowledgeDocument::getCreatedAt);
+
+        if (kbId != null) {
+            kbPermissionService.checkPermission(userId, kbId, Role.VIEWER);
+            wrapper.eq(KnowledgeDocument::getKbId, kbId);
+        } else {
+            List<Long> visibleKbIds = kbPermissionService.getVisibleKbIds(userId);
+            if (visibleKbIds.isEmpty()) {
+                return List.of();
+            }
+            wrapper.in(KnowledgeDocument::getKbId, visibleKbIds);
+        }
+        wrapper.orderByDesc(KnowledgeDocument::getCreatedAt);
 
         List<KnowledgeDocument> list = knowledgeDocumentMapper.selectList(wrapper);
         return list.stream().map(this::toVO).collect(Collectors.toList());
@@ -333,9 +348,22 @@ public class KnowledgeDocumentService {
      */
     public Page<KnowledgeDocumentVO> pageByKbId(Long kbId, int pageNum, int pageSize,
                                                  String fileName, Integer status) {
+        Long userId = SecurityUtils.getCurrentUserId();
         LambdaQueryWrapper<KnowledgeDocument> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(kbId != null, KnowledgeDocument::getKbId, kbId)
-                .like(fileName != null && !fileName.isBlank(),
+
+        if (kbId != null) {
+            kbPermissionService.checkPermission(userId, kbId, Role.VIEWER);
+            wrapper.eq(KnowledgeDocument::getKbId, kbId);
+        } else {
+            List<Long> visibleKbIds = kbPermissionService.getVisibleKbIds(userId);
+            if (visibleKbIds.isEmpty()) {
+                Page<KnowledgeDocumentVO> emptyPage = new Page<>(pageNum, pageSize, 0);
+                emptyPage.setRecords(List.of());
+                return emptyPage;
+            }
+            wrapper.in(KnowledgeDocument::getKbId, visibleKbIds);
+        }
+        wrapper.like(fileName != null && !fileName.isBlank(),
                         KnowledgeDocument::getFileName, fileName)
                 .eq(status != null, KnowledgeDocument::getStatus, status)
                 .orderByDesc(KnowledgeDocument::getCreatedAt);
@@ -363,6 +391,7 @@ public class KnowledgeDocumentService {
         if (doc == null) {
             throw new BusinessException(404, "文件不存在");
         }
+        checkDocumentPermission(doc, Role.VIEWER);
         return toVO(doc);
     }
 
@@ -379,6 +408,23 @@ public class KnowledgeDocumentService {
         wrapper.eq(KnowledgeDocument::getFileHash, fileHash)
                 .last("LIMIT 1");
         return knowledgeDocumentMapper.selectOne(wrapper);
+    }
+
+    /**
+     * <h3>文档资源级鉴权</h3>
+     *
+     * <p>根据文档所属知识库（{@code kbId}）校验当前登录用户是否具备指定角色权限。</p>
+     *
+     * @param doc          文档实体（已存在，kbId 不能为空）
+     * @param requiredRole 所需的最低角色
+     * @throws BusinessException 未登录或权限不足时抛出
+     */
+    private void checkDocumentPermission(KnowledgeDocument doc, Role requiredRole) {
+        Long userId = SecurityUtils.getCurrentUserId();
+        if (userId == null) {
+            throw new BusinessException(401, "未登录");
+        }
+        kbPermissionService.checkPermission(userId, doc.getKbId(), requiredRole);
     }
 
     // ======================== 删除 ========================
@@ -418,6 +464,7 @@ public class KnowledgeDocumentService {
         if (doc == null) {
             throw new BusinessException(404, "文件不存在");
         }
+        checkDocumentPermission(doc, Role.EDITOR);
 
         // ===== 2. 幂等判断 =====
         if (Integer.valueOf(1).equals(doc.getIsDeleted())) {
@@ -464,6 +511,9 @@ public class KnowledgeDocumentService {
                 String.valueOf(doc.getId()));
 
         String fileName = doc.getFileName() != null ? doc.getFileName() : "document";
+        String kbPrefix = doc.getKbId() != null ? doc.getKbId() + "_" : "";
+        // 清理旧 BM25 索引：先按新格式 "kbId_fileName_" 清理，再兼容旧格式 "fileName_"
+        hybridSearchService.getKeywordIndex().removeByPrefix(kbPrefix + fileName + "_");
         hybridSearchService.getKeywordIndex().removeByPrefix(fileName + "_");
 
         documentHashService.deleteByFileName(doc.getId());
@@ -547,6 +597,7 @@ public class KnowledgeDocumentService {
         if (doc == null) {
             throw new BusinessException(404, "文件不存在");
         }
+        checkDocumentPermission(doc, Role.VIEWER);
 
         String parsedTextUrl = doc.getParsedTextUrl();
         if (parsedTextUrl == null || parsedTextUrl.isBlank()) {
@@ -610,6 +661,7 @@ public class KnowledgeDocumentService {
         if (doc == null) {
             throw new BusinessException(404, "文件不存在");
         }
+        checkDocumentPermission(doc, Role.EDITOR);
 
         if (Integer.valueOf(2).equals(doc.getIsVectorized())) {
             throw new BusinessException(400, "文档已向量化，无法编辑");
@@ -698,6 +750,7 @@ public class KnowledgeDocumentService {
         if (doc == null) {
             throw new BusinessException(404, "文件不存在");
         }
+        checkDocumentPermission(doc, Role.VIEWER);
 
         LambdaQueryWrapper<KnowledgeDocumentChunk> chunkQuery = new LambdaQueryWrapper<>();
         chunkQuery.eq(KnowledgeDocumentChunk::getDocumentId, documentId)
@@ -850,6 +903,7 @@ public class KnowledgeDocumentService {
         if (doc == null) {
             throw new BusinessException(404, "文件不存在");
         }
+        checkDocumentPermission(doc, Role.EDITOR);
 
         if (!Integer.valueOf(2).equals(doc.getStatus())) {
             throw new BusinessException(400, "文档未完成解析，无法保存切片");
@@ -955,6 +1009,7 @@ public class KnowledgeDocumentService {
         if (doc == null) {
             throw new BusinessException(404, "文件不存在");
         }
+        checkDocumentPermission(doc, Role.EDITOR);
 
         if (Integer.valueOf(2).equals(doc.getIsVectorized())) {
             throw new BusinessException(400, "文档已向量化，无法快速切片");
@@ -1046,12 +1101,15 @@ public class KnowledgeDocumentService {
      * @throws BusinessException 列表中存在已向量化文档时抛出
      */
     public BatchChunkResult autoChunkBatch(List<Long> documentIds) {
-        // ===== 预检：存在已向量化文档则整体拒绝 =====
+        // ===== 预检：权限 + 已向量化文档则整体拒绝 =====
         for (Long id : documentIds) {
             KnowledgeDocument doc = knowledgeDocumentMapper.selectById(id);
-            if (doc != null && Integer.valueOf(2).equals(doc.getIsVectorized())) {
-                log.warn("批量快速切片被拒绝: 存在已向量化文档, id={}", id);
-                throw new BusinessException(400, "存在已向量化的文档，无法快速切片");
+            if (doc != null) {
+                checkDocumentPermission(doc, Role.EDITOR);
+                if (Integer.valueOf(2).equals(doc.getIsVectorized())) {
+                    log.warn("批量快速切片被拒绝: 存在已向量化文档, id={}", id);
+                    throw new BusinessException(400, "存在已向量化的文档，无法快速切片");
+                }
             }
         }
 
@@ -1106,6 +1164,7 @@ public class KnowledgeDocumentService {
         if (doc == null) {
             throw new BusinessException(404, "文件不存在");
         }
+        checkDocumentPermission(doc, Role.EDITOR);
 
         if (!Integer.valueOf(2).equals(doc.getStatus())) {
             throw new BusinessException(400, "文档未完成解析，无法向量化");
@@ -1147,7 +1206,7 @@ public class KnowledgeDocumentService {
      *   <li>从 {@code knowledge_document_chunk} 读取切片（按 chunk_index 排序）</li>
      *   <li>构建 LangChain4j {@link TextSegment} 列表（含 source/fileName/chunk_index 元数据）</li>
      *   <li>遍历 → {@link EmbeddingModel#embed} → {@link EmbeddingStore#add} 存入 PGVector</li>
-     *   <li>遍历 → BM25 关键词索引（chunkId = fileName_chunkIndex）</li>
+     *   <li>遍历 → BM25 关键词索引（chunkId = kbId_fileName_chunkIndex）</li>
      *   <li>保存文本级 SHA-256 哈希（去重依据）</li>
      *   <li>更新 status=2 + isVectorized=true</li>
      * </ol>
@@ -1181,6 +1240,8 @@ public class KnowledgeDocumentService {
             log.info("向量化: 读取切片完成, id={}, count={}", documentId, chunks.size());
 
             String fileName = doc.getFileName() != null ? doc.getFileName() : "document";
+            // 知识库隔离：chunkId 前缀格式为 "kbId_fileName"，用于 BM25 检索时的前缀过滤
+            String kbPrefix = doc.getKbId() != null ? doc.getKbId() + "_" : "";
 
             List<TextSegment> segments = new java.util.ArrayList<>(chunks.size());
             StringBuilder allText = new StringBuilder();
@@ -1202,8 +1263,10 @@ public class KnowledgeDocumentService {
 
             com.hai.aiknowledgebase.common.KeywordIndex keywordIndex =
                     hybridSearchService.getKeywordIndex();
+            // 清理旧 BM25 索引：先按新格式 "kbId_fileName_" 清理，再兼容旧格式 "fileName_"
+            keywordIndex.removeByPrefix(kbPrefix + fileName + "_");
             keywordIndex.removeByPrefix(fileName + "_");
-            log.debug("向量化: 清理旧 BM25 索引完成, prefix={}_", fileName);
+            log.debug("向量化: 清理旧 BM25 索引完成, prefix={}{}_", kbPrefix, fileName);
 
             for (TextSegment segment : segments) {
                 Embedding embedding = embeddingModel.embed(segment).content();
@@ -1212,7 +1275,7 @@ public class KnowledgeDocumentService {
             log.info("向量化: PGVector 存储完成, id={}, segments={}", documentId, segments.size());
 
             for (int i = 0; i < segments.size(); i++) {
-                String chunkId = fileName + "_" + i;
+                String chunkId = kbPrefix + fileName + "_" + i;
                 keywordIndex.index(chunkId, segments.get(i).text());
             }
             log.info("向量化: BM25 索引完成, id={}, chunks={}", documentId, segments.size());
@@ -1262,6 +1325,7 @@ public class KnowledgeDocumentService {
         if (doc == null) {
             throw new BusinessException(404, "文档不存在");
         }
+        checkDocumentPermission(doc, Role.EDITOR);
 
         String fileUrl = doc.getFileUrl();
         if (fileUrl == null || fileUrl.isBlank()) {

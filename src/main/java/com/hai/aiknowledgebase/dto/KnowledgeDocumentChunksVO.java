@@ -44,6 +44,9 @@ public class KnowledgeDocumentChunksVO {
     @AllArgsConstructor
     public static class ChunkItem {
 
+        /** 切片数据库主键（已保存切片才有值，预览切片为 null） */
+        private Long id;
+
         /** 切片序号（从 0 开始） */
         private int index;
 
@@ -52,6 +55,9 @@ public class KnowledgeDocumentChunksVO {
 
         /** Token 估算值 */
         private int tokenCount;
+
+        /** 是否启用（检索时召回过滤），null 视为启用 */
+        private Boolean enabled;
 
         /** 层级路径（如 "第一章 > 1.1 概述"） */
         private String contextPrefix;

@@ -5,13 +5,7 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.hai.aiknowledgebase.common.CustomDocument;
 import com.hai.aiknowledgebase.common.HashType;
 import com.hai.aiknowledgebase.common.Role;
-import com.hai.aiknowledgebase.dto.ChunkingParams;
-import com.hai.aiknowledgebase.dto.KnowledgeDocumentChunksVO;
-import com.hai.aiknowledgebase.dto.KnowledgeDocumentContentUpdateDTO;
-import com.hai.aiknowledgebase.dto.KnowledgeDocumentContentVO;
-import com.hai.aiknowledgebase.dto.KnowledgeDocumentUploadVO;
-import com.hai.aiknowledgebase.dto.KnowledgeDocumentVO;
-import com.hai.aiknowledgebase.dto.BatchChunkResult;
+import com.hai.aiknowledgebase.dto.*;
 import com.hai.aiknowledgebase.entity.KnowledgeBase;
 import com.hai.aiknowledgebase.entity.KnowledgeDocument;
 import com.hai.aiknowledgebase.entity.KnowledgeDocumentChunk;
@@ -23,6 +17,7 @@ import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.Metadata;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.model.TokenCountEstimator;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import lombok.RequiredArgsConstructor;
@@ -118,6 +113,9 @@ public class KnowledgeDocumentService {
 
     /** 嵌入模型（ONNX 本地模型 paraphrase-multilingual-MiniLM-L12-v2） */
     private final EmbeddingModel embeddingModel;
+
+    /** Token 计数估算器（用于片段编辑/合并/拆分后重算 token 数） */
+    private final TokenCountEstimator tokenCountEstimator;
 
     /** PGVector 向量存储 */
     private final EmbeddingStore<TextSegment> embeddingStore;
@@ -806,6 +804,7 @@ public class KnowledgeDocumentService {
             item.setIndex(i);
             item.setText(chunk.text());
             item.setTokenCount(chunk.tokenCount());
+            item.setEnabled(true);
             item.setContextPrefix(chunk.contextPrefix());
             item.setMetadata(new java.util.HashMap<>(chunk.metadata()));
             items.add(item);
@@ -856,27 +855,7 @@ public class KnowledgeDocumentService {
                                                            int total) {
         List<KnowledgeDocumentChunksVO.ChunkItem> items = new java.util.ArrayList<>(chunks.size());
         for (KnowledgeDocumentChunk chunk : chunks) {
-            KnowledgeDocumentChunksVO.ChunkItem item = new KnowledgeDocumentChunksVO.ChunkItem();
-            item.setIndex(chunk.getChunkIndex());
-            item.setText(chunk.getText());
-            item.setTokenCount(chunk.getTokenCount());
-            item.setContextPrefix(chunk.getContextPrefix());
-
-            Map<String, String> meta = new java.util.HashMap<>();
-            if (chunk.getContentType() != null) {
-                meta.put("content_type", chunk.getContentType());
-            }
-            if (chunk.getParentText() != null) {
-                meta.put("parent_text", chunk.getParentText());
-            }
-            if (chunk.getParentStart() != null) {
-                meta.put("parent_start", String.valueOf(chunk.getParentStart()));
-            }
-            if (chunk.getParentEnd() != null) {
-                meta.put("parent_end", String.valueOf(chunk.getParentEnd()));
-            }
-            item.setMetadata(meta);
-            items.add(item);
+            items.add(toChunkItem(chunk));
         }
 
         KnowledgeDocumentChunksVO vo = new KnowledgeDocumentChunksVO();
@@ -885,6 +864,38 @@ public class KnowledgeDocumentService {
         vo.setTotalChunks(total);
         vo.setChunks(items);
         return vo;
+    }
+
+    /**
+     * <h3>将片段实体转换为响应项</h3>
+     *
+     * <p>包含数据库主键、序号、文本、token 数、启用状态以及元数据，
+     * 供预览与片段管理接口复用。</p>
+     */
+    private KnowledgeDocumentChunksVO.ChunkItem toChunkItem(KnowledgeDocumentChunk chunk) {
+        KnowledgeDocumentChunksVO.ChunkItem item = new KnowledgeDocumentChunksVO.ChunkItem();
+        item.setId(chunk.getId());
+        item.setIndex(chunk.getChunkIndex() != null ? chunk.getChunkIndex() : 0);
+        item.setText(chunk.getText());
+        item.setTokenCount(chunk.getTokenCount() != null ? chunk.getTokenCount() : 0);
+        item.setEnabled(chunk.getEnabled() == null || chunk.getEnabled());
+        item.setContextPrefix(chunk.getContextPrefix());
+
+        Map<String, String> meta = new java.util.HashMap<>();
+        if (chunk.getContentType() != null) {
+            meta.put("content_type", chunk.getContentType());
+        }
+        if (chunk.getParentText() != null) {
+            meta.put("parent_text", chunk.getParentText());
+        }
+        if (chunk.getParentStart() != null) {
+            meta.put("parent_start", String.valueOf(chunk.getParentStart()));
+        }
+        if (chunk.getParentEnd() != null) {
+            meta.put("parent_end", String.valueOf(chunk.getParentEnd()));
+        }
+        item.setMetadata(meta);
+        return item;
     }
 
     /**
@@ -966,6 +977,7 @@ public class KnowledgeDocumentService {
             chunk.setText(item.getText());
             chunk.setTokenCount(item.getTokenCount());
             chunk.setContextPrefix(item.getContextPrefix());
+            chunk.setEnabled(item.getEnabled() == null || item.getEnabled());
 
             Map<String, String> meta = item.getMetadata();
             if (meta != null) {
@@ -1085,6 +1097,7 @@ public class KnowledgeDocumentService {
             chunk.setText(c.text());
             chunk.setTokenCount(c.tokenCount());
             chunk.setContextPrefix(c.contextPrefix());
+            chunk.setEnabled(true);
 
             Map<String, String> meta = c.metadata();
             if (meta != null) {
@@ -1269,10 +1282,7 @@ public class KnowledgeDocumentService {
             List<TextSegment> segments = new java.util.ArrayList<>(chunks.size());
             StringBuilder allText = new StringBuilder();
             for (KnowledgeDocumentChunk chunk : chunks) {
-                Metadata metadata = Metadata.from("source", fileName)
-                        .put("document_id", String.valueOf(documentId))
-                        .put("chunk_index", String.valueOf(chunk.getChunkIndex()))
-                        .put("kb_id", doc.getKbId() != null ? String.valueOf(doc.getKbId()) : "");
+                Metadata metadata = buildChunkMetadata(doc, chunk);
                 String text = chunk.getText() != null ? chunk.getText() : "";
                 segments.add(TextSegment.from(text, metadata));
                 allText.append(text).append("\n");
@@ -1297,11 +1307,18 @@ public class KnowledgeDocumentService {
             }
             log.info("向量化: PGVector 存储完成, id={}, segments={}", documentId, segments.size());
 
-            for (int i = 0; i < segments.size(); i++) {
-                String chunkId = kbPrefix + fileName + "_" + i;
-                keywordIndex.index(chunkId, segments.get(i).text());
+            int bm25Count = 0;
+            for (KnowledgeDocumentChunk chunk : chunks) {
+                // 禁用片段不进入 BM25 索引（向量仍保留，检索时由向量路径过滤）
+                if (chunk.getEnabled() != null && !chunk.getEnabled()) {
+                    continue;
+                }
+                // chunkId 使用数据库主键（编辑/合并/拆分后保持稳定），格式 "kbId_fileName_chunkId"
+                String chunkId = kbPrefix + fileName + "_" + chunk.getId();
+                keywordIndex.index(chunkId, chunk.getText() != null ? chunk.getText() : "");
+                bm25Count++;
             }
-            log.info("向量化: BM25 索引完成, id={}, chunks={}", documentId, segments.size());
+            log.info("向量化: BM25 索引完成, id={}, chunks={}", documentId, bm25Count);
 
             String contentHash = DigestUtils.sha256Hex(allText.toString());
             documentHashService.save(contentHash, HashType.HASH_TYPE_TEXT,
@@ -1657,5 +1674,448 @@ public class KnowledgeDocumentService {
         vo.setUpdatedAt(doc.getUpdatedAt());
         vo.setIsDeleted(doc.getIsDeleted());
         return vo;
+    }
+
+    // ======================== 片段管理（精细化干预 & 启停控制） ========================
+
+    /**
+     * <h3>查询文档已保存片段列表（含主键与启用状态）</h3>
+     *
+     * <p>区别于切片预览接口，本接口返回 {@code knowledge_document_chunk} 表中的
+     * 已保存片段，附带数据库主键 {@code id} 与启用状态 {@code enabled}，
+     * 供前端片段管理页展示与操作。</p>
+     *
+     * @param documentId 文档 ID
+     * @param role       所需最低角色（VIEWER/EDITOR）
+     */
+    public KnowledgeDocumentChunksVO listChunksForDocument(Long documentId, Role role) {
+        KnowledgeDocument doc = knowledgeDocumentMapper.selectById(documentId);
+        if (doc == null) {
+            throw new BusinessException(404, "文档不存在");
+        }
+        checkDocumentPermission(doc, role);
+
+        LambdaQueryWrapper<KnowledgeDocumentChunk> qw = new LambdaQueryWrapper<>();
+        qw.eq(KnowledgeDocumentChunk::getDocumentId, documentId)
+                .orderByAsc(KnowledgeDocumentChunk::getChunkIndex)
+                .orderByAsc(KnowledgeDocumentChunk::getId);
+        List<KnowledgeDocumentChunk> chunks = knowledgeDocumentChunkMapper.selectList(qw);
+        return buildChunksResponse(doc, chunks, chunks == null ? 0 : chunks.size());
+    }
+
+    /**
+     * <h3>编辑单个片段（精细化干预）</h3>
+     *
+     * <p>修改片段文本或元数据（contextPrefix/contentType/parentText 等），
+     * token 数自动重算，若文档已向量化则异步重算该片段的向量与 BM25 索引，
+     * 其余片段不受影响。</p>
+     *
+     * @param chunkId 片段主键
+     * @param dto     编辑内容（null 字段保持原值）
+     */
+    @Transactional
+    public KnowledgeDocumentChunksVO.ChunkItem updateChunk(Long chunkId, KnowledgeDocumentChunkUpdateDTO dto) {
+        KnowledgeDocumentChunk chunk = getChunkWithPermission(chunkId, Role.EDITOR);
+        KnowledgeDocument doc = knowledgeDocumentMapper.selectById(chunk.getDocumentId());
+        String oldText = chunk.getText();
+
+        if (dto.getText() != null) {
+            chunk.setText(dto.getText());
+        }
+        if (dto.getContextPrefix() != null) {
+            chunk.setContextPrefix(dto.getContextPrefix());
+        }
+        if (dto.getContentType() != null) {
+            chunk.setContentType(dto.getContentType());
+        }
+        if (dto.getParentText() != null) {
+            chunk.setParentText(dto.getParentText());
+        }
+        if (dto.getParentStart() != null) {
+            chunk.setParentStart(dto.getParentStart());
+        }
+        if (dto.getParentEnd() != null) {
+            chunk.setParentEnd(dto.getParentEnd());
+        }
+
+        // token 数自动重算
+        String text = chunk.getText() != null ? chunk.getText() : "";
+        chunk.setTokenCount(tokenCountEstimator.estimateTokenCountInText(text));
+
+        knowledgeDocumentChunkMapper.updateById(chunk);
+        recalcDocumentStats(chunk.getDocumentId());
+
+        // 文本变化且文档已向量化时重算向量（未向量化文档不重算，向量化状态由全量任务统一管理）
+        boolean textChanged = oldText == null || !oldText.equals(text);
+        boolean vectorized = doc != null && Integer.valueOf(2).equals(doc.getIsVectorized());
+        if (textChanged && vectorized) {
+            triggerAfterCommit(() -> self.revectorizeChunkAsync(chunkId));
+        }
+
+        return toChunkItem(chunk);
+    }
+
+    /**
+     * <h3>合并相邻片段（精细化干预）</h3>
+     *
+     * <p>将 {@code chunkIds} 中多个片段按给定顺序合并为单个片段（文本用换行拼接），
+     * 保留首片段的 contextPrefix/contentType，父级段落元数据置空。
+     * 被删除片段的向量与 BM25 索引同步清理，合并后的片段异步重算向量。</p>
+     */
+    @Transactional
+    public KnowledgeDocumentChunksVO.ChunkItem mergeChunks(KnowledgeDocumentChunkMergeDTO dto) {
+        if (dto == null || dto.getChunkIds() == null || dto.getChunkIds().size() < 2) {
+            throw new BusinessException(400, "至少需要 2 个片段才能合并");
+        }
+        KnowledgeDocument doc = knowledgeDocumentMapper.selectById(dto.getDocumentId());
+        if (doc == null) {
+            throw new BusinessException(404, "文档不存在");
+        }
+        checkDocumentPermission(doc, Role.EDITOR);
+
+        List<KnowledgeDocumentChunk> chunks = new java.util.ArrayList<>();
+        for (Long id : dto.getChunkIds()) {
+            KnowledgeDocumentChunk c = knowledgeDocumentChunkMapper.selectById(id);
+            if (c == null) {
+                throw new BusinessException(404, "片段不存在: id=" + id);
+            }
+            if (!dto.getDocumentId().equals(c.getDocumentId())) {
+                throw new BusinessException(400, "片段不属于该文档: id=" + id);
+            }
+            chunks.add(c);
+        }
+
+        // 首片段吸收全部文本
+        KnowledgeDocumentChunk first = chunks.get(0);
+        StringBuilder merged = new StringBuilder();
+        for (KnowledgeDocumentChunk c : chunks) {
+            if (c.getText() != null && !c.getText().isBlank()) {
+                if (merged.length() > 0) {
+                    merged.append("\n\n");
+                }
+                merged.append(c.getText());
+            }
+        }
+        String mergedText = merged.toString();
+        first.setText(mergedText);
+        first.setTokenCount(tokenCountEstimator.estimateTokenCountInText(mergedText));
+        // 父级边界在合并后失效，置空
+        first.setParentText(null);
+        first.setParentStart(null);
+        first.setParentEnd(null);
+        knowledgeDocumentChunkMapper.updateById(first);
+
+        // 删除其余片段（同步清理 BM25，异步清理向量）
+        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+        for (int i = 1; i < chunks.size(); i++) {
+            KnowledgeDocumentChunk c = chunks.get(i);
+            keywordIndex.remove(bm25ChunkId(doc, c.getId()));
+            knowledgeDocumentChunkMapper.deleteById(c.getId());
+            final Long deletedId = c.getId();
+            triggerAfterCommit(() -> self.removeChunkVectorAsync(deletedId));
+        }
+
+        renormalizeChunkIndexes(dto.getDocumentId());
+        recalcDocumentStats(dto.getDocumentId());
+
+        // 文档已向量化时才重算向量（未向量化文档不重算，向量化状态由全量任务统一管理）
+        final Long mergedId = first.getId();
+        if (Integer.valueOf(2).equals(doc.getIsVectorized())) {
+            triggerAfterCommit(() -> self.revectorizeChunkAsync(mergedId));
+        }
+
+        return toChunkItem(first);
+    }
+
+    /**
+     * <h3>拆分片段（精细化干预）</h3>
+     *
+     * <p>将单个片段拆分为多个片段，原片段被删除，拆分后的文本由 {@code texts} 提供。
+     * 新片段继承原片段的 contentType/contextPrefix/enabled 状态，token 数自动重算。</p>
+     */
+    @Transactional
+    public List<KnowledgeDocumentChunksVO.ChunkItem> splitChunk(KnowledgeDocumentChunkSplitDTO dto) {
+        if (dto == null || dto.getChunkId() == null || dto.getTexts() == null || dto.getTexts().size() < 2) {
+            throw new BusinessException(400, "拆分至少需要 2 段文本");
+        }
+        KnowledgeDocument doc = knowledgeDocumentMapper.selectById(dto.getDocumentId());
+        if (doc == null) {
+            throw new BusinessException(404, "文档不存在");
+        }
+        checkDocumentPermission(doc, Role.EDITOR);
+
+        KnowledgeDocumentChunk original = knowledgeDocumentChunkMapper.selectById(dto.getChunkId());
+        if (original == null) {
+            throw new BusinessException(404, "片段不存在: id=" + dto.getChunkId());
+        }
+        if (!dto.getDocumentId().equals(original.getDocumentId())) {
+            throw new BusinessException(400, "片段不属于该文档: id=" + dto.getChunkId());
+        }
+
+        // 删除原片段（同步清理 BM25，异步清理向量）
+        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+        keywordIndex.remove(bm25ChunkId(doc, original.getId()));
+        knowledgeDocumentChunkMapper.deleteById(original.getId());
+        triggerAfterCommit(() -> self.removeChunkVectorAsync(original.getId()));
+
+        // 插入拆分后的新片段，chunkIndex 从原片段序号开始递增
+        List<KnowledgeDocumentChunksVO.ChunkItem> result = new java.util.ArrayList<>();
+        int baseIndex = original.getChunkIndex() != null ? original.getChunkIndex() : 0;
+        for (int i = 0; i < dto.getTexts().size(); i++) {
+            String text = dto.getTexts().get(i);
+            KnowledgeDocumentChunk c = new KnowledgeDocumentChunk();
+            c.setDocumentId(dto.getDocumentId());
+            c.setChunkIndex(baseIndex + i);
+            c.setText(text);
+            c.setTokenCount(tokenCountEstimator.estimateTokenCountInText(text != null ? text : ""));
+            c.setContextPrefix(original.getContextPrefix());
+            c.setContentType(original.getContentType());
+            c.setEnabled(original.getEnabled() == null || original.getEnabled());
+            knowledgeDocumentChunkMapper.insert(c);
+            result.add(toChunkItem(c));
+        }
+
+        renormalizeChunkIndexes(dto.getDocumentId());
+        recalcDocumentStats(dto.getDocumentId());
+
+        // 文档已向量化时才向量化新片段（未向量化文档不向量化，向量化状态由全量任务统一管理）
+        List<Long> newIds = result.stream().map(KnowledgeDocumentChunksVO.ChunkItem::getId).collect(java.util.stream.Collectors.toList());
+        if (Integer.valueOf(2).equals(doc.getIsVectorized())) {
+            triggerAfterCommit(() -> {
+                for (Long id : newIds) {
+                    self.revectorizeChunkAsync(id);
+                }
+            });
+        }
+
+        return result;
+    }
+
+    /**
+     * <h3>批量启停片段（召回过滤）</h3>
+     *
+     * <p>{@code enabled=false} 时片段在检索时被过滤（不参与召回），
+     * {@code enabled=true} 时恢复召回。向量数据始终保留，仅检索层过滤，
+     * 禁用时同步从 BM25 内存索引移除，启用时重新加入，实现零成本切换。</p>
+     */
+    @Transactional
+    public List<KnowledgeDocumentChunksVO.ChunkItem> setChunksEnabled(KnowledgeDocumentChunkToggleDTO dto) {
+        if (dto == null || dto.getChunkIds() == null || dto.getChunkIds().isEmpty()) {
+            throw new BusinessException(400, "片段 ID 列表不能为空");
+        }
+        if (dto.getEnabled() == null) {
+            throw new BusinessException(400, "enabled 不能为空");
+        }
+
+        // 先校验所有片段与权限，再统一修改，避免中途失败导致内存索引与数据库不一致
+        java.util.Map<Long, KnowledgeDocumentChunk> chunkMap = new java.util.LinkedHashMap<>();
+        java.util.Map<Long, KnowledgeDocument> docMap = new java.util.HashMap<>();
+        for (Long chunkId : dto.getChunkIds()) {
+            KnowledgeDocumentChunk chunk = knowledgeDocumentChunkMapper.selectById(chunkId);
+            if (chunk == null) {
+                throw new BusinessException(404, "片段不存在: id=" + chunkId);
+            }
+            KnowledgeDocument doc = knowledgeDocumentMapper.selectById(chunk.getDocumentId());
+            if (doc == null) {
+                throw new BusinessException(404, "文档不存在");
+            }
+            checkDocumentPermission(doc, Role.EDITOR);
+            chunkMap.put(chunkId, chunk);
+            docMap.put(chunk.getDocumentId(), doc);
+        }
+
+        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+        List<KnowledgeDocumentChunksVO.ChunkItem> result = new java.util.ArrayList<>();
+
+        for (java.util.Map.Entry<Long, KnowledgeDocumentChunk> entry : chunkMap.entrySet()) {
+            Long chunkId = entry.getKey();
+            KnowledgeDocumentChunk chunk = entry.getValue();
+
+            chunk.setEnabled(dto.getEnabled());
+            knowledgeDocumentChunkMapper.updateById(chunk);
+
+            // 同步向量检索过滤集合
+            hybridSearchService.markChunkEnabled(chunkId, dto.getEnabled());
+
+            // 同步 BM25 索引
+            KnowledgeDocument doc = docMap.get(chunk.getDocumentId());
+            String bm25Id = bm25ChunkId(doc, chunkId);
+            if (dto.getEnabled()) {
+                if (chunk.getText() != null && !chunk.getText().isBlank()) {
+                    keywordIndex.index(bm25Id, chunk.getText());
+                }
+            } else {
+                keywordIndex.remove(bm25Id);
+            }
+
+            result.add(toChunkItem(chunk));
+        }
+        return result;
+    }
+
+    /**
+     * <h3>加载片段并校验权限</h3>
+     */
+    private KnowledgeDocumentChunk getChunkWithPermission(Long chunkId, Role role) {
+        KnowledgeDocumentChunk chunk = knowledgeDocumentChunkMapper.selectById(chunkId);
+        if (chunk == null) {
+            throw new BusinessException(404, "片段不存在: id=" + chunkId);
+        }
+        KnowledgeDocument doc = knowledgeDocumentMapper.selectById(chunk.getDocumentId());
+        if (doc == null) {
+            throw new BusinessException(404, "文档不存在");
+        }
+        checkDocumentPermission(doc, role);
+        return chunk;
+    }
+
+    /**
+     * <h3>重算文档 chunkCount / tokenCount</h3>
+     */
+    private void recalcDocumentStats(Long documentId) {
+        LambdaQueryWrapper<KnowledgeDocumentChunk> qw = new LambdaQueryWrapper<>();
+        qw.eq(KnowledgeDocumentChunk::getDocumentId, documentId);
+        List<KnowledgeDocumentChunk> chunks = knowledgeDocumentChunkMapper.selectList(qw);
+        int count = chunks == null ? 0 : chunks.size();
+        int tokens = 0;
+        if (chunks != null) {
+            for (KnowledgeDocumentChunk c : chunks) {
+                if (c.getTokenCount() != null) {
+                    tokens += c.getTokenCount();
+                }
+            }
+        }
+        KnowledgeDocument doc = knowledgeDocumentMapper.selectById(documentId);
+        if (doc != null) {
+            doc.setChunkCount(count);
+            doc.setTokenCount(tokens);
+            knowledgeDocumentMapper.updateById(doc);
+        }
+    }
+
+    /**
+     * <h3>重排片段序号（合并/拆分后保持 0..n-1 连续）</h3>
+     */
+    private void renormalizeChunkIndexes(Long documentId) {
+        LambdaQueryWrapper<KnowledgeDocumentChunk> qw = new LambdaQueryWrapper<>();
+        qw.eq(KnowledgeDocumentChunk::getDocumentId, documentId)
+                .orderByAsc(KnowledgeDocumentChunk::getChunkIndex)
+                .orderByAsc(KnowledgeDocumentChunk::getId);
+        List<KnowledgeDocumentChunk> chunks = knowledgeDocumentChunkMapper.selectList(qw);
+        for (int i = 0; i < chunks.size(); i++) {
+            KnowledgeDocumentChunk c = chunks.get(i);
+            if (c.getChunkIndex() == null || c.getChunkIndex() != i) {
+                c.setChunkIndex(i);
+                knowledgeDocumentChunkMapper.updateById(c);
+            }
+        }
+    }
+
+    /**
+     * <h3>构建片段 BM25 索引 ID</h3>
+     *
+     * <p>格式与 {@link #vectorizeAsync} 保持一致：{@code kbId_fileName_chunkId}。</p>
+     */
+    private String bm25ChunkId(KnowledgeDocument doc, Long chunkId) {
+        String fileName = doc.getFileName() != null ? doc.getFileName() : "document";
+        String kbPrefix = doc.getKbId() != null ? doc.getKbId() + "_" : "";
+        return kbPrefix + fileName + "_" + chunkId;
+    }
+
+    /**
+     * <h3>构建片段向量元数据</h3>
+     *
+     * <p>包含 source/document_id/chunk_index/kb_id/chunk_id 以及内容元数据
+     * （content_type/parent_text/parent_start/parent_end），供检索层
+     * 父上下文扩展与 content_type 降权使用。</p>
+     */
+    private Metadata buildChunkMetadata(KnowledgeDocument doc, KnowledgeDocumentChunk chunk) {
+        Metadata metadata = Metadata.from("source", doc.getFileName() != null ? doc.getFileName() : "document")
+                .put("document_id", String.valueOf(doc.getId()))
+                .put("chunk_index", String.valueOf(chunk.getChunkIndex()))
+                .put("chunk_id", String.valueOf(chunk.getId()))
+                .put("kb_id", doc.getKbId() != null ? String.valueOf(doc.getKbId()) : "");
+        if (chunk.getContentType() != null) {
+            metadata.put("content_type", chunk.getContentType());
+        }
+        if (chunk.getParentText() != null) {
+            metadata.put("parent_text", chunk.getParentText());
+        }
+        if (chunk.getParentStart() != null) {
+            metadata.put("parent_start", String.valueOf(chunk.getParentStart()));
+        }
+        if (chunk.getParentEnd() != null) {
+            metadata.put("parent_end", String.valueOf(chunk.getParentEnd()));
+        }
+        return metadata;
+    }
+
+    /**
+     * <h3>事务提交后触发异步任务</h3>
+     *
+     * <p>确保数据库变更已提交后再执行异步向量重算，避免异步线程读到旧数据。</p>
+     */
+    private void triggerAfterCommit(Runnable task) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    task.run();
+                }
+            });
+        } else {
+            // 无事务上下文时直接执行
+            task.run();
+        }
+    }
+
+    /**
+     * <h3>异步重算单个片段向量与 BM25 索引</h3>
+     */
+    @Async("vectorizationTaskExecutor")
+    public void revectorizeChunkAsync(Long chunkId) {
+        KnowledgeDocumentChunk chunk = knowledgeDocumentChunkMapper.selectById(chunkId);
+        if (chunk == null) {
+            log.warn("片段向量重算: 片段不存在, id={}", chunkId);
+            return;
+        }
+        KnowledgeDocument doc = knowledgeDocumentMapper.selectById(chunk.getDocumentId());
+        if (doc == null) {
+            log.warn("片段向量重算: 文档不存在, chunkId={}", chunkId);
+            return;
+        }
+        try {
+            String text = chunk.getText() != null ? chunk.getText() : "";
+            // 删除旧向量后重新写入
+            jdbcTemplate.update("DELETE FROM " + vectorTableName + " WHERE metadata->>'chunk_id' = ?",
+                    String.valueOf(chunkId));
+            Embedding embedding = embeddingModel.embed(text).content();
+            embeddingStore.add(embedding, TextSegment.from(text, buildChunkMetadata(doc, chunk)));
+
+            // 更新 BM25
+            com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+            String bm25Id = bm25ChunkId(doc, chunkId);
+            keywordIndex.remove(bm25Id);
+            if (chunk.getEnabled() == null || chunk.getEnabled()) {
+                keywordIndex.index(bm25Id, text);
+            }
+            log.info("片段向量重算完成: chunkId={}", chunkId);
+        } catch (Exception e) {
+            log.error("片段向量重算失败: chunkId={}", chunkId, e);
+        }
+    }
+
+    /**
+     * <h3>异步删除单个片段向量</h3>
+     */
+    @Async("vectorizationTaskExecutor")
+    public void removeChunkVectorAsync(Long chunkId) {
+        try {
+            jdbcTemplate.update("DELETE FROM " + vectorTableName + " WHERE metadata->>'chunk_id' = ?",
+                    String.valueOf(chunkId));
+            log.info("片段向量删除完成: chunkId={}", chunkId);
+        } catch (Exception e) {
+            log.error("片段向量删除失败: chunkId={}", chunkId, e);
+        }
     }
 }

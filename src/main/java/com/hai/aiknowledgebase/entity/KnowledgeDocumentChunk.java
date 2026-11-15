@@ -58,6 +58,9 @@ public class KnowledgeDocumentChunk {
     /** 父级段落结束 chunk 索引 */
     private Integer parentEnd;
 
+    /** 是否启用：true=可被检索召回，false=禁用（检索时过滤） */
+    private Boolean enabled;
+
     @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createdAt;
 

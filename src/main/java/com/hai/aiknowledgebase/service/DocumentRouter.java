@@ -132,16 +132,20 @@ public class DocumentRouter {
      * </ul>
      *
      * @param customDocument 统一文档对象（包含格式、内容、元数据）
+     * @param chunkLength    知识库配置的切片长度（token，可为 null 表示用预设值）
+     * @param overlapLength  知识库配置的重叠长度（token，可为 null 表示用预设值）
      * @return 切片结果列表
      */
-    public List<MarkdownDocumentChunker.Chunk> route(CustomDocument customDocument) {
+    public List<MarkdownDocumentChunker.Chunk> route(CustomDocument customDocument,
+                                                     Integer chunkLength,
+                                                     Integer overlapLength) {
         // ===== 步骤1：格式特殊通道 =====
         // Excel/CSV 是结构化表格数据，不适合 Markdown 递归切分，直接走按行切分
         if (customDocument.getFormat() == CustomDocument.Format.EXCEL ||
                 customDocument.getFormat() == CustomDocument.Format.CSV) {
             log.info("文档 [{}] 为表格格式，路由到 Excel 行切分器",
                     customDocument.getFileName());
-            return chunkExcelByRows(customDocument);
+            return chunkExcelByRows(customDocument, chunkLength, overlapLength);
         }
 
         // ===== 步骤2：提取文本内容 =====
@@ -157,8 +161,9 @@ public class DocumentRouter {
         ContentCategory category = contentAnalyzer.analyze(content);
         log.info("文档 [{}] 分类为: {}", customDocument.getFileName(), category);
 
-        // ===== 步骤4：根据分类获取配置 =====
-        ChunkingConfig config = getConfigForCategory(category);
+        // ===== 步骤4：根据分类获取配置，并用知识库参数覆盖预设值 =====
+        ChunkingConfig config = applyCustomParams(getConfigForCategory(category),
+                chunkLength, overlapLength);
 
         // ===== 步骤4.5：试题文档预处理（分离正文/题目/词汇表）=====
         if (category == ContentCategory.EXAM_PAPER) {
@@ -178,7 +183,7 @@ public class DocumentRouter {
             return new MarkdownDocumentChunker(
                     config.getMinTokens(),
                     config.getMaxTokens(),
-                    config.getOverlapRatio(),
+                    config.getOverlapTokens(),
                     tokenEstimator,
                     modelToUse,
                     config.getSemanticThreshold()
@@ -199,11 +204,11 @@ public class DocumentRouter {
      *
      * <p>映射关系：</p>
      * <table>
-     *   <tr><th>分类</th><th>minTokens</th><th>maxTokens</th><th>overlap</th><th>语义</th><th>说明</th></tr>
-     *   <tr><td>TECHNICAL</td><td>200</td><td>1000</td><td>10%</td><td>关</td><td>依赖代码块/标题结构</td></tr>
-     *   <tr><td>LEGAL</td><td>300</td><td>1200</td><td>25%</td><td>开</td><td>法条无标题，需语义聚类 + 大重叠防切断</td></tr>
-     *   <tr><td>TABLE_HEAVY</td><td>100</td><td>800</td><td>5%</td><td>关</td><td>表格按行切，小重叠</td></tr>
-     *   <tr><td>GENERAL</td><td>100</td><td>512</td><td>10%</td><td>关</td><td>递归切分足够</td></tr>
+     *   <tr><th>分类</th><th>minTokens</th><th>maxTokens</th><th>overlapTokens</th><th>语义</th><th>说明</th></tr>
+     *   <tr><td>TECHNICAL</td><td>200</td><td>1000</td><td>100</td><td>关</td><td>依赖代码块/标题结构</td></tr>
+     *   <tr><td>LEGAL</td><td>300</td><td>1200</td><td>300</td><td>开</td><td>法条无标题，需语义聚类 + 大重叠防切断</td></tr>
+     *   <tr><td>TABLE_HEAVY</td><td>100</td><td>800</td><td>40</td><td>关</td><td>表格按行切，小重叠</td></tr>
+     *   <tr><td>GENERAL</td><td>100</td><td>512</td><td>50</td><td>关</td><td>递归切分足够</td></tr>
      * </table>
      *
      * @param category 内容分类
@@ -238,6 +243,36 @@ public class DocumentRouter {
         // 用 yml 配置的阈值覆盖预设值
         config.setSemanticThreshold(semanticThreshold);
         return config;
+    }
+
+    /**
+     * <h3>用知识库参数覆盖预设配置</h3>
+     *
+     * <p>统一 AUTO 与手动策略的参数口径：知识库配置的 chunkLength 覆盖 maxTokens，
+     * overlapLength 覆盖 overlapTokens。chunkLength 覆盖后 minTokens 需取 min 兜底，
+     * 防止 minTokens &gt; maxTokens。这里用 builder 重建新实例，
+     * 避免污染 static final 预设单例。</p>
+     *
+     * @param base          分类预设配置
+     * @param chunkLength   知识库切片长度（token，null 或 ≤0 表示用预设）
+     * @param overlapLength 知识库重叠长度（token，null 或 ≤0 表示用预设）
+     * @return 覆盖后的配置（新实例）
+     */
+    private ChunkingConfig applyCustomParams(ChunkingConfig base,
+                                             Integer chunkLength,
+                                             Integer overlapLength) {
+        int effectiveMaxTokens = (chunkLength != null && chunkLength > 0)
+                ? chunkLength : base.getMaxTokens();
+        int effectiveMinTokens = Math.min(base.getMinTokens(), effectiveMaxTokens);
+        int effectiveOverlapTokens = (overlapLength != null && overlapLength > 0)
+                ? overlapLength : base.getOverlapTokens();
+        return ChunkingConfig.builder()
+                .minTokens(effectiveMinTokens)
+                .maxTokens(effectiveMaxTokens)
+                .overlapTokens(effectiveOverlapTokens)
+                .enableSemantic(base.isEnableSemantic())
+                .semanticThreshold(base.getSemanticThreshold())
+                .build();
     }
 
     /**
@@ -285,7 +320,7 @@ public class DocumentRouter {
             return new MarkdownDocumentChunker(
                     config.getMinTokens(),
                     config.getMaxTokens(),
-                    config.getOverlapRatio(),
+                    config.getOverlapTokens(),
                     tokenEstimator,
                     modelToUse,
                     config.getSemanticThreshold()
@@ -320,8 +355,8 @@ public class DocumentRouter {
      * <p>用配置的核心参数拼接为字符串，作为 Chunker 缓存 Map 的 Key。</p>
      *
      * <h4>Key 格式</h4>
-     * <pre>{minTokens}_{maxTokens}_{overlapRatio}_{enableSemantic}_{semanticThreshold}</pre>
-     * <p>示例：{@code "200_1000_0.10_false_0.70"} 对应 TECHNICAL 配置。</p>
+     * <pre>{minTokens}_{maxTokens}_{overlapTokens}_{enableSemantic}_{semanticThreshold}</pre>
+     * <p>示例：{@code "200_1000_100_false_0.70"} 对应 TECHNICAL 配置。</p>
      *
      * <p>只有配置参数完全相同的文档才会复用同一个 Chunker 实例，
      * 避免参数不同的文档使用错误的切分策略。</p>
@@ -330,10 +365,10 @@ public class DocumentRouter {
      * @return 缓存 Key 字符串
      */
     private String buildCacheKey(ChunkingConfig config) {
-        return String.format("%d_%d_%.2f_%b_%.2f",
+        return String.format("%d_%d_%d_%b_%.2f",
                 config.getMinTokens(),
                 config.getMaxTokens(),
-                config.getOverlapRatio(),
+                config.getOverlapTokens(),
                 config.isEnableSemantic(),
                 config.getSemanticThreshold());
     }
@@ -371,7 +406,7 @@ public class DocumentRouter {
      * @return 按行切分的 Chunk 列表
      */
     private List<MarkdownDocumentChunker.Chunk> chunkExcelByRows(
-            CustomDocument customDocument) {
+            CustomDocument customDocument, Integer chunkLength, Integer overlapLength) {
         String content = customDocument.getContent();
         if (content == null || content.isBlank()) return List.of();
 
@@ -380,7 +415,7 @@ public class DocumentRouter {
         if (lines.length < 2) {
             // 不足两行（可能只有表头），降级到默认切分器
             log.warn("Excel 内容行数过少，降级为默认切分");
-            return routeToDefaultChunker(customDocument);
+            return routeToDefaultChunker(customDocument, chunkLength, overlapLength);
         }
 
         // 提取表头（第一行）
@@ -422,15 +457,16 @@ public class DocumentRouter {
      * @return 按通用配置切分的 Chunk 列表
      */
     private List<MarkdownDocumentChunker.Chunk> routeToDefaultChunker(
-            CustomDocument customDocument) {
-        ChunkingConfig config = ChunkingConfig.GENERAL;
+            CustomDocument customDocument, Integer chunkLength, Integer overlapLength) {
+        ChunkingConfig config = applyCustomParams(ChunkingConfig.GENERAL,
+                chunkLength, overlapLength);
         String cacheKey = buildCacheKey(config);
         MarkdownDocumentChunker chunker = chunkerCache.computeIfAbsent(
                 cacheKey, key ->
                         new MarkdownDocumentChunker(
                                 config.getMinTokens(),
                                 config.getMaxTokens(),
-                                config.getOverlapRatio(),
+                                config.getOverlapTokens(),
                                 tokenEstimator,
                                 null,  // 降级场景关闭语义切分
                                 config.getSemanticThreshold()

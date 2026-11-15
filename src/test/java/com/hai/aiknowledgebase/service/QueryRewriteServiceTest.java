@@ -88,7 +88,8 @@ class QueryRewriteServiceTest {
         void disabledReturnsOriginalQuery() {
             ReflectionTestUtils.setField(queryRewriteService, "enabled", false);
 
-            QueryRewriteResult result = queryRewriteService.rewrite("测试查询");
+            QueryRewriteResult result = queryRewriteService.rewrite(
+                    RewriteRequest.builder().query("测试查询").build());
 
             assertThat(result.getRewrittenQuery()).isEqualTo("测试查询");
             assertThat(result.getPath()).isEqualTo(RewritePath.NONE);
@@ -107,7 +108,8 @@ class QueryRewriteServiceTest {
                     .build();
             when(l1RuleBasedTransformer.applyRuleRewrite(anyString())).thenReturn(mockResult);
 
-            QueryRewriteResult result = queryRewriteService.rewrite("测试查询");
+            QueryRewriteResult result = queryRewriteService.rewrite(
+                    RewriteRequest.builder().query("测试查询").build());
 
             assertThat(result.getPath()).isEqualTo(RewritePath.L1_RULE);
         }
@@ -122,7 +124,8 @@ class QueryRewriteServiceTest {
         @Test
         @DisplayName("null 查询应返回空字符串")
         void nullQueryReturnsEmpty() {
-            QueryRewriteResult result = queryRewriteService.rewrite((String) null);
+            QueryRewriteResult result = queryRewriteService.rewrite(
+                    RewriteRequest.builder().query(null).build());
 
             assertThat(result.getRewrittenQuery()).isEmpty();
             assertThat(result.getPath()).isEqualTo(RewritePath.L1_RULE);
@@ -131,7 +134,8 @@ class QueryRewriteServiceTest {
         @Test
         @DisplayName("空白查询应返回空字符串")
         void blankQueryReturnsEmpty() {
-            QueryRewriteResult result = queryRewriteService.rewrite("   ");
+            QueryRewriteResult result = queryRewriteService.rewrite(
+                    RewriteRequest.builder().query("   ").build());
 
             assertThat(result.getRewrittenQuery()).isEmpty();
             assertThat(result.getPath()).isEqualTo(RewritePath.L1_RULE);
@@ -140,7 +144,8 @@ class QueryRewriteServiceTest {
         @Test
         @DisplayName("空字符串应返回空字符串")
         void emptyQueryReturnsEmpty() {
-            QueryRewriteResult result = queryRewriteService.rewrite("");
+            QueryRewriteResult result = queryRewriteService.rewrite(
+                    RewriteRequest.builder().query("").build());
 
             assertThat(result.getRewrittenQuery()).isEmpty();
             assertThat(result.getPath()).isEqualTo(RewritePath.L1_RULE);
@@ -193,7 +198,8 @@ class QueryRewriteServiceTest {
                     .build();
             when(l1RuleBasedTransformer.applyRuleRewrite(anyString())).thenReturn(l1Result);
 
-            QueryRewriteResult result = queryRewriteService.rewrite("测试查询");
+            QueryRewriteResult result = queryRewriteService.rewrite(
+                    RewriteRequest.builder().query("测试查询").build());
 
             assertThat(result.getPath()).isEqualTo(RewritePath.L1_RULE);
         }
@@ -217,7 +223,8 @@ class QueryRewriteServiceTest {
                     .build();
             when(l1RuleBasedTransformer.applyRuleRewrite("配置API")).thenReturn(l1Result);
 
-            QueryRewriteResult result = queryRewriteService.rewrite("配置API");
+            QueryRewriteResult result = queryRewriteService.rewrite(
+                    RewriteRequest.builder().query("配置API").build());
 
             assertThat(result.getRewrittenQuery()).isEqualTo("配置API接口");
             assertThat(result.getExpandKeywords()).contains("API", "接口");
@@ -237,7 +244,8 @@ class QueryRewriteServiceTest {
                     .build();
             when(l1RuleBasedTransformer.applyRuleRewrite("配置API")).thenReturn(l1Result);
 
-            QueryRewriteResult result = queryRewriteService.rewrite("配质API");
+            QueryRewriteResult result = queryRewriteService.rewrite(
+                    RewriteRequest.builder().query("配质API").build());
 
             assertThat(result.getRewrittenQuery()).isEqualTo("配置API接口");
             verify(queryCorrector).correct("配质API");
@@ -262,7 +270,8 @@ class QueryRewriteServiceTest {
                     .build();
             when(l1RuleBasedTransformer.applyRuleRewrite("查询方法不包含删除")).thenReturn(l1Result);
 
-            QueryRewriteResult result = queryRewriteService.rewrite("查询方法不包含删除");
+            QueryRewriteResult result = queryRewriteService.rewrite(
+                    RewriteRequest.builder().query("查询方法不包含删除").build());
 
             assertThat(result.getExcludeKeywords()).contains("删除");
         }
@@ -279,7 +288,8 @@ class QueryRewriteServiceTest {
                     .build();
             when(l1RuleBasedTransformer.applyRuleRewrite("查询方法除了新增")).thenReturn(l1Result);
 
-            QueryRewriteResult result = queryRewriteService.rewrite("查询方法除了新增");
+            QueryRewriteResult result = queryRewriteService.rewrite(
+                    RewriteRequest.builder().query("查询方法除了新增").build());
 
             assertThat(result.getExcludeKeywords()).contains("新增");
         }
@@ -296,7 +306,8 @@ class QueryRewriteServiceTest {
                     .build();
             when(l1RuleBasedTransformer.applyRuleRewrite("查询方法列表")).thenReturn(l1Result);
 
-            QueryRewriteResult result = queryRewriteService.rewrite("查询方法列表");
+            QueryRewriteResult result = queryRewriteService.rewrite(
+                    RewriteRequest.builder().query("查询方法列表").build());
 
             assertThat(result.getExcludeKeywords()).isEmpty();
         }

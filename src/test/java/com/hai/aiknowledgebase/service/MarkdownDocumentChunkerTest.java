@@ -56,11 +56,11 @@ class MarkdownDocumentChunkerTest {
     /**
      * 创建切片器实例，embeddingModel=null 表示关闭语义切分，走纯 token 降级路径。
      */
-    private MarkdownDocumentChunker createChunker(int minTokens, int maxTokens, double overlapRatio) {
+    private MarkdownDocumentChunker createChunker(int minTokens, int maxTokens, int overlapTokens) {
         return new MarkdownDocumentChunker(
                 minTokens,
                 maxTokens,
-                overlapRatio,
+                overlapTokens,
                 tokenEstimator,
                 null,
                 0.7
@@ -104,7 +104,7 @@ class MarkdownDocumentChunkerTest {
                     （2）根据测试反馈及用户反馈，持续进行迭代优化，以不断提升数智人系统的性能和服务质量。
                     """;
 
-            MarkdownDocumentChunker chunker = createChunker(1, 500, 0.0);
+            MarkdownDocumentChunker chunker = createChunker(1, 500, 0);
             List<MarkdownDocumentChunker.Section> roots = chunker.parseSections(markdown);
 
             assertThat(roots).hasSize(1);
@@ -158,7 +158,7 @@ class MarkdownDocumentChunkerTest {
                     （2）根据测试反馈及用户反馈，持续进行迭代优化，以不断提升数智人系统的性能和服务质量。
                     """;
 
-            MarkdownDocumentChunker chunker = createChunker(1, 150, 0.0);
+            MarkdownDocumentChunker chunker = createChunker(1, 150, 0);
             List<MarkdownDocumentChunker.Chunk> chunks = chunker.chunk(markdown);
 
             assertThat(chunks).isNotEmpty();
@@ -229,7 +229,7 @@ class MarkdownDocumentChunkerTest {
                     （2）根据测试反馈及用户反馈，持续进行迭代优化，以不断提升数智人系统的性能和服务质量。
                     """;
 
-            MarkdownDocumentChunker chunker = createChunker(1, 150, 0.0);
+            MarkdownDocumentChunker chunker = createChunker(1, 150, 0);
             List<MarkdownDocumentChunker.Chunk> chunks = chunker.chunk(markdown);
 
             assertThat(chunks).isNotEmpty();
@@ -261,7 +261,7 @@ class MarkdownDocumentChunkerTest {
                     这是一段背景介绍文本，详细描述了项目的来龙去脉。
                     """;
 
-            MarkdownDocumentChunker chunker = createChunker(1, 500, 0.0);
+            MarkdownDocumentChunker chunker = createChunker(1, 500, 0);
             List<MarkdownDocumentChunker.Section> roots = chunker.parseSections(markdown);
 
             assertThat(roots).hasSize(2);
@@ -288,7 +288,7 @@ class MarkdownDocumentChunkerTest {
                     实施计划的具体内容...
                     """;
 
-            MarkdownDocumentChunker chunker = createChunker(1, 500, 0.0);
+            MarkdownDocumentChunker chunker = createChunker(1, 500, 0);
             List<MarkdownDocumentChunker.Section> roots = chunker.parseSections(markdown);
 
             assertThat(roots).hasSize(3);
@@ -313,7 +313,7 @@ class MarkdownDocumentChunkerTest {
                     第二节内容...
                     """;
 
-            MarkdownDocumentChunker chunker = createChunker(1, 500, 0.0);
+            MarkdownDocumentChunker chunker = createChunker(1, 500, 0);
             List<MarkdownDocumentChunker.Section> roots = chunker.parseSections(markdown);
 
             assertThat(roots).hasSize(1);
@@ -342,7 +342,7 @@ class MarkdownDocumentChunkerTest {
                     接口设计的规范...
                     """;
 
-            MarkdownDocumentChunker chunker = createChunker(1, 500, 0.0);
+            MarkdownDocumentChunker chunker = createChunker(1, 500, 0);
             List<MarkdownDocumentChunker.Section> roots = chunker.parseSections(markdown);
 
             assertThat(roots).hasSize(1);
@@ -370,7 +370,7 @@ class MarkdownDocumentChunkerTest {
                     开发测试阶段的工作内容...
                     """;
 
-            MarkdownDocumentChunker chunker = createChunker(1, 500, 0.0);
+            MarkdownDocumentChunker chunker = createChunker(1, 500, 0);
             List<MarkdownDocumentChunker.Section> roots = chunker.parseSections(markdown);
 
             assertThat(roots).hasSize(1);
@@ -536,8 +536,8 @@ class MarkdownDocumentChunkerTest {
                     4. 整体用户体验和服务质量将得到显著提升，用户的满意度和使用意愿将显著增加。
                     """;
 
-            // 使用线上 GENERAL 默认参数：minTokens=100, maxTokens=512, overlapRatio=0.1
-            MarkdownDocumentChunker chunker = createChunker(100, 512, 0.1);
+            // 使用线上 GENERAL 默认参数：minTokens=100, maxTokens=512, overlapTokens=50
+            MarkdownDocumentChunker chunker = createChunker(100, 512, 50);
             List<MarkdownDocumentChunker.Chunk> chunks = chunker.chunk(markdown);
 
             // 同时输出到控制台和文件（避免终端编码问题）
@@ -575,6 +575,95 @@ class MarkdownDocumentChunkerTest {
 
             // 写入文件
             try (FileWriter fw = new FileWriter("target/chunk_test_output.txt", StandardCharsets.UTF_8)) {
+                fw.write(result);
+            } catch (IOException e) {
+                System.err.println("写入文件失败: " + e.getMessage());
+            }
+
+            assertThat(chunks).isNotEmpty();
+        }
+
+        @Test
+        @DisplayName("打印《提问的智慧》目录文档切片结果（chunkLength=400, overlap=30）")
+        void printChunksForSmartQuestionsToc() {
+            String markdown = """
+                    ## 目录
+
+                    - [声明](#声明)
+                    - [简介](#简介)
+                    - [在提问之前](#在提问之前)
+                    - [当你提问时](#当你提问时)
+                      - [慎选提问的论坛](#慎选提问的论坛)
+                      - [Stack Overflow](#stack-overflow)
+                      - [网站和 IRC 论坛](#网站和-irc-论坛)
+                      - [第二步，使用项目邮件列表](#第二步使用项目邮件列表)
+                      - [使用有意义且描述明确的标题](#使用有意义且描述明确的标题)
+                      - [使问题容易回复](#使问题容易回复)
+                      - [使用清晰、正确、精准且合乎语法的语句](#使用清晰正确精准且合乎语法的语句)
+                      - [使用易于读取且标准的文件格式发送问题](#使用易于读取且标准的文件格式发送问题)
+                      - [精确地描述问题并言之有物](#精确地描述问题并言之有物)
+                      - [话不在多而在精](#话不在多而在精)
+                      - [别动辄声称找到 Bug](#别动辄声称找到-bug)
+                      - [低声下气不能代替你的功课](#低声下气不能代替你的功课)
+                      - [描述问题症状而非你的猜测](#描述问题症状而非你的猜测)
+                      - [按发生时间先后列出问题症状](#按发生时间先后列出问题症状)
+                      - [描述目标而不是过程](#描述目标而不是过程)
+                      - [别要求使用私人电邮回复](#别要求使用私人电邮回复)
+                      - [清楚明确地表达你的问题以及需求](#清楚明确地表达你的问题以及需求)
+                      - [询问有关代码的问题时](#询问有关代码的问题时)
+                      - [别把自己家庭作业的问题贴上来](#别把自己家庭作业的问题贴上来)
+                      - [去掉无意义的提问句](#去掉无意义的提问句)
+                      - [即使你很急也不要在标题写```紧急```](#即使你很急也不要在标题写紧急)
+                      - [礼多人不怪，而且有时还很有帮助](#礼多人不怪而且有时还很有帮助)
+                      - [问题解决后，加个简短的补充说明](#问题解决后加个简短的补充说明)
+                    - [如何解读答案](#如何解读答案)
+                      - [RTFM 和 STFW：如何知道你已完全搞砸了](#rtfm-和-stfw如何知道你已完全搞砸了)
+                      - [如果还是搞不懂](#如果还是搞不懂)
+                      - [处理无礼的回应](#处理无礼的回应)
+                    - [如何避免扮演失败者](#如何避免扮演失败者)
+                    - [不该问的问题](#不该问的问题)
+                    - [好问题与蠢问题](#好问题与蠢问题)
+                    - [如果得不到回答](#如果得不到回答)
+                    - [如何更好地回答问题](#如何更好地回答问题)
+                    - [相关资源](#相关资源)
+                    - [鸣谢](#鸣谢)
+                    """;
+
+            // 模拟 AUTO 路由到 GENERAL 预设：minTokens=100, maxTokens=400, overlapTokens=30
+            MarkdownDocumentChunker chunker = createChunker(100, 400, 30);
+            List<MarkdownDocumentChunker.Chunk> chunks = chunker.chunk(markdown);
+
+            // 同时输出到控制台和文件（避免终端编码问题）
+            StringWriter sw = new StringWriter();
+            PrintWriter out = new PrintWriter(sw);
+
+            out.println("========================================");
+            out.println("  《提问的智慧》目录切片结果 (chunkLength=400, overlap=30)");
+            out.println("  总 chunk 数: " + chunks.size());
+            out.println("========================================");
+
+            for (int i = 0; i < chunks.size(); i++) {
+                MarkdownDocumentChunker.Chunk c = chunks.get(i);
+                out.println();
+                out.println("--- Chunk[" + i + "] ---");
+                out.println("  tokens      : " + c.tokenCount());
+                out.println("  contextPrefix: " + c.contextPrefix());
+                out.println("  text (full) :");
+                out.println("    " + c.text().replace("\n", "\n    "));
+                out.println("  metadata    : " + c.metadata());
+            }
+
+            out.println();
+            out.println("========================================");
+            out.println("  切片完成，共 " + chunks.size() + " 个 chunk");
+            out.println("========================================");
+            out.flush();
+
+            String result = sw.toString();
+            System.out.println(result);
+
+            // 写入文件
+            try (FileWriter fw = new FileWriter("target/smart_questions_toc_output.txt", StandardCharsets.UTF_8)) {
                 fw.write(result);
             } catch (IOException e) {
                 System.err.println("写入文件失败: " + e.getMessage());

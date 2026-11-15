@@ -14,7 +14,7 @@ import lombok.Data;
  *   <tr><th>参数</th><th>含义</th><th>影响因素</th></tr>
  *   <tr><td>minTokens</td><td>单个 Chunk 最小 token 数。低于此值的片段会被 mergeSmallChunks 合并</td><td>内容类型的最小语义单元大小</td></tr>
  *   <tr><td>maxTokens</td><td>单个 Chunk 最大 token 数。超过此值触发切分（splitLargeSection / semanticChunk）</td><td>嵌入模型上下文窗口、内容语义完整性</td></tr>
- *   <tr><td>overlapRatio</td><td>相邻 Chunk 重叠比例。前一个 Chunk 尾部按此比例复制到下一个 Chunk 头部</td><td>内容边界敏感性、检索召回完整性</td></tr>
+ *   <tr><td>overlapTokens</td><td>相邻 Chunk 固定重叠 token 数。前一个 Chunk 尾部按此 token 数复制到下一个 Chunk 头部</td><td>内容边界敏感性、检索召回完整性</td></tr>
  *   <tr><td>enableSemantic</td><td>是否启用基于句子向量余弦相似度的语义切分</td><td>内容是否有天然标题结构</td></tr>
  *   <tr><td>semanticThreshold</td><td>语义转折阈值（0.0~1.0）。句子与累积向量相似度低于此值时触发切分</td><td>语义转折的敏感度需求</td></tr>
  * </table>
@@ -27,7 +27,7 @@ import lombok.Data;
 public class ChunkingConfig {
     private int minTokens;
     private int maxTokens;
-    private double overlapRatio;
+    private int overlapTokens;
     private boolean enableSemantic;
     private double semanticThreshold;
 
@@ -52,10 +52,10 @@ public class ChunkingConfig {
      * 最终送入 LLM 的上下文由 buildContextWithinBudget 按 token 预算截断，因此 1000 是安全的。
      * 参考：OpenAI text-embedding-3-small 最大输入 8191 token，1000 远低于上限。</p>
      *
-     * <h4>overlapRatio = 0.1 (10%)</h4>
+     * <h4>overlapTokens = 100</h4>
      * <p>技术文档靠 Markdown 标题/代码块结构切分，边界清晰（如标题切换、代码块结束），
-     * 10% 重叠足以防止边界处的关键信息丢失。参考：LangChain RecursiveCharacterTextSplitter
-     * 默认 chunk_overlap 为 chunk_size 的 10%。</p>
+     * 固定 100 token 重叠足以防止边界处的关键信息丢失。参考：LangChain RecursiveCharacterTextSplitter
+     * 默认 chunk_overlap 约为 chunk_size 的 10%（1000 × 10% = 100）。</p>
      *
      * <h4>enableSemantic = false</h4>
      * <p>技术文档有明确的 Markdown 结构（代码块包裹、标题层级），递归结构切分足以保证语义完整。
@@ -68,7 +68,7 @@ public class ChunkingConfig {
     public static final ChunkingConfig TECHNICAL = ChunkingConfig.builder()
             .minTokens(200)
             .maxTokens(1000)
-            .overlapRatio(0.1)
+            .overlapTokens(100)
             .enableSemantic(false)
             .semanticThreshold(0.7)
             .build();
@@ -87,11 +87,11 @@ public class ChunkingConfig {
      * 法律文本信息密度高，每条条款都有独立检索价值，需要比技术文档更大的 maxTokens。
      * 参考：LlamaIndex 建议法律文档 chunk_size 为 1024-2048 token。</p>
      *
-     * <h4>overlapRatio = 0.25 (25%)</h4>
+     * <h4>overlapTokens = 300</h4>
      * <p>法律文本的最大特点：法条之间高度关联（"依据前条..."、"参照第X条..."、"前款规定的..."），
-     * 大重叠（25%）防止切断法条引用链，确保检索时能召回关联条款。
-     * 这是所有预设中最高的重叠比例，因为法律文本的边界最不清晰。
-     * 参考：RAG 最佳实践中，法律/合同类文档建议 overlap 20%-30%。</p>
+     * 大重叠（300 token）防止切断法条引用链，确保检索时能召回关联条款。
+     * 这是所有预设中最大的重叠量，因为法律文本的边界最不清晰。
+     * 参考：RAG 最佳实践中，法律/合同类文档建议 overlap 20%-30%（1200 × 25% = 300）。</p>
      *
      * <h4>enableSemantic = true</h4>
      * <p>法律文本通常无 Markdown 标题结构（或仅有"第X章"级别的大标题），
@@ -107,7 +107,7 @@ public class ChunkingConfig {
     public static final ChunkingConfig LEGAL = ChunkingConfig.builder()
             .minTokens(300)
             .maxTokens(1200)
-            .overlapRatio(0.25)
+            .overlapTokens(300)
             .enableSemantic(true)
             .semanticThreshold(0.75)
             .build();
@@ -126,9 +126,9 @@ public class ChunkingConfig {
      * 降低检索精度。参考：表格数据建议较小 chunk（512-1024 token），
      * 因为每行数据都是独立信息单元。</p>
      *
-     * <h4>overlapRatio = 0.05 (5%)</h4>
-     * <p>表格按行切分，边界在表格行之间，非常清晰。少量重叠（5%）足够覆盖边界处
-     * 的表头信息（表头会被复制到重叠区域）。如果重叠比例过高，会导致表格数据重复，
+     * <h4>overlapTokens = 40</h4>
+     * <p>表格按行切分，边界在表格行之间，非常清晰。少量重叠（40 token）足够覆盖边界处
+     * 的表头信息（表头会被复制到重叠区域）。如果重叠量过大，会导致表格数据重复，
      * 降低检索精度。</p>
      *
      * <h4>enableSemantic = false</h4>
@@ -141,7 +141,7 @@ public class ChunkingConfig {
     public static final ChunkingConfig TABLE_HEAVY = ChunkingConfig.builder()
             .minTokens(100)
             .maxTokens(800)
-            .overlapRatio(0.05)
+            .overlapTokens(40)
             .enableSemantic(false)
             .semanticThreshold(0.7)
             .build();
@@ -161,10 +161,10 @@ public class ChunkingConfig {
      * LlamaIndex 默认 chunk_size=1024 token。此处取 512 是折中方案，
      * 兼顾检索精度（小 chunk）和语义完整（大 chunk）。</p>
      *
-     * <h4>overlapRatio = 0.1 (10%)</h4>
-     * <p>10% 是通用文档切分的业界默认值。参考：LangChain RecursiveCharacterTextSplitter
-     * 默认 chunk_overlap=200 字符 / chunk_size=1000 字符 = 20%，但 10% 对于有标题结构的
-     * 通用文档更合适，因为标题边界天然提供了切分点，重叠需求更低。</p>
+     * <h4>overlapTokens = 50</h4>
+     * <p>50 token 是通用文档切分的业界默认经验值（约 512 × 10%）。参考：LangChain
+     * RecursiveCharacterTextSplitter 默认 chunk_overlap 约为 chunk_size 的 10%，
+     * 对于有标题结构的通用文档更合适，因为标题边界天然提供了切分点，重叠需求更低。</p>
      *
      * <h4>enableSemantic = false</h4>
      * <p>通用文档的递归切分（基于标题层级 + token 约束）已足够覆盖大多数场景。
@@ -176,7 +176,7 @@ public class ChunkingConfig {
     public static final ChunkingConfig GENERAL = ChunkingConfig.builder()
             .minTokens(100)
             .maxTokens(512)
-            .overlapRatio(0.1)
+            .overlapTokens(50)
             .enableSemantic(false)
             .semanticThreshold(0.7)
             .build();
@@ -195,9 +195,9 @@ public class ChunkingConfig {
      * 参考：试卷文档建议 chunk_size 在 512-1024 之间，
      * 因为每道题是独立检索单元，过大会导致检索结果包含不相关题目。</p>
      *
-     * <h4>overlapRatio = 0.15 (15%)</h4>
+     * <h4>overlapTokens = 120</h4>
      * <p>试题间有关联：阅读理解中多道题共享同一篇文章，完形填空中上下文连贯。
-     * 15% 重叠略高于通用文档的 10%，保证上下文衔接，但低于法律文档的 25%，
+     * 120 token 重叠略高于通用文档，保证上下文衔接，但低于法律文档，
      * 因为试题的边界仍然清晰（题目编号、选项标记）。</p>
      *
      * <h4>enableSemantic = false</h4>
@@ -210,7 +210,7 @@ public class ChunkingConfig {
     public static final ChunkingConfig EXAM_PAPER = ChunkingConfig.builder()
             .minTokens(200)
             .maxTokens(800)
-            .overlapRatio(0.15)
+            .overlapTokens(120)
             .enableSemantic(false)
             .semanticThreshold(0.7)
             .build();

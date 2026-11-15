@@ -30,7 +30,7 @@ public class KnowledgeBaseRequest {
     @NotNull(message = "重叠长度不能为空")
     private Integer overlapLength;
 
-    /** 切片策略，默认 RECURSIVE */
+    /** 切片策略（AUTO/RECURSIVE/SENTENCE/PARAGRAPH/LINE），默认 AUTO */
     private String splitStrategy;
 
     /** 向量模型，默认 text-embedding-3-small */

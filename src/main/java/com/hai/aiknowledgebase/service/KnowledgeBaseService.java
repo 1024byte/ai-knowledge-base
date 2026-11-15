@@ -2,6 +2,8 @@ package com.hai.aiknowledgebase.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.hai.aiknowledgebase.common.Role;
+import com.hai.aiknowledgebase.common.SplitStrategy;
+import com.hai.aiknowledgebase.dto.ChunkingParams;
 import com.hai.aiknowledgebase.dto.KnowledgeBaseRequest;
 import com.hai.aiknowledgebase.dto.KnowledgeBaseVO;
 import com.hai.aiknowledgebase.entity.ChatHistory;
@@ -68,7 +70,7 @@ public class KnowledgeBaseService {
      * <h4>默认值</h4>
      * <table>
      *   <tr><th>参数</th><th>未传时的默认值</th></tr>
-     *   <tr><td>splitStrategy</td><td>RECURSIVE</td></tr>
+     *   <tr><td>splitStrategy</td><td>AUTO</td></tr>
      *   <tr><td>embeddingModel</td><td>text-embedding-3-small</td></tr>
      *   <tr><td>retrievalTopK</td><td>5</td></tr>
      *   <tr><td>similarityThreshold</td><td>0.7</td></tr>
@@ -107,7 +109,9 @@ public class KnowledgeBaseService {
 
         KnowledgeBaseConfig config = new KnowledgeBaseConfig();
         config.setKbId(kb.getId());
-        config.setSplitStrategy(request.getSplitStrategy() != null ? request.getSplitStrategy() : "RECURSIVE");
+        String splitStrategy = request.getSplitStrategy() != null ? request.getSplitStrategy() : SplitStrategy.AUTO.name();
+        validateSplitStrategy(splitStrategy);
+        config.setSplitStrategy(splitStrategy);
         config.setEmbeddingModel(request.getEmbeddingModel() != null ? request.getEmbeddingModel() : "text-embedding-3-small");
         config.setRetrievalTopK(request.getRetrievalTopK() != null ? request.getRetrievalTopK() : 5);
         config.setSimilarityThreshold(request.getSimilarityThreshold() != null ? request.getSimilarityThreshold() : 0.7);
@@ -164,7 +168,10 @@ public class KnowledgeBaseService {
 
         KnowledgeBaseConfig config = knowledgeBaseConfigMapper.selectById(id);
         if (config != null) {
-            if (request.getSplitStrategy() != null) config.setSplitStrategy(request.getSplitStrategy());
+            if (request.getSplitStrategy() != null) {
+                validateSplitStrategy(request.getSplitStrategy());
+                config.setSplitStrategy(request.getSplitStrategy());
+            }
             if (request.getEmbeddingModel() != null) config.setEmbeddingModel(request.getEmbeddingModel());
             if (request.getRetrievalTopK() != null) config.setRetrievalTopK(request.getRetrievalTopK());
             if (request.getSimilarityThreshold() != null) config.setSimilarityThreshold(request.getSimilarityThreshold());
@@ -202,6 +209,38 @@ public class KnowledgeBaseService {
      */
     public KnowledgeBase findById(Long id) {
         return knowledgeBaseMapper.selectById(id);
+    }
+
+    /**
+     * <h3>获取知识库切片参数</h3>
+     *
+     * <p>聚合切片流程所需的全部知识库级参数：切片策略（{@code knowledge_base_config} 表）、
+     * 切片长度与重叠长度（{@code knowledge_base} 表）。未配置或未知策略统一回退 {@code AUTO}，
+     * 保证历史数据（可能残留非枚举值）不会导致切片失败。</p>
+     *
+     * @param kbId 知识库 ID
+     * @return 切片参数（splitStrategy / chunkLength / overlapLength）
+     */
+    public ChunkingParams getChunkingParams(Long kbId) {
+        KnowledgeBaseConfig config = knowledgeBaseConfigMapper.selectById(kbId);
+        String splitStrategy = (config != null) ? config.getSplitStrategy() : null;
+        KnowledgeBase kb = knowledgeBaseMapper.selectById(kbId);
+        Integer chunkLength = (kb != null) ? kb.getChunkLength() : null;
+        Integer overlapLength = (kb != null) ? kb.getOverlapLength() : null;
+        return new ChunkingParams(SplitStrategy.from(splitStrategy).name(), chunkLength, overlapLength);
+    }
+
+    /**
+     * <h3>校验切片策略合法性</h3>
+     *
+     * @param splitStrategy 待校验的切片策略存储值
+     * @throws BusinessException 非法值时抛出
+     */
+    private void validateSplitStrategy(String splitStrategy) {
+        if (!SplitStrategy.isValid(splitStrategy)) {
+            throw new BusinessException(400, "无效的切片策略: " + splitStrategy
+                    + "，可选值: AUTO / RECURSIVE / SENTENCE / PARAGRAPH / LINE");
+        }
     }
 
     /**

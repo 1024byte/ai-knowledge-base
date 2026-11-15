@@ -2,6 +2,7 @@ package com.hai.aiknowledgebase.service;
 
 import com.hai.aiknowledgebase.common.CustomDocument;
 import com.hai.aiknowledgebase.common.FileUtils;
+import com.hai.aiknowledgebase.common.SplitStrategy;
 import com.hai.aiknowledgebase.config.ThresholdsConfig;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.DocumentSplitter;
@@ -33,8 +34,8 @@ public class DocumentChunkerService implements DocumentSplitter {
     @Value("${document.chunk.max-tokens:800}")
     private int maxTokens;
 
-    @Value("${document.chunk.overlap-ratio:0.2}")
-    private double overlapRatio;
+    @Value("${document.chunk.overlap-tokens:160}")
+    private int overlapTokens;
 
     private final ThresholdsConfig thresholdsConfig;
 
@@ -46,14 +47,19 @@ public class DocumentChunkerService implements DocumentSplitter {
 
     private final DocumentRouter documentRouter;
 
+    // 通用切分器（RECURSIVE/SENTENCE/PARAGRAPH/LINE 手动策略落点）
+    private final GenericDocumentChunker genericDocumentChunker;
+
     // 构造器注入（Spring 4.3+ 自动注入，无需 @Autowired）
     public DocumentChunkerService(TokenCountEstimator tokenEstimator,
                                   EmbeddingModel embeddingModel,
                                   DocumentRouter documentRouter,
+                                  GenericDocumentChunker genericDocumentChunker,
                                   ThresholdsConfig thresholdsConfig) {
         this.tokenCountEstimator = tokenEstimator;
         this.embeddingModel = embeddingModel;
         this.documentRouter = documentRouter;
+        this.genericDocumentChunker = genericDocumentChunker;
         this.thresholdsConfig = thresholdsConfig;
     }
 
@@ -88,6 +94,27 @@ public class DocumentChunkerService implements DocumentSplitter {
         }
     }
 
+    /**
+     * <h3>按切片策略分派</h3>
+     *
+     * <p>知识库文档切片的统一入口：{@code AUTO} 走内容路由（按文档内容自动识别推荐），
+     * 其余四种手动策略走通用切分器，保证预览、快速切片、正式向量化三处结果一致。</p>
+     *
+     * @param customDocument 待切分文档（含文件名/格式/内容）
+     * @param splitStrategy  切片策略存储值（枚举名或 code，未知值回退 AUTO）
+     * @param chunkLength    知识库切片长度（token），AUTO 与手动策略统一生效
+     * @param overlapLength  知识库重叠长度（token），AUTO 与手动策略统一生效
+     * @return 切分后的 Chunk 列表
+     */
+    public List<MarkdownDocumentChunker.Chunk> chunkByStrategy(CustomDocument customDocument, String splitStrategy,
+                                                              Integer chunkLength, Integer overlapLength) {
+        SplitStrategy strategy = SplitStrategy.from(splitStrategy);
+        if (strategy == SplitStrategy.AUTO) {
+            return documentRouter.route(customDocument, chunkLength, overlapLength);
+        }
+        return genericDocumentChunker.chunk(customDocument.getContent(), strategy, chunkLength, overlapLength);
+    }
+
     // ======================== LangChain4j DocumentSplitter 接口实现 ========================
 
     @Override
@@ -102,7 +129,7 @@ public class DocumentChunkerService implements DocumentSplitter {
                 .content(document.text())
                 .format(CustomDocument.Format.fromString(extension)).build();
 
-        List<MarkdownDocumentChunker.Chunk> chunks = documentRouter.route(customDocument);
+        List<MarkdownDocumentChunker.Chunk> chunks = documentRouter.route(customDocument, null, null);
 
         String text = document.text();
 
@@ -136,7 +163,7 @@ public class DocumentChunkerService implements DocumentSplitter {
         return new MarkdownDocumentChunker(
                 minTokens,
                 maxTokens,
-                overlapRatio,
+                overlapTokens,
                 tokenCountEstimator ,
                 embeddingModel,
                 thresholdsConfig.getChunking().getSemantic()

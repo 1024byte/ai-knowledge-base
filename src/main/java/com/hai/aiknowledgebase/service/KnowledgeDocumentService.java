@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.hai.aiknowledgebase.common.CustomDocument;
 import com.hai.aiknowledgebase.common.HashType;
 import com.hai.aiknowledgebase.common.Role;
+import com.hai.aiknowledgebase.dto.ChunkingParams;
 import com.hai.aiknowledgebase.dto.KnowledgeDocumentChunksVO;
 import com.hai.aiknowledgebase.dto.KnowledgeDocumentContentUpdateDTO;
 import com.hai.aiknowledgebase.dto.KnowledgeDocumentContentVO;
@@ -734,7 +735,7 @@ public class KnowledgeDocumentService {
      *   <li>校验 parsedTextUrl 非空 → 400 "请先完成文档解析"</li>
      *   <li>校验 status=2（解析完成）→ 400 "文档未完成解析，无法切片"</li>
      *   <li>读取 parsedTextUrl 中 Markdown 文本 → 400 "解析文件已丢失"</li>
-     *   <li>调用 {@code documentChunkerService.chunk(markdown)} 切片</li>
+     *   <li>按知识库切片策略切片（{@code AUTO} 走内容路由，其余走通用切分器）</li>
      *   <li>转换 Chunk → {@link KnowledgeDocumentChunksVO.ChunkItem} 列表</li>
      * </ol>
      *
@@ -794,7 +795,7 @@ public class KnowledgeDocumentService {
         log.info("开始切片: documentId={}, fileName={}, chars={}",
                 documentId, doc.getFileName(), markdown.length());
 
-        List<MarkdownDocumentChunker.Chunk> chunks = documentChunkerService.chunk(markdown);
+        List<MarkdownDocumentChunker.Chunk> chunks = chunkWithStrategy(doc, markdown);
         log.info("切片完成: documentId={}, totalChunks={}",
                 documentId, chunks.size());
 
@@ -817,6 +818,28 @@ public class KnowledgeDocumentService {
         vo.setChunks(items);
 
         return vo;
+    }
+
+    /**
+     * <h3>按知识库切片参数对文档内容切片</h3>
+     *
+     * <p>读取文档所属知识库的切片参数（策略 / 切片长度 / 重叠长度），构建
+     * {@link CustomDocument} 后交给 {@code documentChunkerService.chunkByStrategy}
+     * 分派，保证预览、快速切片、正式向量化三处切片结果一致。</p>
+     *
+     * @param doc      目标文档实体（提供文件名/格式/所属知识库）
+     * @param markdown 已解析的文档文本
+     * @return 切分后的 Chunk 列表
+     */
+    private List<MarkdownDocumentChunker.Chunk> chunkWithStrategy(KnowledgeDocument doc, String markdown) {
+        ChunkingParams params = knowledgeBaseService.getChunkingParams(doc.getKbId());
+        CustomDocument customDocument = CustomDocument.builder()
+                .fileName(doc.getFileName())
+                .format(CustomDocument.Format.fromString(doc.getFileExt()))
+                .content(markdown)
+                .build();
+        return documentChunkerService.chunkByStrategy(customDocument, params.getSplitStrategy(),
+                params.getChunkLength(), params.getOverlapLength());
     }
 
     /**
@@ -1047,7 +1070,7 @@ public class KnowledgeDocumentService {
         log.info("快速切片: documentId={}, fileName={}, chars={}",
                 documentId, doc.getFileName(), markdown.length());
 
-        List<MarkdownDocumentChunker.Chunk> chunks = documentChunkerService.chunk(markdown);
+        List<MarkdownDocumentChunker.Chunk> chunks = chunkWithStrategy(doc, markdown);
 
         LambdaQueryWrapper<KnowledgeDocumentChunk> deleteWrapper = new LambdaQueryWrapper<>();
         deleteWrapper.eq(KnowledgeDocumentChunk::getDocumentId, documentId);
@@ -1336,6 +1359,10 @@ public class KnowledgeDocumentService {
             throw new BusinessException(400, "文档已向量化，如需重新解析请先重新保存切片");
         }
 
+        if (Integer.valueOf(1).equals(doc.getIsVectorized())) {
+            throw new BusinessException(400, "向量化任务正在进行中，请稍后再试");
+        }
+
         log.info("启动文档解析: id={}, fileUrl={}", documentId, fileUrl);
 
         // 立即更新状态为"处理中"，让前端轮询时看到变化
@@ -1361,6 +1388,7 @@ public class KnowledgeDocumentService {
      *   <li>下载/读取原始文件（本地路径 or 远程 URL → 临时文件）</li>
      *   <li>调用 {@link DocumentParserService#parseDocument} 解析为 Markdown</li>
      *   <li>Markdown 写入 {@code parse/{documentId}.md}</li>
+     *   <li>清理旧切片（重新解析后旧切片已失效）</li>
      *   <li>更新 {@code parsed_text_url} + status=2（已完成）</li>
      * </ol>
      *
@@ -1408,7 +1436,14 @@ public class KnowledgeDocumentService {
             Files.writeString(mdFilePath, markdownContent, StandardCharsets.UTF_8);
             log.info("Markdown 已保存: {}", mdFilePath);
 
-            // ===== 4. 更新数据库 —— 解析成功 =====
+            // ===== 4. 清理旧切片（重新解析后旧切片已失效） =====
+            LambdaQueryWrapper<KnowledgeDocumentChunk> chunkDeleteWrapper = new LambdaQueryWrapper<>();
+            chunkDeleteWrapper.eq(KnowledgeDocumentChunk::getDocumentId, documentId);
+            knowledgeDocumentChunkMapper.delete(chunkDeleteWrapper);
+            doc.setChunkCount(0);
+            doc.setTokenCount(0);
+
+            // ===== 5. 更新数据库 —— 解析成功 =====
             doc.setParsedTextUrl(mdFilePath.toString());
             doc.setStatus(2);
             doc.setErrorMessage(null);

@@ -593,11 +593,24 @@ public class HybridSearchService {
      * @param topK  返回结果数量上限
      * @return 带 BM25 分数的排序结果列表
      */
-    private List<RankedResult> keywordSearchRanked(String query, int topK, Set<Long> kbIds) {
+    public List<RankedResult> keywordSearchRanked(String query, int topK, Set<Long> kbIds) {
+        return keywordSearchRanked(query, topK, kbIds, null);
+    }
+
+    /**
+     * <h3>关键词检索（带分数，支持知识库与文档范围过滤）</h3>
+     *
+     * <p>在既有 kbIds 知识库隔离基础上，增加 documentIds 文档范围过滤。
+     * 返回的 TextSegment 元数据会额外携带 {@code chunk_id}（片段主键），
+     * 供下游 RRF 融合以片段主键为去重键时使用。</p>
+     */
+    public List<RankedResult> keywordSearchRanked(String query, int topK, Set<Long> kbIds, Set<Long> documentIds) {
         try {
             // 步骤1：在 BM25 倒排索引中检索，返回 (docId, BM25分数) 的有序列表
             // kbIds == null 表示不过滤；空集合表示无可见知识库；否则按 kbId 前缀集合过滤
-            List<Map.Entry<String, Double>> entries = keywordIndex.search(query, topK, kbIds);
+            Map<Long, Long> chunkIdToDocumentId = loadChunkIdToDocumentId(documentIds);
+            List<Map.Entry<String, Double>> entries =
+                    keywordIndex.search(query, topK, kbIds, documentIds, chunkIdToDocumentId);
 
             List<RankedResult> results = new ArrayList<>();
             for (var entry : entries) {
@@ -611,11 +624,15 @@ public class HybridSearchService {
                 // docId 格式: "sourceFileName_chunkIndex"，如 "时态.md_5"
                 String source = extractSourceFromDocId(docId);
 
-                // 步骤4：包装为 TextSegment，与向量检索结果格式统一
-                TextSegment segment = TextSegment.from(text,
-                        new dev.langchain4j.data.document.Metadata()
-                                .put("source", source)
-                                .put("doc_id", docId));
+                // 步骤4：包装为 TextSegment，与向量检索结果格式统一，并附带 chunk_id 主键
+                dev.langchain4j.data.document.Metadata metadata = new dev.langchain4j.data.document.Metadata()
+                        .put("source", source)
+                        .put("doc_id", docId);
+                Long chunkId = parseChunkIdFromDocId(docId);
+                if (chunkId != null) {
+                    metadata.put("chunk_id", String.valueOf(chunkId));
+                }
+                TextSegment segment = TextSegment.from(text, metadata);
 
                 results.add(new RankedResult(segment, entry.getValue()));
             }
@@ -624,6 +641,49 @@ public class HybridSearchService {
             log.error("关键词检索失败", e);
             return Collections.emptyList();
         }
+    }
+
+    /**
+     * 从 BM25 docId（格式 {@code "kbId_source_chunkId"}）中解析片段主键（最后一个下划线之后）。
+     * 解析失败返回 null。
+     */
+    private Long parseChunkIdFromDocId(String docId) {
+        if (docId == null || docId.isEmpty()) {
+            return null;
+        }
+        int idx = docId.lastIndexOf('_');
+        if (idx < 0 || idx == docId.length() - 1) {
+            return null;
+        }
+        try {
+            return Long.parseLong(docId.substring(idx + 1));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 构建「片段主键 → 文档 ID」映射，供关键词检索按文档范围过滤。
+     *
+     * @param documentIds 文档 ID 集合（null/空返回空映射）
+     */
+    private Map<Long, Long> loadChunkIdToDocumentId(Set<Long> documentIds) {
+        if (documentIds == null || documentIds.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        String inClause = documentIds.stream().map(String::valueOf).collect(Collectors.joining(","));
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(
+                "SELECT id, document_id FROM knowledge_document_chunk WHERE document_id IN (" + inClause + ")");
+        Map<Long, Long> map = new HashMap<>();
+        for (Map<String, Object> row : rows) {
+            Object id = row.get("id");
+            Object documentId = row.get("document_id");
+            if (id == null || documentId == null) {
+                continue;
+            }
+            map.put(((Number) id).longValue(), ((Number) documentId).longValue());
+        }
+        return map;
     }
 
     // ==================== RRF 融合算法 ====================
@@ -717,6 +777,63 @@ public class HybridSearchService {
                     return new RankedResult(original.getSegment(), entry.getValue());
                 })
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * <h3>RRF 融合（以片段主键为去重键，供召回测试等观测场景使用）</h3>
+     *
+     * <p>与生产链路 {@link #reciprocalRankFusion} 的不同点：去重键使用片段主键
+     * {@code chunk_id}（而非文本前缀 + source），避免内容高度相似但主键不同的片段被误合并。
+     * 缺少 {@code chunk_id} 的片段会被跳过，无法参与融合。</p>
+     *
+     * @param vectorResults   向量检索结果（按相似度降序）
+     * @param keywordResults  关键词检索结果（按 BM25 分数降序）
+     * @param topK            最终返回结果数量上限
+     * @param rrfK            RRF 平滑参数
+     * @return RRF 融合排序后的结果列表
+     */
+    public List<RankedResult> fuseRanked(List<RankedResult> vectorResults, List<RankedResult> keywordResults,
+                                         int topK, int rrfK) {
+        Map<String, RankedResult> allResults = new LinkedHashMap<>();
+        Map<String, Double> rrfScores = new HashMap<>();
+
+        for (int i = 0; i < vectorResults.size(); i++) {
+            String key = fusionKey(vectorResults.get(i).getSegment());
+            if (key == null) {
+                continue;
+            }
+            allResults.putIfAbsent(key, vectorResults.get(i));
+            rrfScores.merge(key, 1.0 / (rrfK + i + 1), Double::sum);
+        }
+
+        for (int i = 0; i < keywordResults.size(); i++) {
+            String key = fusionKey(keywordResults.get(i).getSegment());
+            if (key == null) {
+                continue;
+            }
+            allResults.putIfAbsent(key, keywordResults.get(i));
+            rrfScores.merge(key, 1.0 / (rrfK + i + 1), Double::sum);
+        }
+
+        return rrfScores.entrySet().stream()
+                .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
+                .limit(topK)
+                .map(entry -> {
+                    RankedResult original = allResults.get(entry.getKey());
+                    return new RankedResult(original.getSegment(), entry.getValue());
+                })
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * 生成 RRF 融合去重键：优先使用片段主键 {@code chunk_id}，缺失时返回 null（跳过融合）。
+     */
+    private String fusionKey(TextSegment segment) {
+        String chunkId = segment.metadata().getString("chunk_id");
+        if (chunkId == null || chunkId.isBlank()) {
+            return null;
+        }
+        return "chunk:" + chunkId;
     }
 
     // ==================== 辅助方法 ====================

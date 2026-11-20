@@ -85,7 +85,7 @@ public class RecallTestResponse {
         /** 片段文本内容 */
         private String content;
 
-        /** 得分：fusion 为 RRF 分数，vector/bm25 为相似度（0~1） */
+        /** 得分：fusion 为 RRF 分数（Rerank 关闭时经 content_type 降权），vector/bm25 为相似度（0~1） */
         private Double score;
 
         /** 向量召回排名，仅 fusion 列表填充，单路未命中为 null */
@@ -94,7 +94,7 @@ public class RecallTestResponse {
         /** BM25 召回排名，仅 fusion 列表填充，单路未命中为 null */
         private Integer bm25Rank;
 
-        /** Rerank 精排得分（Cross-Encoder 输出，非 0~1 相似度） */
+        /** Rerank 精排得分（Cross-Encoder 输出经 content_type 降权后，非 0~1 相似度） */
         private Double rerankScore;
 
         /** 粗排排名（原 RRF/fusion 排名，1-based） */

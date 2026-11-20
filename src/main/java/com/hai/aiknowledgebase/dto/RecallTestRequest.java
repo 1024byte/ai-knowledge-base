@@ -47,7 +47,11 @@ public class RecallTestRequest {
     @Builder.Default
     private boolean enableRerank = false;
 
-    /** Rerank 阈值，范围 0~1，低于该 Rerank 得分的片段将被过滤；仅 enableRerank=true 时生效 */
+    /** Rerank 阈值（Cross-Encoder 原始 logits），默认 -4.5，低于该分的片段将被过滤；仅 enableRerank=true 时生效 */
     @Builder.Default
-    private Double rerankThreshold = 0.5;
+    private Double rerankThreshold = -4.5;
+
+    /** 排除关键词列表，空 = 不过滤；与智慧问答生产链路的排除词过滤保持一致 */
+    @Builder.Default
+    private List<String> excludeKeywords = new ArrayList<>();
 }

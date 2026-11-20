@@ -1,6 +1,7 @@
 package com.hai.aiknowledgebase.controller;
 
 import com.hai.aiknowledgebase.common.Result;
+import com.hai.aiknowledgebase.config.ThresholdsConfig;
 import com.hai.aiknowledgebase.dto.RecallTestRequest;
 import com.hai.aiknowledgebase.dto.RecallTestResponse;
 import com.hai.aiknowledgebase.exception.BusinessException;
@@ -27,6 +28,7 @@ public class RecallTestController {
     private static final Set<String> STRATEGIES = Set.of("hybrid", "vector", "bm25");
 
     private final RecallTestService recallTestService;
+    private final ThresholdsConfig thresholdsConfig;
 
     @PostMapping("/run")
     public Result<RecallTestResponse> run(@RequestBody RecallTestRequest request) {
@@ -75,10 +77,10 @@ public class RecallTestController {
 
             if (request.isEnableRerank()) {
                 if (request.getRerankThreshold() == null) {
-                    request.setRerankThreshold(0.5);
+                    request.setRerankThreshold(thresholdsConfig.getReranker().getMinScore());
                 }
-                if (request.getRerankThreshold() < 0 || request.getRerankThreshold() > 1) {
-                    throw new BusinessException(400, "rerankThreshold 必须在 0~1 之间");
+                if (request.getRerankThreshold() < -100 || request.getRerankThreshold() > 100) {
+                    throw new BusinessException(400, "rerankThreshold 非法（Cross-Encoder 原始 logits，通常 -20~20 之间）");
                 }
             }
         }

@@ -25,6 +25,8 @@ import java.util.List;
  *   <tr><td>POST</td><td>/api/knowledge-documents/chunks/merge</td><td>合并多个片段</td></tr>
  *   <tr><td>POST</td><td>/api/knowledge-documents/chunks/split</td><td>拆分片段</td></tr>
  *   <tr><td>PUT</td><td>/api/knowledge-documents/chunks/enabled</td><td>批量启停片段（召回过滤）</td></tr>
+ *   <tr><td>DELETE</td><td>/api/knowledge-documents/chunks/{chunkId}</td><td>删除单个片段</td></tr>
+ *   <tr><td>POST</td><td>/api/knowledge-documents/chunks/{chunkId}/revectorize</td><td>重新向量化单个片段</td></tr>
  * </table>
  */
 @Slf4j
@@ -104,5 +106,31 @@ public class KnowledgeDocumentChunkController {
                 dto != null ? dto.getChunkIds() : null, dto != null ? dto.getEnabled() : null);
         List<KnowledgeDocumentChunksVO.ChunkItem> items = knowledgeDocumentService.setChunksEnabled(dto);
         return Result.success(items);
+    }
+
+    /**
+     * <h3>删除单个片段（精细化干预）</h3>
+     *
+     * <p>物理删除片段，同步清理 BM25 索引、异步清理向量，删除后重排剩余片段序号
+     * 并重算文档 chunkCount/tokenCount；若删光全部片段则将文档重置为「待向量化」。</p>
+     */
+    @DeleteMapping("/{chunkId}")
+    public Result<Void> deleteChunk(@PathVariable Long chunkId) {
+        log.info("删除片段: chunkId={}", chunkId);
+        knowledgeDocumentService.deleteChunk(chunkId);
+        return Result.success();
+    }
+
+    /**
+     * <h3>重新向量化单个片段（手动触发）</h3>
+     *
+     * <p>异步删除旧向量重新嵌入并重建 BM25 索引，向上聚合文档状态。
+     * 片段正在处理中时返回 400。</p>
+     */
+    @PostMapping("/{chunkId}/revectorize")
+    public Result<Void> revectorizeChunk(@PathVariable Long chunkId) {
+        log.info("重新向量化片段: chunkId={}", chunkId);
+        knowledgeDocumentService.revectorizeChunk(chunkId);
+        return Result.success();
     }
 }

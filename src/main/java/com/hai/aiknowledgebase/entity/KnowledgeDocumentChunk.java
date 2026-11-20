@@ -61,6 +61,9 @@ public class KnowledgeDocumentChunk {
     /** 是否启用：true=可被检索召回，false=禁用（检索时过滤） */
     private Boolean enabled;
 
+    /** 片段向量化状态：0=待处理, 1=处理中, 2=已完成, 3=失败 */
+    private Integer vectorStatus;
+
     @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createdAt;
 

@@ -42,6 +42,8 @@ public class VectorStoreConfig {
                 .dimension(dimension)
                 .createTable(true)
                 .dropTableFirst(false)
+                .useIndex(true)    // 创建 IVFFlat 向量索引，加速 ANN 近似最近邻检索
+                .indexListSize(100)    // IVFFlat 的 lists 参数（开启 useIndex 时必须 > 0）
                 .build();
     }
     @Bean
@@ -52,7 +54,7 @@ public class VectorStoreConfig {
 
         // 2. 直接使用构造函数创建 OnnxEmbeddingModel 实例
         //    构造函数：OnnxEmbeddingModel(pathToModel, pathToTokenizer, poolingMode)[reference:5][reference:6]
-        return new OnnxEmbeddingModel(modelPath, tokenizerPath, PoolingMode.MEAN);
+        return new OnnxEmbeddingModel(modelPath, tokenizerPath, PoolingMode.CLS);
     }
 
     @Bean

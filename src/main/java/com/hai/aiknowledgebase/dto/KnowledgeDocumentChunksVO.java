@@ -59,6 +59,12 @@ public class KnowledgeDocumentChunksVO {
         /** 是否启用（检索时召回过滤），null 视为启用 */
         private Boolean enabled;
 
+        /** 片段向量化状态：0=待处理, 1=处理中, 2=已完成, 3=失败 */
+        private Integer vectorStatus;
+
+        /** 片段向量化状态文案：pending / processing / completed / failed */
+        private String vectorStatusText;
+
         /** 层级路径（如 "第一章 > 1.1 概述"） */
         private String contextPrefix;
 

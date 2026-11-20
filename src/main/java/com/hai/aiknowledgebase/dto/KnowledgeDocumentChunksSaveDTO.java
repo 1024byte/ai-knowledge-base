@@ -13,7 +13,7 @@ import java.util.List;
  * 在原有切片列表基础上新增 {@code confirm} 确认标记。</p>
  *
  * <h3>确认机制</h3>
- * <p>当文档已向量化（isVectorized == 2）时，前端需先带 {@code confirm=false}
+ * <p>当文档已向量化（isVectorized == DOC_COMPLETED，已完成）时，前端需先带 {@code confirm=false}
  * 提交，后端返回提示；用户确认后带 {@code confirm=true} 重试，才真正执行
  * 保存并清理向量化数据。</p>
  */

@@ -258,7 +258,7 @@ public class KnowledgeDocumentController {
      *   <tr><th>HTTP</th><th>message</th><th>说明</th></tr>
      *   <tr><td>404</td><td>文档不存在</td><td>documentId 无对应记录</td></tr>
      *   <tr><td>400</td><td>文档原始文件路径为空</td><td>file_url 字段为 null</td></tr>
-     *   <tr><td>400</td><td>文档已向量化，如需重新解析请先重新保存切片</td><td>isVectorized == 2</td></tr>
+     *   <tr><td>400</td><td>文档已向量化，如需重新解析请先重新保存切片</td><td>isVectorized == DOC_COMPLETED（已完成）</td></tr>
      *   <tr><td>404</td><td>原始文件不存在</td><td>本地路径下找不到文件</td></tr>
      *   <tr><td>500</td><td>文档解析失败: ...</td><td>解析引擎异常，status 已更新为 3</td></tr>
      * </table>
@@ -350,7 +350,7 @@ public class KnowledgeDocumentController {
      * <table>
      *   <tr><th>HTTP</th><th>message</th><th>说明</th></tr>
      *   <tr><td>404</td><td>文件不存在</td><td>id 无对应记录</td></tr>
-     *   <tr><td>400</td><td>文档已向量化，无法编辑</td><td>isVectorized == 2</td></tr>
+     *   <tr><td>400</td><td>文档已向量化，无法编辑</td><td>isVectorized == DOC_COMPLETED（已完成）</td></tr>
      *   <tr><td>400</td><td>请先完成文档解析</td><td>parsedTextUrl 为空</td></tr>
      *   <tr><td>400</td><td>文档未完成解析，无法编辑</td><td>status != 2</td></tr>
      *   <tr><td>400</td><td>内容不能为空</td><td>content 为空</td></tr>
@@ -499,7 +499,7 @@ public class KnowledgeDocumentController {
      *   <tr><td>404</td><td>文件不存在</td><td>id 无对应记录</td></tr>
      *   <tr><td>400</td><td>文档未完成解析，无法保存切片</td><td>status != 2</td></tr>
      *   <tr><td>400</td><td>切片列表不能为空</td><td>chunks 为空</td></tr>
-     *   <tr><td>400</td><td>文档已向量化，重新保存切片将清除向量化数据，需重新向量化</td><td>isVectorized == 2 且 confirm != true</td></tr>
+     *   <tr><td>400</td><td>文档已向量化，重新保存切片将清除向量化数据，需重新向量化</td><td>isVectorized == DOC_COMPLETED（已完成）且 confirm != true</td></tr>
      * </table>
      *
      * @param id 文档 ID
@@ -527,7 +527,7 @@ public class KnowledgeDocumentController {
      * <table>
      *   <tr><th>HTTP</th><th>message</th><th>说明</th></tr>
      *   <tr><td>404</td><td>文件不存在</td><td>id 无对应记录</td></tr>
-     *   <tr><td>400</td><td>文档已向量化，无法快速切片</td><td>isVectorized == 2</td></tr>
+     *   <tr><td>400</td><td>文档已向量化，无法快速切片</td><td>isVectorized == DOC_COMPLETED（已完成）</td></tr>
      *   <tr><td>400</td><td>文档未完成解析，无法切片</td><td>status != 2</td></tr>
      *   <tr><td>400</td><td>请先完成文档解析</td><td>parsedTextUrl 为空</td></tr>
      *   <tr><td>400</td><td>解析文件已丢失，请重新解析</td><td>解析文件不存在</td></tr>
@@ -550,7 +550,7 @@ public class KnowledgeDocumentController {
      * 返回总数、成功数和失败明细。</p>
      *
      * <h4>预检规则</h4>
-     * <p>只要列表中存在任意已向量化（isVectorized == 2）的文档，
+     * <p>只要列表中存在任意已向量化（isVectorized == DOC_COMPLETED，已完成）的文档，
      * 整个批次直接拒绝，一个都不处理。</p>
      *
      * <h4>失败明细示例</h4>
@@ -568,7 +568,7 @@ public class KnowledgeDocumentController {
      * <h4>错误码</h4>
      * <table>
      *   <tr><th>HTTP</th><th>message</th><th>说明</th></tr>
-     *   <tr><td>400</td><td>存在已向量化的文档，无法快速切片</td><td>列表中存在 isVectorized == 2 的文档</td></tr>
+     *   <tr><td>400</td><td>存在已向量化的文档，无法快速切片</td><td>列表中存在 isVectorized == DOC_COMPLETED（已完成）的文档</td></tr>
      * </table>
      *
      * @param ids 文档 ID 列表

@@ -17,9 +17,9 @@ class EmbeddingSimilarityTest {
 
     @BeforeAll
     static void setUp() throws Exception {
-        String modelPath = new ClassPathResource("models/onnx_model/model.onnx").getFile().getAbsolutePath();
-        String tokenizerPath = new ClassPathResource("models/onnx_model/tokenizer.json").getFile().getAbsolutePath();
-        embeddingModel = new OnnxEmbeddingModel(modelPath, tokenizerPath, PoolingMode.MEAN);
+        String modelPath = new ClassPathResource("models/bge-base-zh-v1.5/model.onnx").getFile().getAbsolutePath();
+        String tokenizerPath = new ClassPathResource("models/bge-base-zh-v1.5/tokenizer.json").getFile().getAbsolutePath();
+        embeddingModel = new OnnxEmbeddingModel(modelPath, tokenizerPath, PoolingMode.CLS);
     }
 
     @Test

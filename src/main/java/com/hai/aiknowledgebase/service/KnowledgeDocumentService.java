@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.hai.aiknowledgebase.common.CustomDocument;
 import com.hai.aiknowledgebase.common.HashType;
 import com.hai.aiknowledgebase.common.Role;
+import com.hai.aiknowledgebase.common.VectorStatus;
 import com.hai.aiknowledgebase.dto.*;
 import com.hai.aiknowledgebase.entity.KnowledgeBase;
 import com.hai.aiknowledgebase.entity.KnowledgeDocument;
@@ -635,7 +636,7 @@ public class KnowledgeDocumentService {
      * <h4>执行步骤</h4>
      * <ol>
      *   <li>查询文档 → 404 "文件不存在"</li>
-     *   <li>校验未向量化（isVectorized != 2）→ 400 "文档已向量化，无法编辑"</li>
+     *   <li>校验未向量化（isVectorized != DOC_COMPLETED，已完成）→ 400 "文档已向量化，无法编辑"</li>
      *   <li>校验 parsedTextUrl 非空 → 400 "请先完成文档解析"</li>
      *   <li>校验 status=2 → 400 "文档未完成解析，无法编辑"</li>
      *   <li>校验 content 非空 → 400 "内容不能为空"</li>
@@ -662,7 +663,7 @@ public class KnowledgeDocumentService {
         }
         checkDocumentPermission(doc, Role.EDITOR);
 
-        if (Integer.valueOf(2).equals(doc.getIsVectorized())) {
+        if (isDocumentVectorized(doc.getIsVectorized())) {
             throw new BusinessException(400, "文档已向量化，无法编辑");
         }
 
@@ -711,7 +712,7 @@ public class KnowledgeDocumentService {
         // ===== 3. 重置文档统计与向量化状态 =====
         doc.setChunkCount(0);
         doc.setTokenCount(0);
-        doc.setIsVectorized(0);
+        doc.setIsVectorized(VectorStatus.DOC_PENDING);
         knowledgeDocumentMapper.updateById(doc);
 
         log.info("解析内容保存完成: documentId={}, fileName={}, chars={}",
@@ -879,6 +880,8 @@ public class KnowledgeDocumentService {
         item.setText(chunk.getText());
         item.setTokenCount(chunk.getTokenCount() != null ? chunk.getTokenCount() : 0);
         item.setEnabled(chunk.getEnabled() == null || chunk.getEnabled());
+        item.setVectorStatus(chunk.getVectorStatus());
+        item.setVectorStatusText(mapChunkVectorStatus(chunk.getVectorStatus()));
         item.setContextPrefix(chunk.getContextPrefix());
 
         Map<String, String> meta = new java.util.HashMap<>();
@@ -909,7 +912,7 @@ public class KnowledgeDocumentService {
      *   <li>查询文档 → 404</li>
      *   <li>校验 status=2（解析完成）→ 400 "文档未完成解析，无法保存切片"</li>
      *   <li>校验切片列表非空 → 400 "切片列表不能为空"</li>
-     *   <li>已向量化（isVectorized == 2）且未确认 → 400 "文档已向量化，重新保存切片将清除向量化数据，需重新向量化"</li>
+     *   <li>已向量化（isVectorized == DOC_COMPLETED，已完成）且未确认 → 400 "文档已向量化，重新保存切片将清除向量化数据，需重新向量化"</li>
      *   <li>清理该文档向量化数据（PGVector + BM25 索引）</li>
      *   <li>删除该文档下所有旧切片（先删后插 = 全量覆盖）</li>
      *   <li>按数组顺序插入新切片，chunkIndex 从 0 开始递增</li>
@@ -947,7 +950,7 @@ public class KnowledgeDocumentService {
             throw new BusinessException(400, "切片列表不能为空");
         }
 
-        if (Integer.valueOf(2).equals(doc.getIsVectorized()) && !confirm) {
+        if (isDocumentVectorized(doc.getIsVectorized()) && !confirm) {
             throw new BusinessException(400, "文档已向量化，重新保存切片将清除向量化数据，需重新向量化");
         }
 
@@ -978,6 +981,7 @@ public class KnowledgeDocumentService {
             chunk.setTokenCount(item.getTokenCount());
             chunk.setContextPrefix(item.getContextPrefix());
             chunk.setEnabled(item.getEnabled() == null || item.getEnabled());
+            chunk.setVectorStatus(VectorStatus.CHUNK_PENDING);
 
             Map<String, String> meta = item.getMetadata();
             if (meta != null) {
@@ -999,7 +1003,7 @@ public class KnowledgeDocumentService {
 
         doc.setChunkCount(chunks.size());
         doc.setTokenCount(totalTokens);
-        doc.setIsVectorized(0);
+        doc.setIsVectorized(VectorStatus.DOC_PENDING);
         knowledgeDocumentMapper.updateById(doc);
 
         log.info("切片保存完成: documentId={}, chunkCount={}, totalTokens={}",
@@ -1046,7 +1050,7 @@ public class KnowledgeDocumentService {
         }
         checkDocumentPermission(doc, Role.EDITOR);
 
-        if (Integer.valueOf(2).equals(doc.getIsVectorized())) {
+        if (isDocumentVectorized(doc.getIsVectorized())) {
             throw new BusinessException(400, "文档已向量化，无法快速切片");
         }
 
@@ -1098,6 +1102,7 @@ public class KnowledgeDocumentService {
             chunk.setTokenCount(c.tokenCount());
             chunk.setContextPrefix(c.contextPrefix());
             chunk.setEnabled(true);
+            chunk.setVectorStatus(VectorStatus.CHUNK_PENDING);
 
             Map<String, String> meta = c.metadata();
             if (meta != null) {
@@ -1115,7 +1120,7 @@ public class KnowledgeDocumentService {
 
         doc.setChunkCount(chunks.size());
         doc.setTokenCount(totalTokens);
-        doc.setIsVectorized(0);
+        doc.setIsVectorized(VectorStatus.DOC_PENDING);
         knowledgeDocumentMapper.updateById(doc);
 
         log.info("快速切片完成: documentId={}, fileName={}, chunkCount={}, totalTokens={}",
@@ -1129,7 +1134,7 @@ public class KnowledgeDocumentService {
      * 只记录失败明细，不中断其他文档的处理（best-effort）。</p>
      *
      * <h4>预检规则</h4>
-     * <p>开始处理前预检，只要列表中存在任意已向量化（isVectorized == 2）的文档，
+     * <p>开始处理前预检，只要列表中存在任意已向量化（isVectorized == DOC_COMPLETED，已完成）的文档，
      * 整个批次直接拒绝，一个都不处理。</p>
      *
      * @param documentIds 文档 ID 列表
@@ -1142,7 +1147,7 @@ public class KnowledgeDocumentService {
             KnowledgeDocument doc = knowledgeDocumentMapper.selectById(id);
             if (doc != null) {
                 checkDocumentPermission(doc, Role.EDITOR);
-                if (Integer.valueOf(2).equals(doc.getIsVectorized())) {
+                if (isDocumentVectorized(doc.getIsVectorized())) {
                     log.warn("批量快速切片被拒绝: 存在已向量化文档, id={}", id);
                     throw new BusinessException(400, "存在已向量化的文档，无法快速切片");
                 }
@@ -1206,11 +1211,7 @@ public class KnowledgeDocumentService {
             throw new BusinessException(400, "文档未完成解析，无法向量化");
         }
 
-        if (Integer.valueOf(2).equals(doc.getIsVectorized())) {
-            throw new BusinessException(400, "文档已向量化，如需重新向量化请先重新保存切片");
-        }
-
-        if (Integer.valueOf(1).equals(doc.getIsVectorized())) {
+        if (Integer.valueOf(VectorStatus.DOC_PROCESSING).equals(doc.getIsVectorized())) {
             throw new BusinessException(400, "向量化任务正在进行中，请稍后再试");
         }
 
@@ -1221,9 +1222,19 @@ public class KnowledgeDocumentService {
         log.info("启动向量化: id={}, fileName={}, chunkCount={}",
                 documentId, doc.getFileName(), doc.getChunkCount());
 
-        doc.setIsVectorized(1);
+        doc.setIsVectorized(VectorStatus.DOC_PROCESSING);
         doc.setErrorMessage(null);
         knowledgeDocumentMapper.updateById(doc);
+
+        // 向下联动：重新向量化整篇文档 → 所有片段重置为待处理，并同步检索层过滤集合
+        LambdaQueryWrapper<KnowledgeDocumentChunk> resetWrapper = new LambdaQueryWrapper<>();
+        resetWrapper.eq(KnowledgeDocumentChunk::getDocumentId, documentId);
+        List<KnowledgeDocumentChunk> chunks = knowledgeDocumentChunkMapper.selectList(resetWrapper);
+        for (KnowledgeDocumentChunk c : chunks) {
+            c.setVectorStatus(VectorStatus.CHUNK_PENDING);
+            knowledgeDocumentChunkMapper.updateById(c);
+            hybridSearchService.markChunkVectorized(c.getId(), VectorStatus.CHUNK_PENDING);
+        }
 
         self.vectorizeAsync(documentId);
 
@@ -1239,17 +1250,17 @@ public class KnowledgeDocumentService {
      *
      * <h4>执行步骤</h4>
      * <ol>
-     *   <li>从 {@code knowledge_document_chunk} 读取切片（按 chunk_index 排序）</li>
-     *   <li>构建 LangChain4j {@link TextSegment} 列表（含 source/fileName/chunk_index 元数据）</li>
-     *   <li>遍历 → {@link EmbeddingModel#embed} → {@link EmbeddingStore#add} 存入 PGVector</li>
-     *   <li>遍历 → BM25 关键词索引（chunkId = kbId_fileName_chunkIndex）</li>
+     *   <li>清理该文档旧向量/BM25 索引（支持重复向量化）</li>
+     *   <li>逐片段处理：片段置为「处理中」→ embed → 写 PGVector/BM25 → 片段置为「已完成」</li>
+     *   <li>单片段失败仅标记该片段为「失败」，不中断其余片段</li>
+     *   <li>每次片段状态变化后调用 {@link #recomputeDocumentVectorStatus} 向上聚合文档状态</li>
      *   <li>保存文本级 SHA-256 哈希（去重依据）</li>
-     *   <li>更新 status=2 + isVectorized=true</li>
      * </ol>
      *
      * <h4>异常处理</h4>
      *
-     * <p>任何步骤失败都会将 isVectorized 置为 3（失败）并记录 errorMessage，status 保持不动</p>
+     * <p>片段级失败标记 {@code vector_status=3}（失败），文档状态由聚合结果决定（部分失败/全部失败），
+     * 不再使用文档级「失败」状态。</p>
      *
      * @param documentId 文档 ID
      */
@@ -1261,89 +1272,78 @@ public class KnowledgeDocumentService {
             return;
         }
 
-        try {
-            LambdaQueryWrapper<KnowledgeDocumentChunk> chunkQuery = new LambdaQueryWrapper<>();
-            chunkQuery.eq(KnowledgeDocumentChunk::getDocumentId, documentId)
-                    .orderByAsc(KnowledgeDocumentChunk::getChunkIndex);
-            List<KnowledgeDocumentChunk> chunks = knowledgeDocumentChunkMapper.selectList(chunkQuery);
+        LambdaQueryWrapper<KnowledgeDocumentChunk> chunkQuery = new LambdaQueryWrapper<>();
+        chunkQuery.eq(KnowledgeDocumentChunk::getDocumentId, documentId)
+                .orderByAsc(KnowledgeDocumentChunk::getChunkIndex);
+        List<KnowledgeDocumentChunk> chunks = knowledgeDocumentChunkMapper.selectList(chunkQuery);
 
-            if (chunks == null || chunks.isEmpty()) {
-                log.warn("向量化失败: 切片为空, id={}", documentId);
-                failVectorize(doc, "切片数据为空，请重新保存切片");
-                return;
-            }
-
-            log.info("向量化: 读取切片完成, id={}, count={}", documentId, chunks.size());
-
-            String fileName = doc.getFileName() != null ? doc.getFileName() : "document";
-            // 知识库隔离：chunkId 前缀格式为 "kbId_fileName"，用于 BM25 检索时的前缀过滤
-            String kbPrefix = doc.getKbId() != null ? doc.getKbId() + "_" : "";
-
-            List<TextSegment> segments = new java.util.ArrayList<>(chunks.size());
-            StringBuilder allText = new StringBuilder();
-            for (KnowledgeDocumentChunk chunk : chunks) {
-                Metadata metadata = buildChunkMetadata(doc, chunk);
-                String text = chunk.getText() != null ? chunk.getText() : "";
-                segments.add(TextSegment.from(text, metadata));
-                allText.append(text).append("\n");
-            }
-
-            // 清理旧向量/索引数据（避免重复向量化后 PGVector 和 BM25 残留）
-            jdbcTemplate.update(
-                    "DELETE FROM " + vectorTableName + " WHERE metadata->>'document_id' = ?",
-                    String.valueOf(documentId));
-            log.debug("向量化: 清理旧向量完成, id={}, table={}", documentId, vectorTableName);
-
-            com.hai.aiknowledgebase.common.KeywordIndex keywordIndex =
-                    hybridSearchService.getKeywordIndex();
-            // 清理旧 BM25 索引：先按新格式 "kbId_fileName_" 清理，再兼容旧格式 "fileName_"
-            keywordIndex.removeByPrefix(kbPrefix + fileName + "_");
-            keywordIndex.removeByPrefix(fileName + "_");
-            log.debug("向量化: 清理旧 BM25 索引完成, prefix={}{}_", kbPrefix, fileName);
-
-            for (TextSegment segment : segments) {
-                Embedding embedding = embeddingModel.embed(segment).content();
-                embeddingStore.add(embedding, segment);
-            }
-            log.info("向量化: PGVector 存储完成, id={}, segments={}", documentId, segments.size());
-
-            int bm25Count = 0;
-            for (KnowledgeDocumentChunk chunk : chunks) {
-                // 禁用片段不进入 BM25 索引（向量仍保留，检索时由向量路径过滤）
-                if (chunk.getEnabled() != null && !chunk.getEnabled()) {
-                    continue;
-                }
-                // chunkId 使用数据库主键（编辑/合并/拆分后保持稳定），格式 "kbId_fileName_chunkId"
-                String chunkId = kbPrefix + fileName + "_" + chunk.getId();
-                keywordIndex.index(chunkId, chunk.getText() != null ? chunk.getText() : "");
-                bm25Count++;
-            }
-            log.info("向量化: BM25 索引完成, id={}, chunks={}", documentId, bm25Count);
-
-            String contentHash = DigestUtils.sha256Hex(allText.toString());
-            documentHashService.save(contentHash, HashType.HASH_TYPE_TEXT,
-                    fileName, documentId);
-
-            doc.setIsVectorized(2);
-            doc.setErrorMessage(null);
+        if (chunks == null || chunks.isEmpty()) {
+            log.warn("向量化失败: 切片为空, id={}", documentId);
+            doc.setErrorMessage("切片数据为空，请重新保存切片");
             knowledgeDocumentMapper.updateById(doc);
-
-            log.info("向量化完成: id={}, fileName={}, chunks={}",
-                    documentId, fileName, segments.size());
-
-        } catch (Exception e) {
-            log.error("向量化失败: id={}", documentId, e);
-            failVectorize(doc, "向量化失败: " + e.getMessage());
+            recomputeDocumentVectorStatus(documentId);
+            return;
         }
-    }
 
-    /**
-     * 向量化失败：isVectorized 置为 3（失败）并记录错误信息，status 保持不动
-     */
-    private void failVectorize(KnowledgeDocument doc, String errorMessage) {
-        doc.setIsVectorized(3);
-        doc.setErrorMessage(errorMessage);
-        knowledgeDocumentMapper.updateById(doc);
+        log.info("向量化: 读取切片完成, id={}, count={}", documentId, chunks.size());
+
+        String fileName = doc.getFileName() != null ? doc.getFileName() : "document";
+        // 知识库隔离：chunkId 前缀格式为 "kbId_fileName"，用于 BM25 检索时的前缀过滤
+        String kbPrefix = doc.getKbId() != null ? doc.getKbId() + "_" : "";
+
+        // 清理旧向量/索引数据（避免重复向量化后 PGVector 和 BM25 残留）
+        jdbcTemplate.update(
+                "DELETE FROM " + vectorTableName + " WHERE metadata->>'document_id' = ?",
+                String.valueOf(documentId));
+        log.debug("向量化: 清理旧向量完成, id={}, table={}", documentId, vectorTableName);
+
+        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+        // 清理旧 BM25 索引：先按新格式 "kbId_fileName_" 清理，再兼容旧格式 "fileName_"
+        keywordIndex.removeByPrefix(kbPrefix + fileName + "_");
+        keywordIndex.removeByPrefix(fileName + "_");
+        log.debug("向量化: 清理旧 BM25 索引完成, prefix={}{}_", kbPrefix, fileName);
+
+        StringBuilder allText = new StringBuilder();
+        for (KnowledgeDocumentChunk chunk : chunks) {
+            String text = chunk.getText() != null ? chunk.getText() : "";
+
+            // 片段进入处理中，向上聚合文档状态
+            chunk.setVectorStatus(VectorStatus.CHUNK_PROCESSING);
+            knowledgeDocumentChunkMapper.updateById(chunk);
+            hybridSearchService.markChunkVectorized(chunk.getId(), VectorStatus.CHUNK_PROCESSING);
+            recomputeDocumentVectorStatus(documentId);
+
+            try {
+                Embedding embedding = embeddingModel.embed(text).content();
+                embeddingStore.add(embedding, TextSegment.from(text, buildChunkMetadata(doc, chunk)));
+
+                // 禁用片段不进入 BM25 索引（向量仍保留，检索时由向量路径过滤）
+                if (chunk.getEnabled() == null || chunk.getEnabled()) {
+                    keywordIndex.index(bm25ChunkId(doc, chunk.getId()), text);
+                }
+
+                chunk.setVectorStatus(VectorStatus.CHUNK_COMPLETED);
+                knowledgeDocumentChunkMapper.updateById(chunk);
+                hybridSearchService.markChunkVectorized(chunk.getId(), VectorStatus.CHUNK_COMPLETED);
+                allText.append(text).append("\n");
+            } catch (Exception e) {
+                log.error("片段向量化失败: chunkId={}, documentId={}", chunk.getId(), documentId, e);
+                chunk.setVectorStatus(VectorStatus.CHUNK_FAILED);
+                knowledgeDocumentChunkMapper.updateById(chunk);
+                hybridSearchService.markChunkVectorized(chunk.getId(), VectorStatus.CHUNK_FAILED);
+                // 失败时移除 BM25 索引，避免召回旧内容
+                keywordIndex.remove(bm25ChunkId(doc, chunk.getId()));
+            }
+            recomputeDocumentVectorStatus(documentId);
+        }
+
+        if (allText.length() > 0) {
+            String contentHash = DigestUtils.sha256Hex(allText.toString());
+            documentHashService.save(contentHash, HashType.HASH_TYPE_TEXT, fileName, documentId);
+        }
+
+        recomputeDocumentVectorStatus(documentId);
+        log.info("向量化完成: id={}, fileName={}, chunks={}", documentId, fileName, chunks.size());
     }
 
     // ======================== 文档解析 API ========================
@@ -1372,11 +1372,11 @@ public class KnowledgeDocumentService {
             throw new BusinessException(400, "文档原始文件路径为空，无法解析");
         }
 
-        if (Integer.valueOf(2).equals(doc.getIsVectorized())) {
+        if (isDocumentVectorized(doc.getIsVectorized())) {
             throw new BusinessException(400, "文档已向量化，如需重新解析请先重新保存切片");
         }
 
-        if (Integer.valueOf(1).equals(doc.getIsVectorized())) {
+        if (Integer.valueOf(VectorStatus.DOC_PROCESSING).equals(doc.getIsVectorized())) {
             throw new BusinessException(400, "向量化任务正在进行中，请稍后再试");
         }
 
@@ -1459,6 +1459,8 @@ public class KnowledgeDocumentService {
             knowledgeDocumentChunkMapper.delete(chunkDeleteWrapper);
             doc.setChunkCount(0);
             doc.setTokenCount(0);
+            // 重新解析后旧切片已失效，向量化状态重置为「待向量化」，避免残留「全部失败」等旧状态
+            doc.setIsVectorized(VectorStatus.DOC_PENDING);
 
             // ===== 5. 更新数据库 —— 解析成功 =====
             doc.setParsedTextUrl(mdFilePath.toString());
@@ -1639,11 +1641,151 @@ public class KnowledgeDocumentService {
     private String mapVectorStatus(Integer isVectorized) {
         if (isVectorized == null) return "unvectorized";
         return switch (isVectorized) {
-            case 1  -> "vectorizing";
-            case 2  -> "vectorized";
-            case 3  -> "failed";
+            case VectorStatus.DOC_PROCESSING -> "vectorizing";
+            case VectorStatus.DOC_COMPLETED  -> "vectorized";
+            case VectorStatus.DOC_PARTIAL    -> "partial_failed";
+            case VectorStatus.DOC_ALL_FAILED -> "all_failed";
             default -> "unvectorized";
         };
+    }
+
+    /**
+     * 判断文档是否已有向量化成果（已完成或部分失败，即有片段已成功向量化）。
+     *
+     * <p>用于保护性校验：重新解析 / 重新保存切片会清空全部片段及其向量，
+     * 因此只要存在已成功向量化的片段，就按「已向量化」处理要求确认。</p>
+     */
+    private boolean isDocumentVectorized(Integer isVectorized) {
+        return isVectorized != null
+                && (isVectorized == VectorStatus.DOC_COMPLETED || isVectorized == VectorStatus.DOC_PARTIAL);
+    }
+
+    /**
+     * vectorStatus → vectorStatusText 映射（片段级状态文案）
+     */
+    private String mapChunkVectorStatus(Integer vectorStatus) {
+        if (vectorStatus == null) return "pending";
+        return switch (vectorStatus) {
+            case VectorStatus.CHUNK_PROCESSING -> "processing";
+            case VectorStatus.CHUNK_COMPLETED  -> "completed";
+            case VectorStatus.CHUNK_FAILED     -> "failed";
+            default -> "pending";
+        };
+    }
+
+    /**
+     * <h3>向上聚合：片段状态 → 文档状态</h3>
+     *
+     * <p>按文档下各片段的 {@code vector_status} 分布重新计算文档级 {@code is_vectorized}，
+     * 保证文档状态始终是片段状态的聚合结果，避免二者不一致。</p>
+     *
+     * <p>聚合规则：</p>
+     * <ul>
+     *   <li>无片段：保持现状不修改</li>
+     *   <li>存在「处理中」片段：向量化中（1）</li>
+     *   <li>存在「待处理」片段且已有终态（已完成/失败）片段：向量化中（1）</li>
+     *   <li>存在「待处理」片段且无任何终态片段：待向量化（0）</li>
+     *   <li>全部「已完成」：已完成（2）</li>
+     *   <li>全部「失败」：全部失败（5）</li>
+     *   <li>「已完成」与「失败」混合：部分失败（4）</li>
+     * </ul>
+     *
+     * <p>守卫：若文档当前为「向量化中（1）」，即使片段全「待处理」也保持「向量化中」，
+     * 因为这只是向量化已触发、异步任务尚未开始处理的瞬态，避免被兜底任务错误回退为「待向量化」。</p>
+     *
+     * @param documentId 文档 ID
+     */
+    private void recomputeDocumentVectorStatus(Long documentId) {
+        if (documentId == null) {
+            return;
+        }
+        List<java.util.Map<String, Object>> rows =
+                knowledgeDocumentChunkMapper.countByVectorStatus(documentId);
+
+        int total = 0;
+        int pending = 0;
+        int processing = 0;
+        int completed = 0;
+        int failed = 0;
+        for (java.util.Map<String, Object> row : rows) {
+            Object status = row.get("vector_status");
+            Object cnt = row.get("cnt");
+            int n = cnt == null ? 0 : ((Number) cnt).intValue();
+            total += n;
+            int s = status == null ? VectorStatus.CHUNK_PENDING : ((Number) status).intValue();
+            if (s == VectorStatus.CHUNK_PENDING) {
+                pending += n;
+            } else if (s == VectorStatus.CHUNK_PROCESSING) {
+                processing += n;
+            } else if (s == VectorStatus.CHUNK_COMPLETED) {
+                completed += n;
+            } else if (s == VectorStatus.CHUNK_FAILED) {
+                failed += n;
+            }
+        }
+
+        if (total == 0) {
+            // 无片段可聚合，保持文档状态不变
+            return;
+        }
+
+        boolean hasTerminal = completed > 0 || failed > 0;
+        int newStatus;
+        if (processing > 0) {
+            newStatus = VectorStatus.DOC_PROCESSING;
+        } else if (pending > 0 && hasTerminal) {
+            newStatus = VectorStatus.DOC_PROCESSING;
+        } else if (pending > 0) {
+            newStatus = VectorStatus.DOC_PENDING;
+        } else if (completed == total) {
+            newStatus = VectorStatus.DOC_COMPLETED;
+        } else if (completed == 0) {
+            newStatus = VectorStatus.DOC_ALL_FAILED;
+        } else {
+            newStatus = VectorStatus.DOC_PARTIAL;
+        }
+
+        KnowledgeDocument doc = knowledgeDocumentMapper.selectById(documentId);
+        if (doc == null) {
+            return;
+        }
+
+        // 守卫：已触发向量化的文档，片段全「待处理」只是异步任务尚未开始处理的瞬态，
+        // 不应把「向量化中」错误回退为「待向量化」
+        if (newStatus == VectorStatus.DOC_PENDING
+                && Integer.valueOf(VectorStatus.DOC_PROCESSING).equals(doc.getIsVectorized())) {
+            newStatus = VectorStatus.DOC_PROCESSING;
+        }
+
+        if (!Integer.valueOf(newStatus).equals(doc.getIsVectorized())) {
+            // 乐观更新：仅当 is_vectorized 仍为读到的旧值时写入，避免与异步线程/兜底任务并发时的丢失更新
+            knowledgeDocumentMapper.updateVectorStatusIfMatch(documentId, newStatus, doc.getIsVectorized());
+        }
+    }
+
+    /**
+     * <h3>兜底聚合：纠正「向量化中」但片段已全部终态的文档状态</h3>
+     *
+     * <p>供定时任务调用。异步向量化可能因进程中断/异常导致文档停留在
+     * {@code DOC_PROCESSING}（1），而其片段实际已全部进入终态（已完成/失败）。
+     * 本方法扫描所有处于「向量化中」的文档，重新按片段状态聚合文档状态。</p>
+     *
+     * <p>幂等：{@link #recomputeDocumentVectorStatus} 仅在状态不一致时才更新；
+     * 正常进行中的文档（存在处理中片段）会被重新置为「向量化中」，无副作用。</p>
+     *
+     * @return 被扫描（处于向量化中）的文档数量
+     */
+    public int reconcileStaleVectorStatus() {
+        LambdaQueryWrapper<KnowledgeDocument> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(KnowledgeDocument::getIsVectorized, VectorStatus.DOC_PROCESSING);
+        List<KnowledgeDocument> docs = knowledgeDocumentMapper.selectList(wrapper);
+        if (docs == null || docs.isEmpty()) {
+            return 0;
+        }
+        for (KnowledgeDocument doc : docs) {
+            recomputeDocumentVectorStatus(doc.getId());
+        }
+        return docs.size();
     }
 
     /**
@@ -1716,7 +1858,6 @@ public class KnowledgeDocumentService {
     @Transactional
     public KnowledgeDocumentChunksVO.ChunkItem updateChunk(Long chunkId, KnowledgeDocumentChunkUpdateDTO dto) {
         KnowledgeDocumentChunk chunk = getChunkWithPermission(chunkId, Role.EDITOR);
-        KnowledgeDocument doc = knowledgeDocumentMapper.selectById(chunk.getDocumentId());
         String oldText = chunk.getText();
 
         if (dto.getText() != null) {
@@ -1742,13 +1883,18 @@ public class KnowledgeDocumentService {
         String text = chunk.getText() != null ? chunk.getText() : "";
         chunk.setTokenCount(tokenCountEstimator.estimateTokenCountInText(text));
 
+        // 文本变化 → 片段置为待处理 → 向上聚合文档状态 → 异步重算向量
+        boolean textChanged = oldText == null || !oldText.equals(text);
+        if (textChanged) {
+            chunk.setVectorStatus(VectorStatus.CHUNK_PENDING);
+        }
+
         knowledgeDocumentChunkMapper.updateById(chunk);
         recalcDocumentStats(chunk.getDocumentId());
 
-        // 文本变化且文档已向量化时重算向量（未向量化文档不重算，向量化状态由全量任务统一管理）
-        boolean textChanged = oldText == null || !oldText.equals(text);
-        boolean vectorized = doc != null && Integer.valueOf(2).equals(doc.getIsVectorized());
-        if (textChanged && vectorized) {
+        if (textChanged) {
+            hybridSearchService.markChunkVectorized(chunkId, VectorStatus.CHUNK_PENDING);
+            recomputeDocumentVectorStatus(chunk.getDocumentId());
             triggerAfterCommit(() -> self.revectorizeChunkAsync(chunkId));
         }
 
@@ -1803,6 +1949,8 @@ public class KnowledgeDocumentService {
         first.setParentText(null);
         first.setParentStart(null);
         first.setParentEnd(null);
+        // 合并后文本变化 → 片段置为待处理
+        first.setVectorStatus(VectorStatus.CHUNK_PENDING);
         knowledgeDocumentChunkMapper.updateById(first);
 
         // 删除其余片段（同步清理 BM25，异步清理向量）
@@ -1818,11 +1966,11 @@ public class KnowledgeDocumentService {
         renormalizeChunkIndexes(dto.getDocumentId());
         recalcDocumentStats(dto.getDocumentId());
 
-        // 文档已向量化时才重算向量（未向量化文档不重算，向量化状态由全量任务统一管理）
+        // 片段置为待处理 → 向上聚合文档状态 → 异步重算向量
+        hybridSearchService.markChunkVectorized(first.getId(), VectorStatus.CHUNK_PENDING);
+        recomputeDocumentVectorStatus(dto.getDocumentId());
         final Long mergedId = first.getId();
-        if (Integer.valueOf(2).equals(doc.getIsVectorized())) {
-            triggerAfterCommit(() -> self.revectorizeChunkAsync(mergedId));
-        }
+        triggerAfterCommit(() -> self.revectorizeChunkAsync(mergedId));
 
         return toChunkItem(first);
     }
@@ -1871,6 +2019,7 @@ public class KnowledgeDocumentService {
             c.setContextPrefix(original.getContextPrefix());
             c.setContentType(original.getContentType());
             c.setEnabled(original.getEnabled() == null || original.getEnabled());
+            c.setVectorStatus(VectorStatus.CHUNK_PENDING);
             knowledgeDocumentChunkMapper.insert(c);
             result.add(toChunkItem(c));
         }
@@ -1878,15 +2027,17 @@ public class KnowledgeDocumentService {
         renormalizeChunkIndexes(dto.getDocumentId());
         recalcDocumentStats(dto.getDocumentId());
 
-        // 文档已向量化时才向量化新片段（未向量化文档不向量化，向量化状态由全量任务统一管理）
+        // 新片段置为待处理 → 向上聚合文档状态 → 异步向量化
         List<Long> newIds = result.stream().map(KnowledgeDocumentChunksVO.ChunkItem::getId).collect(java.util.stream.Collectors.toList());
-        if (Integer.valueOf(2).equals(doc.getIsVectorized())) {
-            triggerAfterCommit(() -> {
-                for (Long id : newIds) {
-                    self.revectorizeChunkAsync(id);
-                }
-            });
+        for (Long id : newIds) {
+            hybridSearchService.markChunkVectorized(id, VectorStatus.CHUNK_PENDING);
         }
+        recomputeDocumentVectorStatus(dto.getDocumentId());
+        triggerAfterCommit(() -> {
+            for (Long id : newIds) {
+                self.revectorizeChunkAsync(id);
+            }
+        });
 
         return result;
     }
@@ -1951,6 +2102,62 @@ public class KnowledgeDocumentService {
             result.add(toChunkItem(chunk));
         }
         return result;
+    }
+
+    /**
+     * <h3>删除单个片段（精细化干预）</h3>
+     *
+     * <p>物理删除片段，同步从 BM25 内存索引移除，事务提交后异步清理向量数据。
+     * 删除后重排剩余片段序号、重算文档 chunkCount/tokenCount；若删光全部片段，
+     * 则将文档向量化状态重置为「待向量化」，否则向上聚合文档状态。</p>
+     *
+     * @param chunkId 片段主键
+     */
+    @Transactional
+    public void deleteChunk(Long chunkId) {
+        KnowledgeDocumentChunk chunk = getChunkWithPermission(chunkId, Role.EDITOR);
+        Long documentId = chunk.getDocumentId();
+        KnowledgeDocument doc = knowledgeDocumentMapper.selectById(documentId);
+
+        // 同步清理 BM25 索引，异步清理向量
+        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+        keywordIndex.remove(bm25ChunkId(doc, chunk.getId()));
+        knowledgeDocumentChunkMapper.deleteById(chunk.getId());
+        final Long deletedId = chunk.getId();
+        triggerAfterCommit(() -> self.removeChunkVectorAsync(deletedId));
+
+        renormalizeChunkIndexes(documentId);
+        recalcDocumentStats(documentId);
+
+        // 删光片段 → 文档重置为「待向量化」；否则向上聚合文档状态
+        Long remaining = knowledgeDocumentChunkMapper.selectCount(
+                new LambdaQueryWrapper<KnowledgeDocumentChunk>()
+                        .eq(KnowledgeDocumentChunk::getDocumentId, documentId));
+        if (remaining == null || remaining == 0) {
+            KnowledgeDocument currentDoc = knowledgeDocumentMapper.selectById(documentId);
+            if (currentDoc != null) {
+                currentDoc.setIsVectorized(VectorStatus.DOC_PENDING);
+                knowledgeDocumentMapper.updateById(currentDoc);
+            }
+        } else {
+            recomputeDocumentVectorStatus(documentId);
+        }
+    }
+
+    /**
+     * <h3>重新向量化单个片段（手动触发）</h3>
+     *
+     * <p>校验权限后异步触发 {@link #revectorizeChunkAsync}，删除旧向量重新嵌入、
+     * 重建 BM25 索引并向上聚合文档状态。片段正在处理中时拒绝重复触发。</p>
+     *
+     * @param chunkId 片段主键
+     */
+    public void revectorizeChunk(Long chunkId) {
+        KnowledgeDocumentChunk chunk = getChunkWithPermission(chunkId, Role.EDITOR);
+        if (Integer.valueOf(VectorStatus.CHUNK_PROCESSING).equals(chunk.getVectorStatus())) {
+            throw new BusinessException(400, "片段正在向量化中，请稍后重试");
+        }
+        self.revectorizeChunkAsync(chunkId);
     }
 
     /**
@@ -2084,6 +2291,13 @@ public class KnowledgeDocumentService {
             log.warn("片段向量重算: 文档不存在, chunkId={}", chunkId);
             return;
         }
+
+        // 片段进入处理中，向上聚合文档状态
+        chunk.setVectorStatus(VectorStatus.CHUNK_PROCESSING);
+        knowledgeDocumentChunkMapper.updateById(chunk);
+        hybridSearchService.markChunkVectorized(chunkId, VectorStatus.CHUNK_PROCESSING);
+        recomputeDocumentVectorStatus(doc.getId());
+
         try {
             String text = chunk.getText() != null ? chunk.getText() : "";
             // 删除旧向量后重新写入
@@ -2099,10 +2313,20 @@ public class KnowledgeDocumentService {
             if (chunk.getEnabled() == null || chunk.getEnabled()) {
                 keywordIndex.index(bm25Id, text);
             }
+
+            chunk.setVectorStatus(VectorStatus.CHUNK_COMPLETED);
+            knowledgeDocumentChunkMapper.updateById(chunk);
+            hybridSearchService.markChunkVectorized(chunkId, VectorStatus.CHUNK_COMPLETED);
             log.info("片段向量重算完成: chunkId={}", chunkId);
         } catch (Exception e) {
             log.error("片段向量重算失败: chunkId={}", chunkId, e);
+            chunk.setVectorStatus(VectorStatus.CHUNK_FAILED);
+            knowledgeDocumentChunkMapper.updateById(chunk);
+            hybridSearchService.markChunkVectorized(chunkId, VectorStatus.CHUNK_FAILED);
+            com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+            keywordIndex.remove(bm25ChunkId(doc, chunkId));
         }
+        recomputeDocumentVectorStatus(doc.getId());
     }
 
     /**

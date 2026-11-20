@@ -33,7 +33,7 @@ public class KnowledgeDocumentUploadVO {
     /** 解析状态：unparsed / parsing / parsed / failed */
     private String parseStatus;
 
-    /** 向量化状态：unvectorized / vectorizing / vectorized / failed */
+    /** 向量化状态：unvectorized / vectorizing / vectorized / partial_failed / all_failed */
     private String vectorStatus;
 
     /** 创建时间，格式 YYYY-MM-DD HH:mm:ss */

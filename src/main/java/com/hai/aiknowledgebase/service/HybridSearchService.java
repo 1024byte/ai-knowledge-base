@@ -1,12 +1,14 @@
 package com.hai.aiknowledgebase.service;
 
 import com.hai.aiknowledgebase.common.KeywordIndex;
+import com.hai.aiknowledgebase.common.VectorStatus;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingStore;
+import dev.langchain4j.store.embedding.filter.Filter;
 import dev.langchain4j.store.embedding.filter.MetadataFilterBuilder;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
@@ -72,6 +74,9 @@ public class HybridSearchService {
 
     /** 已禁用片段 ID 集合（chunk 数据库主键），用于向量检索时过滤禁用片段 */
     private final Set<Long> disabledChunkIds = ConcurrentHashMap.newKeySet();
+
+    /** 未完成向量化的片段 ID 集合（vector_status != 2），用于向量检索时过滤非完成状态片段 */
+    private final Set<Long> nonCompletedChunkIds = ConcurrentHashMap.newKeySet();
 
     /**
      * RRF 算法的平滑参数 k。
@@ -160,6 +165,8 @@ public class HybridSearchService {
 
             // 先从 chunk 表加载禁用片段 ID（用于重建时跳过 + 向量检索时过滤）
             reloadDisabledChunkIds();
+            // 加载未完成向量化的片段 ID（重建时跳过 + 向量检索时过滤）
+            reloadNonCompletedChunkIds();
 
             // 查询所有 chunk：按 document_id 分组，组内按 embedding_id 排序
             // 同时查询 source（文件名）、chunk_id（片段主键）用于重建 chunkId
@@ -207,6 +214,12 @@ public class HybridSearchService {
                     continue;
                 }
 
+                // 未完成向量化的片段不进入 BM25 索引（避免召回处理中/失败的旧内容）
+                if (chunkIdObj != null && nonCompletedChunkIds.contains(parseChunkId(chunkIdObj))) {
+                    skippedCount++;
+                    continue;
+                }
+
                 // 重构 chunkId：优先使用 chunk_id（数据库主键，编辑/合并/拆分后保持稳定），
                 // 旧数据无 chunk_id 时回退为 chunkIndex。
                 // 格式："kbId_sourceFileName_chunkId"，如 "1_时态.md_42"
@@ -248,6 +261,24 @@ public class HybridSearchService {
     }
 
     /**
+     * <h3>从 chunk 表重新加载未完成向量化的片段 ID 集合</h3>
+     *
+     * <p>应用启动时执行一次，将 {@code vector_status != 2}（待处理/处理中/失败）的片段主键
+     * 加载到内存集合，供向量检索路径过滤非完成状态片段使用。</p>
+     */
+    private void reloadNonCompletedChunkIds() {
+        try {
+            List<Long> ids = jdbcTemplate.queryForList(
+                    "SELECT id FROM knowledge_document_chunk WHERE vector_status IS DISTINCT FROM 2", Long.class);
+            nonCompletedChunkIds.clear();
+            nonCompletedChunkIds.addAll(ids);
+            log.info("加载未完成向量化片段集合完成: {} 个片段", nonCompletedChunkIds.size());
+        } catch (Exception e) {
+            log.warn("加载未完成向量化片段集合失败，非完成状态片段可能被错误召回", e);
+        }
+    }
+
+    /**
      * 标记片段启用/禁用状态（维护内存集合，供向量检索路径过滤）。
      *
      * @param chunkId 片段数据库主键
@@ -262,6 +293,20 @@ public class HybridSearchService {
     }
 
     /**
+     * 标记片段向量化状态（维护内存集合，供向量检索路径过滤）。
+     *
+     * @param chunkId      片段数据库主键
+     * @param vectorStatus 片段向量化状态（{@link VectorStatus#CHUNK_COMPLETED} 为完成）
+     */
+    public void markChunkVectorized(Long chunkId, int vectorStatus) {
+        if (vectorStatus == VectorStatus.CHUNK_COMPLETED) {
+            nonCompletedChunkIds.remove(chunkId);
+        } else {
+            nonCompletedChunkIds.add(chunkId);
+        }
+    }
+
+    /**
      * 判断片段是否被禁用（向量检索过滤用）。
      */
     private boolean isChunkDisabled(TextSegment segment) {
@@ -271,6 +316,21 @@ public class HybridSearchService {
         }
         try {
             return disabledChunkIds.contains(Long.parseLong(chunkId));
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
+    /**
+     * 判断片段是否未完成向量化（向量检索过滤用）。
+     */
+    private boolean isChunkNotCompleted(TextSegment segment) {
+        String chunkId = segment.metadata().getString("chunk_id");
+        if (chunkId == null || chunkId.isBlank()) {
+            return false;
+        }
+        try {
+            return nonCompletedChunkIds.contains(Long.parseLong(chunkId));
         } catch (NumberFormatException e) {
             return false;
         }
@@ -404,11 +464,11 @@ public class HybridSearchService {
      * <h4>关键代码解释</h4>
      * <ul>
      *   <li><b>embeddingModel.embed(query).content()</b>：
-     *       调用 LangChain4j 的嵌入模型（本项目使用 paraphrase-multilingual-MiniLM-L12-v2 量化模型），
-     *       将查询文本转换为高维向量（如 318 维）。这个向量捕获了查询的语义信息。</li>
+     *       调用 LangChain4j 的嵌入模型（本项目使用 BGE-base-zh-v1.5，ONNX 本地推理），
+     *       将查询文本转换为高维向量（768 维）。这个向量捕获了查询的语义信息。</li>
      *   <li><b>EmbeddingSearchRequest</b>：
      *       构建向量检索请求，指定查询向量和返回数量。PGVector 底层使用
-     *       IVFFlat 或 HNSW 索引进行 ANN 近似最近邻搜索。</li>
+     *       IVFFlat 索引进行 ANN 近似最近邻搜索。</li>
      *   <li><b>embeddingStore.search(request)</b>：
      *       在 PGVector 向量库中检索与查询向量最相似的文档片段，
      *       返回的 EmbeddingMatch 包含 TextSegment 和余弦相似度分数。</li>
@@ -425,6 +485,16 @@ public class HybridSearchService {
     }
 
     public List<RankedResult> vectorSearchRanked(String query, int topK, Set<Long> kbIds) {
+        return vectorSearchRanked(query, topK, kbIds, null);
+    }
+
+    /**
+     * <h3>向量检索（带分数，支持知识库与文档范围过滤）</h3>
+     *
+     * <p>在既有 kbIds 知识库隔离基础上，增加 documentIds 文档范围过滤，二者取交集。
+     * documentIds 为 null/空集合时表示不过滤文档范围。</p>
+     */
+    public List<RankedResult> vectorSearchRanked(String query, int topK, Set<Long> kbIds, Set<Long> documentIds) {
         // 1. 前置校验
         if (query == null || query.trim().isEmpty()) {
             log.warn("Query is empty, return empty result");
@@ -443,8 +513,10 @@ public class HybridSearchService {
             var requestBuilder = EmbeddingSearchRequest.builder()
                     .queryEmbedding(queryEmbedding)
                     .maxResults(fetchSize);
-            // 知识库隔离：kbIds == null 表示不过滤；空集合表示无可见知识库（返回空）；
-            // 非空集合通过 metadata filter 的 isIn 在向量库层过滤
+            // 检索范围 = kbIds ∩ documentIds：
+            //   kbIds == null 表示不过滤知识库；空集合表示无可见知识库（返回空）
+            //   documentIds 为 null/空集合表示不过滤文档范围
+            Filter filter = null;
             if (kbIds != null) {
                 if (kbIds.isEmpty()) {
                     return Collections.emptyList();
@@ -452,7 +524,17 @@ public class HybridSearchService {
                 List<String> kbIdValues = kbIds.stream()
                         .map(String::valueOf)
                         .collect(Collectors.toList());
-                requestBuilder.filter(MetadataFilterBuilder.metadataKey("kb_id").isIn(kbIdValues));
+                filter = MetadataFilterBuilder.metadataKey("kb_id").isIn(kbIdValues);
+            }
+            if (documentIds != null && !documentIds.isEmpty()) {
+                List<String> docIdValues = documentIds.stream()
+                        .map(String::valueOf)
+                        .collect(Collectors.toList());
+                Filter docFilter = MetadataFilterBuilder.metadataKey("document_id").isIn(docIdValues);
+                filter = (filter == null) ? docFilter : filter.and(docFilter);
+            }
+            if (filter != null) {
+                requestBuilder.filter(filter);
             }
             EmbeddingSearchRequest request = requestBuilder.build();
 
@@ -466,6 +548,7 @@ public class HybridSearchService {
             List<RankedResult> results = matches.stream()
                     .filter(m -> m != null && m.embedded() != null)
                     .filter(m -> !isChunkDisabled(m.embedded()))
+                    .filter(m -> !isChunkNotCompleted(m.embedded()))
                     .map(m -> new RankedResult(m.embedded(), m.score()))
                     .sorted((a, b) -> Double.compare(b.getScore(), a.getScore())) // 降序
                     .limit(topK)

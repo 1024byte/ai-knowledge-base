@@ -272,6 +272,26 @@ public class KeywordIndex {
      * @return 按得分降序排列的 (docId, score) 列表
      */
     public List<Map.Entry<String, Double>> search(String query, int topK, Set<Long> kbIds) {
+        return search(query, topK, kbIds, null, null);
+    }
+
+    /**
+     * <h3>BM25 关键词检索（支持知识库隔离 + 文档范围过滤）</h3>
+     *
+     * <p>在 {@link #search(String, int, Set)} 基础上增加文档范围过滤：当 {@code documentIds}
+     * 非空时，仅保留 chunkId 对应 documentId 落在目标文档集合内的结果。chunkId 无法直接
+     * 从 docId 反查 documentId，故需调用方传入 {@code chunkIdToDocumentId} 映射
+     * （片段主键 → 文档 ID）。</p>
+     *
+     * @param query               查询文本
+     * @param topK                返回前 K 个结果
+     * @param kbIds               知识库 ID 集合，可为 null（null 表示不过滤）
+     * @param documentIds         文档 ID 集合，可为 null/空集合（表示不过滤文档范围）
+     * @param chunkIdToDocumentId 片段主键 → 文档 ID 映射，仅在 documentIds 非空时使用
+     * @return 按得分降序排列的 (docId, score) 列表
+     */
+    public List<Map.Entry<String, Double>> search(String query, int topK, Set<Long> kbIds,
+                                                  Set<Long> documentIds, Map<Long, Long> chunkIdToDocumentId) {
         // 对查询文本分词
         Map<String, Integer> queryTerms = analyze(query);
         if (queryTerms.isEmpty()) {
@@ -287,6 +307,9 @@ public class KeywordIndex {
             }
             kbIdSet = kbIds.stream().map(String::valueOf).collect(Collectors.toSet());
         }
+
+        // 文档范围过滤开关
+        boolean filterByDocument = documentIds != null && !documentIds.isEmpty();
 
         Map<String, Double> scores = new HashMap<>();
         int totalDocs = docs.size();
@@ -315,8 +338,14 @@ public class KeywordIndex {
                 if (kbIdSet != null && !belongsToKb(docId, kbIdSet)) {
                     continue;
                 }
+                // 文档范围过滤：跳过不属于目标文档集合的文档
+                if (filterByDocument && !belongsToDocuments(docId, documentIds, chunkIdToDocumentId)) {
+                    continue;
+                }
                 int tf = docEntry.getValue();  // 词频
-                int docLen = docs.get(docId).length();  // 文档长度
+                String text = docs.get(docId);
+                if (text == null) continue;
+                int docLen = text.length();  // 文档长度
 
                 // BM25 参数
                 double k1 = 1.2;  // 词频饱和度
@@ -336,6 +365,44 @@ public class KeywordIndex {
                 .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
                 .limit(topK)
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * 判断 docId 是否属于给定的文档集合。
+     *
+     * <p>docId 格式为 {@code "kbId_source_chunkId"}，取最后一个下划线之后的片段主键，
+     * 再通过 {@code chunkIdToDocumentId} 反查文档 ID，判断其是否在允许集合内。</p>
+     *
+     * @param docId               文档唯一标识
+     * @param documentIds         允许的文档 ID 集合
+     * @param chunkIdToDocumentId 片段主键 → 文档 ID 映射
+     * @return 属于该集合返回 true；无法解析片段主键或映射缺失时返回 false
+     */
+    private boolean belongsToDocuments(String docId, Set<Long> documentIds, Map<Long, Long> chunkIdToDocumentId) {
+        Long chunkId = parseChunkId(docId);
+        if (chunkId == null || chunkIdToDocumentId == null) {
+            return false;
+        }
+        Long documentId = chunkIdToDocumentId.get(chunkId);
+        return documentId != null && documentIds.contains(documentId);
+    }
+
+    /**
+     * 从 docId 中解析片段主键（最后一个下划线之后的部分）。
+     *
+     * @param docId 文档唯一标识，格式 {@code "kbId_source_chunkId"}
+     * @return 片段主键；无法解析为数字时返回 null
+     */
+    private Long parseChunkId(String docId) {
+        int idx = docId.lastIndexOf('_');
+        if (idx < 0 || idx == docId.length() - 1) {
+            return null;
+        }
+        try {
+            return Long.parseLong(docId.substring(idx + 1));
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     /**

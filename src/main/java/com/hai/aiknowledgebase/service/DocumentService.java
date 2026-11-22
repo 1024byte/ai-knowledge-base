@@ -9,6 +9,7 @@ import com.hai.aiknowledgebase.entity.DocumentMetadata;
 import com.hai.aiknowledgebase.exception.BusinessException;
 import com.hai.aiknowledgebase.mapper.CategoryMapper;
 import com.hai.aiknowledgebase.mapper.DocumentMetadataMapper;
+import com.hai.aiknowledgebase.retrieve.ChunkIndexManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.codec.digest.DigestUtils;
@@ -60,7 +61,7 @@ import static com.hai.aiknowledgebase.common.FileUtils.*;
  * </ul>
  *
  * @see VectorizationService 异步向量化服务
- * @see HybridSearchService 混合检索服务（提供 BM25 索引）
+ * @see ChunkIndexManager 片段索引管理器（提供 BM25 索引）
  * @see DocumentHashService 文档哈希去重服务
  */
 @Slf4j
@@ -83,8 +84,8 @@ public class DocumentService {
     /** 文档哈希去重服务 */
     private final DocumentHashService documentHashService;
 
-    /** 混合检索服务，提供 BM25 关键词索引（用于删除时清理索引） */
-    private final HybridSearchService hybridSearchService;
+    /** 片段索引管理器：提供 BM25 关键词索引（用于删除时清理索引） */
+    private final ChunkIndexManager chunkIndexManager;
 
     /** PGVector 向量表名，默认 "embeddings" */
     @Value("${vectorstore.pgvector.table-name:embeddings}")
@@ -629,7 +630,7 @@ public class DocumentService {
 
             // 步骤2：删除 BM25 关键词倒排索引
             // removeByPrefix 删除所有以 "docId_" 开头的索引条目
-            hybridSearchService.getKeywordIndex().removeByPrefix(documentId + "_");
+            chunkIndexManager.getKeywordIndex().removeByPrefix(documentId + "_");
             log.info("已从 BM25 索引中删除文档 {} 的片段", documentId);
 
             // 步骤3：删除文件哈希记录（数据库 + 缓存）

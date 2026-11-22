@@ -6,6 +6,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hai.aiknowledgebase.annotation.Timed;
 import com.hai.aiknowledgebase.common.Role;
 import com.hai.aiknowledgebase.dto.*;
+import com.hai.aiknowledgebase.retrieve.RankedResult;
+import com.hai.aiknowledgebase.retrieve.RetrievalCoordinator;
 import com.hai.aiknowledgebase.entity.ChatHistory;
 import com.hai.aiknowledgebase.exception.BusinessException;
 import com.hai.aiknowledgebase.mapper.ChatHistoryMapper;
@@ -70,7 +72,7 @@ public class ChatService {
             .build();
     private final ChatMemoryStore chatMemoryStore;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
-    private final RAGSearchService ragSearchService;
+    private final RetrievalCoordinator retrievalCoordinator;
     private final QueryRewriteService queryRewriteService;
     private final TokenCountEstimator tokenCountEstimator;
     private final ThreadPoolTaskExecutor chatTaskExecutor;
@@ -116,7 +118,7 @@ public class ChatService {
                        EmbeddingModel embeddingModel,
                        ChatHistoryMapper chatHistoryMapper,
                        ChatMemoryStore chatMemoryStore,
-                       RAGSearchService ragSearchService,
+                       RetrievalCoordinator retrievalCoordinator,
                        QueryRewriteService queryRewriteService,
                        TokenCountEstimator tokenCountEstimator,
                        @Qualifier("chatTaskExecutor") ThreadPoolTaskExecutor chatTaskExecutor,
@@ -128,7 +130,7 @@ public class ChatService {
         this.embeddingModel = embeddingModel;
         this.chatHistoryMapper = chatHistoryMapper;
         this.chatMemoryStore = chatMemoryStore;
-        this.ragSearchService = ragSearchService;
+        this.retrievalCoordinator = retrievalCoordinator;
         this.queryRewriteService = queryRewriteService;
         this.tokenCountEstimator = tokenCountEstimator;
         this.chatTaskExecutor = chatTaskExecutor;
@@ -208,7 +210,7 @@ public class ChatService {
      * <h3>处理流程（8 步）</h3>
      * <ol start="0">
      *   <li><b>查询改写</b>：指代消解 + 同义词扩展 + 固定映射 + 意图识别，生成改写查询 + 扩展/排除关键词</li>
-     *   <li><b>混合检索</b>：调用 {@link RAGSearchService#retrieveSegments} 进行向量+BM25双路检索</li>
+     *   <li><b>混合检索</b>：调用 {@link RetrievalCoordinator#retrieveSegments} 进行向量+BM25双路检索</li>
      *   <li><b>构建上下文</b>：将检索到的文档片段拼接为 LLM 上下文（以 "---" 分隔）</li>
      *   <li><b>构建 Prompt</b>：将上下文和用户问题组装为完整提示词</li>
      *   <li><b>构建消息列表</b>：System提示词 + 历史消息 + 当前用户Prompt → LLM 输入</li>
@@ -274,16 +276,16 @@ public class ChatService {
                 rewriteResult.getStrategy());
 
         // 步骤1：混合检索（支持多子查询分别检索 + 合并去重）
-        List<HybridSearchService.RankedResult> rankedResults;
+        List<RankedResult> rankedResults;
         if (subQueries != null && !subQueries.isEmpty()) {// 多子查询检索：分别对每个子查询进行检索，合并结果并重新排序
             rankedResults = multiQueryRetrieve(subQueries, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);//多子查询检索
                        log.info("多子查询检索: {} 个子查询, 合并后 {} 个片段", subQueries.size(), rankedResults.size());
         } else {
-            rankedResults = ragSearchService.retrieveSegments(searchQuery, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
+            rankedResults = retrievalCoordinator.retrieveSegments(searchQuery, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
             log.info("检索到 {} 个相关文档片段", rankedResults.size());
         }
         List<TextSegment> segments = rankedResults.stream()
-                .map(HybridSearchService.RankedResult::getSegment)
+                .map(RankedResult::getSegment)
                 .collect(Collectors.toList());
 
         // 步骤2：构建上下文（Token 预算制：按片段顺序填入，超出预算截断或丢弃）
@@ -382,12 +384,12 @@ public class ChatService {
                         question, searchQuery, expandKeywords, excludeKeywords,
                         subQueries != null ? subQueries.size() : 0);
 
-                List<HybridSearchService.RankedResult> rankedResults;
+                List<RankedResult> rankedResults;
                 if (subQueries != null && !subQueries.isEmpty()) {
                     rankedResults = multiQueryRetrieve(subQueries, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
                     log.info("多子查询检索(stream): {} 个子查询, 合并后 {} 个片段", subQueries.size(), rankedResults.size());
                 } else {
-                    rankedResults = ragSearchService.retrieveSegments(searchQuery, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
+                    rankedResults = retrievalCoordinator.retrieveSegments(searchQuery, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
                     log.info("检索到(stream) {} 个相关文档片段", rankedResults.size());
                 }
 
@@ -396,7 +398,7 @@ public class ChatService {
                 sourceSegmentCache.put(messageId, sourceSegments);
 
                 List<TextSegment> segments = rankedResults.stream()
-                        .map(HybridSearchService.RankedResult::getSegment)
+                        .map(RankedResult::getSegment)
                         .collect(Collectors.toList());
 
                 ContextBuildResult contextResult = buildContextWithinBudget(segments, maxContextTokens);
@@ -585,7 +587,7 @@ public class ChatService {
     /**
      * 将检索结果转换为 SourceSegment 列表（按 content 去重，保留首次出现顺序）
      */
-    private List<SourceSegment> buildSourceSegments(List<HybridSearchService.RankedResult> rankedResults) {
+    private List<SourceSegment> buildSourceSegments(List<RankedResult> rankedResults) {
         Set<String> seen = new LinkedHashSet<>();
         return rankedResults.stream()
                 .filter(r -> {
@@ -949,26 +951,26 @@ public class ChatService {
      * 通过文本内容去重（避免同一片段被重复计入），
      * 并行执行以降低多子查询场景的总延迟，最终按分数降序排列返回。</p>
      */
-    private List<HybridSearchService.RankedResult> multiQueryRetrieve(
+    private List<RankedResult> multiQueryRetrieve(
             List<String> subQueries, int totalTopK, double minScore,
             List<String> expandKeywords, List<String> excludeKeywords, Set<Long> kbIds) {
         int perQueryTopK = Math.max(3, totalTopK / subQueries.size());
 
-        List<CompletableFuture<List<HybridSearchService.RankedResult>>> futures = new ArrayList<>();
+        List<CompletableFuture<List<RankedResult>>> futures = new ArrayList<>();
         for (String subQuery : subQueries) {
             futures.add(CompletableFuture.supplyAsync(
-                    () -> ragSearchService.retrieveSegments(subQuery, perQueryTopK, minScore, expandKeywords, excludeKeywords, kbIds),
+                    () -> retrievalCoordinator.retrieveSegments(subQuery, perQueryTopK, minScore, expandKeywords, excludeKeywords, kbIds),
                     chatTaskExecutor));
         }
 
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
 
         Set<String> seenTexts = new LinkedHashSet<>();
-        List<HybridSearchService.RankedResult> merged = new ArrayList<>();
-        for (CompletableFuture<List<HybridSearchService.RankedResult>> future : futures) {
+        List<RankedResult> merged = new ArrayList<>();
+        for (CompletableFuture<List<RankedResult>> future : futures) {
             try {
-                List<HybridSearchService.RankedResult> results = future.join();
-                for (HybridSearchService.RankedResult r : results) {
+                List<RankedResult> results = future.join();
+                for (RankedResult r : results) {
                     if (seenTexts.add(r.getSegment().text())) {
                         merged.add(r);
                     }

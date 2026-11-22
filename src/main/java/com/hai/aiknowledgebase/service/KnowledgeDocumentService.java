@@ -13,6 +13,7 @@ import com.hai.aiknowledgebase.entity.KnowledgeDocumentChunk;
 import com.hai.aiknowledgebase.exception.BusinessException;
 import com.hai.aiknowledgebase.mapper.KnowledgeDocumentChunkMapper;
 import com.hai.aiknowledgebase.mapper.KnowledgeDocumentMapper;
+import com.hai.aiknowledgebase.retrieve.ChunkIndexManager;
 import com.hai.aiknowledgebase.security.SecurityUtils;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.Metadata;
@@ -124,8 +125,8 @@ public class KnowledgeDocumentService {
     /** 文档哈希去重服务 */
     private final DocumentHashService documentHashService;
 
-    /** 混合检索服务（BM25 关键词索引） */
-    private final HybridSearchService hybridSearchService;
+    /** 片段索引管理器（BM25 关键词索引） */
+    private final ChunkIndexManager chunkIndexManager;
 
     /** JDBC 模板（用于直接清理 PGVector 旧向量，避开 Filter API 版本差异） */
     private final org.springframework.jdbc.core.JdbcTemplate jdbcTemplate;
@@ -513,8 +514,8 @@ public class KnowledgeDocumentService {
         String fileName = doc.getFileName() != null ? doc.getFileName() : "document";
         String kbPrefix = doc.getKbId() != null ? doc.getKbId() + "_" : "";
         // 清理旧 BM25 索引：先按新格式 "kbId_fileName_" 清理，再兼容旧格式 "fileName_"
-        hybridSearchService.getKeywordIndex().removeByPrefix(kbPrefix + fileName + "_");
-        hybridSearchService.getKeywordIndex().removeByPrefix(fileName + "_");
+        chunkIndexManager.getKeywordIndex().removeByPrefix(kbPrefix + fileName + "_");
+        chunkIndexManager.getKeywordIndex().removeByPrefix(fileName + "_");
 
         documentHashService.deleteByFileName(doc.getId());
     }
@@ -963,7 +964,7 @@ public class KnowledgeDocumentService {
                 String.valueOf(documentId));
         log.debug("保存切片: 清理旧向量完成, id={}, table={}", documentId, vectorTableName);
 
-        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = chunkIndexManager.getKeywordIndex();
         keywordIndex.removeByPrefix(fileName + "_");
         log.debug("保存切片: 清理旧 BM25 索引完成, prefix={}_", fileName);
 
@@ -1233,7 +1234,7 @@ public class KnowledgeDocumentService {
         for (KnowledgeDocumentChunk c : chunks) {
             c.setVectorStatus(VectorStatus.CHUNK_PENDING);
             knowledgeDocumentChunkMapper.updateById(c);
-            hybridSearchService.markChunkVectorized(c.getId(), VectorStatus.CHUNK_PENDING);
+            chunkIndexManager.markChunkVectorized(c.getId(), VectorStatus.CHUNK_PENDING);
         }
 
         self.vectorizeAsync(documentId);
@@ -1297,7 +1298,7 @@ public class KnowledgeDocumentService {
                 String.valueOf(documentId));
         log.debug("向量化: 清理旧向量完成, id={}, table={}", documentId, vectorTableName);
 
-        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = chunkIndexManager.getKeywordIndex();
         // 清理旧 BM25 索引：先按新格式 "kbId_fileName_" 清理，再兼容旧格式 "fileName_"
         keywordIndex.removeByPrefix(kbPrefix + fileName + "_");
         keywordIndex.removeByPrefix(fileName + "_");
@@ -1310,7 +1311,7 @@ public class KnowledgeDocumentService {
             // 片段进入处理中，向上聚合文档状态
             chunk.setVectorStatus(VectorStatus.CHUNK_PROCESSING);
             knowledgeDocumentChunkMapper.updateById(chunk);
-            hybridSearchService.markChunkVectorized(chunk.getId(), VectorStatus.CHUNK_PROCESSING);
+            chunkIndexManager.markChunkVectorized(chunk.getId(), VectorStatus.CHUNK_PROCESSING);
             recomputeDocumentVectorStatus(documentId);
 
             try {
@@ -1324,13 +1325,13 @@ public class KnowledgeDocumentService {
 
                 chunk.setVectorStatus(VectorStatus.CHUNK_COMPLETED);
                 knowledgeDocumentChunkMapper.updateById(chunk);
-                hybridSearchService.markChunkVectorized(chunk.getId(), VectorStatus.CHUNK_COMPLETED);
+                chunkIndexManager.markChunkVectorized(chunk.getId(), VectorStatus.CHUNK_COMPLETED);
                 allText.append(text).append("\n");
             } catch (Exception e) {
                 log.error("片段向量化失败: chunkId={}, documentId={}", chunk.getId(), documentId, e);
                 chunk.setVectorStatus(VectorStatus.CHUNK_FAILED);
                 knowledgeDocumentChunkMapper.updateById(chunk);
-                hybridSearchService.markChunkVectorized(chunk.getId(), VectorStatus.CHUNK_FAILED);
+                chunkIndexManager.markChunkVectorized(chunk.getId(), VectorStatus.CHUNK_FAILED);
                 // 失败时移除 BM25 索引，避免召回旧内容
                 keywordIndex.remove(bm25ChunkId(doc, chunk.getId()));
             }
@@ -1893,7 +1894,7 @@ public class KnowledgeDocumentService {
         recalcDocumentStats(chunk.getDocumentId());
 
         if (textChanged) {
-            hybridSearchService.markChunkVectorized(chunkId, VectorStatus.CHUNK_PENDING);
+            chunkIndexManager.markChunkVectorized(chunkId, VectorStatus.CHUNK_PENDING);
             recomputeDocumentVectorStatus(chunk.getDocumentId());
             triggerAfterCommit(() -> self.revectorizeChunkAsync(chunkId));
         }
@@ -1954,7 +1955,7 @@ public class KnowledgeDocumentService {
         knowledgeDocumentChunkMapper.updateById(first);
 
         // 删除其余片段（同步清理 BM25，异步清理向量）
-        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = chunkIndexManager.getKeywordIndex();
         for (int i = 1; i < chunks.size(); i++) {
             KnowledgeDocumentChunk c = chunks.get(i);
             keywordIndex.remove(bm25ChunkId(doc, c.getId()));
@@ -1967,7 +1968,7 @@ public class KnowledgeDocumentService {
         recalcDocumentStats(dto.getDocumentId());
 
         // 片段置为待处理 → 向上聚合文档状态 → 异步重算向量
-        hybridSearchService.markChunkVectorized(first.getId(), VectorStatus.CHUNK_PENDING);
+        chunkIndexManager.markChunkVectorized(first.getId(), VectorStatus.CHUNK_PENDING);
         recomputeDocumentVectorStatus(dto.getDocumentId());
         final Long mergedId = first.getId();
         triggerAfterCommit(() -> self.revectorizeChunkAsync(mergedId));
@@ -2001,7 +2002,7 @@ public class KnowledgeDocumentService {
         }
 
         // 删除原片段（同步清理 BM25，异步清理向量）
-        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = chunkIndexManager.getKeywordIndex();
         keywordIndex.remove(bm25ChunkId(doc, original.getId()));
         knowledgeDocumentChunkMapper.deleteById(original.getId());
         triggerAfterCommit(() -> self.removeChunkVectorAsync(original.getId()));
@@ -2030,7 +2031,7 @@ public class KnowledgeDocumentService {
         // 新片段置为待处理 → 向上聚合文档状态 → 异步向量化
         List<Long> newIds = result.stream().map(KnowledgeDocumentChunksVO.ChunkItem::getId).collect(java.util.stream.Collectors.toList());
         for (Long id : newIds) {
-            hybridSearchService.markChunkVectorized(id, VectorStatus.CHUNK_PENDING);
+            chunkIndexManager.markChunkVectorized(id, VectorStatus.CHUNK_PENDING);
         }
         recomputeDocumentVectorStatus(dto.getDocumentId());
         triggerAfterCommit(() -> {
@@ -2075,7 +2076,7 @@ public class KnowledgeDocumentService {
             docMap.put(chunk.getDocumentId(), doc);
         }
 
-        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = chunkIndexManager.getKeywordIndex();
         List<KnowledgeDocumentChunksVO.ChunkItem> result = new java.util.ArrayList<>();
 
         for (java.util.Map.Entry<Long, KnowledgeDocumentChunk> entry : chunkMap.entrySet()) {
@@ -2086,7 +2087,7 @@ public class KnowledgeDocumentService {
             knowledgeDocumentChunkMapper.updateById(chunk);
 
             // 同步向量检索过滤集合
-            hybridSearchService.markChunkEnabled(chunkId, dto.getEnabled());
+            chunkIndexManager.markChunkEnabled(chunkId, dto.getEnabled());
 
             // 同步 BM25 索引
             KnowledgeDocument doc = docMap.get(chunk.getDocumentId());
@@ -2120,7 +2121,7 @@ public class KnowledgeDocumentService {
         KnowledgeDocument doc = knowledgeDocumentMapper.selectById(documentId);
 
         // 同步清理 BM25 索引，异步清理向量
-        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+        com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = chunkIndexManager.getKeywordIndex();
         keywordIndex.remove(bm25ChunkId(doc, chunk.getId()));
         knowledgeDocumentChunkMapper.deleteById(chunk.getId());
         final Long deletedId = chunk.getId();
@@ -2295,7 +2296,7 @@ public class KnowledgeDocumentService {
         // 片段进入处理中，向上聚合文档状态
         chunk.setVectorStatus(VectorStatus.CHUNK_PROCESSING);
         knowledgeDocumentChunkMapper.updateById(chunk);
-        hybridSearchService.markChunkVectorized(chunkId, VectorStatus.CHUNK_PROCESSING);
+        chunkIndexManager.markChunkVectorized(chunkId, VectorStatus.CHUNK_PROCESSING);
         recomputeDocumentVectorStatus(doc.getId());
 
         try {
@@ -2307,7 +2308,7 @@ public class KnowledgeDocumentService {
             embeddingStore.add(embedding, TextSegment.from(text, buildChunkMetadata(doc, chunk)));
 
             // 更新 BM25
-            com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+            com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = chunkIndexManager.getKeywordIndex();
             String bm25Id = bm25ChunkId(doc, chunkId);
             keywordIndex.remove(bm25Id);
             if (chunk.getEnabled() == null || chunk.getEnabled()) {
@@ -2316,14 +2317,14 @@ public class KnowledgeDocumentService {
 
             chunk.setVectorStatus(VectorStatus.CHUNK_COMPLETED);
             knowledgeDocumentChunkMapper.updateById(chunk);
-            hybridSearchService.markChunkVectorized(chunkId, VectorStatus.CHUNK_COMPLETED);
+            chunkIndexManager.markChunkVectorized(chunkId, VectorStatus.CHUNK_COMPLETED);
             log.info("片段向量重算完成: chunkId={}", chunkId);
         } catch (Exception e) {
             log.error("片段向量重算失败: chunkId={}", chunkId, e);
             chunk.setVectorStatus(VectorStatus.CHUNK_FAILED);
             knowledgeDocumentChunkMapper.updateById(chunk);
-            hybridSearchService.markChunkVectorized(chunkId, VectorStatus.CHUNK_FAILED);
-            com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+            chunkIndexManager.markChunkVectorized(chunkId, VectorStatus.CHUNK_FAILED);
+            com.hai.aiknowledgebase.common.KeywordIndex keywordIndex = chunkIndexManager.getKeywordIndex();
             keywordIndex.remove(bm25ChunkId(doc, chunkId));
         }
         recomputeDocumentVectorStatus(doc.getId());

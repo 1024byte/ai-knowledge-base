@@ -9,6 +9,10 @@ import com.hai.aiknowledgebase.entity.KnowledgeDocumentChunk;
 import com.hai.aiknowledgebase.mapper.KnowledgeBaseMapper;
 import com.hai.aiknowledgebase.mapper.KnowledgeDocumentChunkMapper;
 import com.hai.aiknowledgebase.mapper.KnowledgeDocumentMapper;
+import com.hai.aiknowledgebase.retrieve.RankedResult;
+import com.hai.aiknowledgebase.retrieve.RerankedResult;
+import com.hai.aiknowledgebase.retrieve.RetrievalCoordinator;
+import com.hai.aiknowledgebase.retrieve.RetrievalTrace;
 import dev.langchain4j.data.segment.TextSegment;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -28,13 +32,13 @@ import java.util.stream.Collectors;
 /**
  * <h2>召回测试服务</h2>
  *
- * <p>复用 {@link RAGSearchService#retrieveWithTrace} 的生产检索编排（向量 / BM25 / RRF 融合 / Rerank），
+ * <p>复用 {@link RetrievalCoordinator#retrieveWithTrace} 的生产检索编排（向量 / BM25 / RRF 融合 / Rerank），
  * 仅保留「分词观测 + 数据补全 + 响应组装」等测试展示职责，确保召回测试观测到的检索行为
  * 与智慧问答生产链路使用同一套底层检索原语。</p>
  *
  * <h3>职责边界</h3>
  * <ul>
- *   <li><b>检索编排</b>：委托 {@link RAGSearchService#retrieveWithTrace}（单路检索、阈值过滤、融合、精排）</li>
+ *   <li><b>检索编排</b>：委托 {@link RetrievalCoordinator#retrieveWithTrace}（单路检索、阈值过滤、融合、精排）</li>
  *   <li><b>本服务保留</b>：BM25 分词观测、chunkId/documentId/source/kbName 数据补全、三路响应组装</li>
  * </ul>
  */
@@ -43,7 +47,7 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class RecallTestService {
 
-    private final RAGSearchService ragSearchService;
+    private final RetrievalCoordinator retrievalCoordinator;
     private final ChineseTokenizerService tokenizerService;
     private final KnowledgeDocumentChunkMapper chunkMapper;
     private final KnowledgeDocumentMapper documentMapper;
@@ -87,7 +91,7 @@ public class RecallTestService {
                 : new ArrayList<>(new LinkedHashSet<>(tokenizerService.tokenize(query, true)));
 
         // 3. 复用生产检索编排，一次性拿到向量/BM25/融合/精排四路观测结果
-        RAGSearchService.RetrievalTrace trace = ragSearchService.retrieveWithTrace(
+        RetrievalTrace trace = retrievalCoordinator.retrieveWithTrace(
                 query, strategy, topK, threshold, kbIds, documentIds, rrfK, enableRerank, rerankThreshold,
                 excludeKeywords);
 
@@ -127,15 +131,15 @@ public class RecallTestService {
      * 构建数据补全上下文：以片段主键为锚点，逐级反查「片段 → 文档 → 知识库」，
      * 得到 documentId / fileName（source）/ kbName。
      */
-    private CompletionContext buildCompletionContext(RAGSearchService.RetrievalTrace trace) {
+    private CompletionContext buildCompletionContext(RetrievalTrace trace) {
         Set<Long> chunkIds = new HashSet<>();
-        for (HybridSearchService.RankedResult r : trace.getVector()) {
+        for (RankedResult r : trace.getVector()) {
             addChunkId(chunkIds, r.getSegment());
         }
-        for (HybridSearchService.RankedResult r : trace.getBm25()) {
+        for (RankedResult r : trace.getBm25()) {
             addChunkId(chunkIds, r.getSegment());
         }
-        for (HybridSearchService.RankedResult r : trace.getFusion()) {
+        for (RankedResult r : trace.getFusion()) {
             addChunkId(chunkIds, r.getSegment());
         }
 
@@ -189,7 +193,7 @@ public class RecallTestService {
     /**
      * 将单路检索结果组装为响应项（向量 / BM25 共用）。
      */
-    private List<RecallTestResponse.RecallResultItem> complete(List<HybridSearchService.RankedResult> results,
+    private List<RecallTestResponse.RecallResultItem> complete(List<RankedResult> results,
                                                                CompletionContext context) {
         return results.stream()
                 .map(r -> buildItem(chunkIdOf(r.getSegment()), r.getSegment().text(), r.getScore(), context))
@@ -199,13 +203,13 @@ public class RecallTestService {
     /**
      * 组装 RRF 融合结果：补齐 vectorRank / bm25Rank。
      */
-    private List<RecallTestResponse.RecallResultItem> completeFusion(RAGSearchService.RetrievalTrace trace,
+    private List<RecallTestResponse.RecallResultItem> completeFusion(RetrievalTrace trace,
                                                                      CompletionContext context) {
         Map<Long, Integer> vectorRank = rankMap(trace.getVector());
         Map<Long, Integer> bm25Rank = rankMap(trace.getBm25());
 
         List<RecallTestResponse.RecallResultItem> items = new ArrayList<>();
-        for (HybridSearchService.RankedResult r : trace.getFusion()) {
+        for (RankedResult r : trace.getFusion()) {
             Long chunkId = chunkIdOf(r.getSegment());
             RecallTestResponse.RecallResultItem base =
                     buildItem(chunkId, r.getSegment().text(), r.getScore(), context);
@@ -226,12 +230,12 @@ public class RecallTestService {
     /**
      * 组装 Rerank 精排结果：复用融合项的基础字段，补齐 rerankScore / coarseRank / rerankRank。
      */
-    private List<RecallTestResponse.RecallResultItem> completeRerank(RAGSearchService.RetrievalTrace trace,
+    private List<RecallTestResponse.RecallResultItem> completeRerank(RetrievalTrace trace,
                                                                      CompletionContext context,
                                                                      List<RecallTestResponse.RecallResultItem> fusionItems) {
         List<RecallTestResponse.RecallResultItem> items = new ArrayList<>();
         int rerankRank = 1;
-        for (RAGSearchService.RetrievalTrace.RerankedResult rr : trace.getRerank()) {
+        for (RerankedResult rr : trace.getRerank()) {
             int coarseIdx = rr.getCoarseRank() - 1;
             RecallTestResponse.RecallResultItem base = (coarseIdx >= 0 && coarseIdx < fusionItems.size())
                     ? fusionItems.get(coarseIdx)
@@ -293,7 +297,7 @@ public class RecallTestService {
     /**
      * 构建「片段主键 → 1-based 排名」映射，用于融合结果补齐分路排名。
      */
-    private Map<Long, Integer> rankMap(List<HybridSearchService.RankedResult> results) {
+    private Map<Long, Integer> rankMap(List<RankedResult> results) {
         Map<Long, Integer> map = new HashMap<>();
         for (int i = 0; i < results.size(); i++) {
             Long chunkId = chunkIdOf(results.get(i).getSegment());

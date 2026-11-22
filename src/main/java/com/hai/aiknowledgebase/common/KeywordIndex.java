@@ -58,7 +58,7 @@ import java.util.stream.Collectors;
  * 支持多线程并发读写。{@code avgDocLength} 使用 {@code volatile} 保证可见性。</p>
  *
  * @see ChineseTokenizerService 中文分词服务（基于 jieba）
- * @see com.hai.aiknowledgebase.service.HybridSearchService 混合检索服务（调用方）
+ * @see com.hai.aiknowledgebase.retrieve.ChunkIndexManager 片段索引管理器（生命周期持有方）
  */
 @Slf4j
 public class KeywordIndex {
@@ -89,7 +89,7 @@ public class KeywordIndex {
 
     /**
      * 构造函数，注入中文分词服务。
-     * 由 {@link com.hai.aiknowledgebase.service.HybridSearchService} 在初始化时创建。
+     * 由 {@link com.hai.aiknowledgebase.retrieve.ChunkIndexManager} 在初始化时创建。
      *
      * @param tokenizerService 中文分词服务实例
      */

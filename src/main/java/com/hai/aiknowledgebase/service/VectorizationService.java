@@ -8,6 +8,7 @@ import com.hai.aiknowledgebase.common.ResultCode;
 import com.hai.aiknowledgebase.entity.DocumentMetadata;
 import com.hai.aiknowledgebase.exception.BusinessException;
 import com.hai.aiknowledgebase.mapper.DocumentMetadataMapper;
+import com.hai.aiknowledgebase.retrieve.ChunkIndexManager;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.Metadata;
 import dev.langchain4j.data.embedding.Embedding;
@@ -70,7 +71,7 @@ import java.util.List;
  *
  * @see DocumentParserService 文档解析服务
  * @see DocumentChunkerService 文档切片服务
- * @see HybridSearchService 混合检索服务（提供 BM25 索引）
+ * @see ChunkIndexManager 片段索引管理器（提供 BM25 索引）
  * @see DocumentHashService 文档哈希去重服务
  */
 @Slf4j
@@ -96,8 +97,8 @@ public class VectorizationService {
     /** MyBatis-Plus 文档元数据 Mapper，用于更新文档状态 */
     private final DocumentMetadataMapper documentMetadataMapper;
 
-    /** 混合检索服务：提供 BM25 关键词索引，向量化时同步建立关键词索引 */
-    private final HybridSearchService hybridSearchService;
+    /** 片段索引管理器：提供 BM25 关键词索引，向量化时同步建立关键词索引 */
+    private final ChunkIndexManager chunkIndexManager;
 
     /** SSE 状态推送服务：向量化完成后向前端实时推送状态 */
     private final DocumentStatusSseService documentStatusSseService;
@@ -185,8 +186,8 @@ public class VectorizationService {
             }
 
             // ===== 步骤6：BM25 关键词索引 =====
-            // 从 HybridSearchService 获取 BM25 关键词倒排索引实例
-            KeywordIndex keywordIndex = hybridSearchService.getKeywordIndex();
+            // 从 ChunkIndexManager 获取 BM25 关键词倒排索引实例
+            KeywordIndex keywordIndex = chunkIndexManager.getKeywordIndex();
             // 将每个片段加入索引，chunkId 格式为 "sourceFileName_chunkIndex"
             // 例如 sourceFileName="时态.md"，第3个片段 → chunkId="时态.md_2"
             for (int i = 0; i < segments.size(); i++) {

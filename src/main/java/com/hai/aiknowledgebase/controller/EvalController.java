@@ -11,16 +11,12 @@ import com.hai.aiknowledgebase.dto.QueryRewriteResult;
 import com.hai.aiknowledgebase.dto.RewriteRequest;
 import com.hai.aiknowledgebase.exception.BusinessException;
 import com.hai.aiknowledgebase.queryrewrite.QueryRewriteService;
-import com.hai.aiknowledgebase.service.ChineseTokenizerService;
-import com.hai.aiknowledgebase.service.HybridSearchService;
-import com.hai.aiknowledgebase.service.RAGSearchService;
+import com.hai.aiknowledgebase.retrieve.RankedResult;
+import com.hai.aiknowledgebase.retrieve.RerankOrchestrator;
+import com.hai.aiknowledgebase.retrieve.RetrievalCoordinator;
+import com.hai.aiknowledgebase.retrieve.VectorRetriever;
 import com.hai.aiknowledgebase.service.RerankerService;
-import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.store.embedding.EmbeddingMatch;
-import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
-import dev.langchain4j.store.embedding.EmbeddingStore;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
@@ -34,13 +30,14 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class EvalController {
 
-    private final RAGSearchService ragSearchService;
-    private final HybridSearchService hybridSearchService;
+    /** 检索协调器：混合检索编排 */
+    private final RetrievalCoordinator retrievalCoordinator;
+    /** 向量检索原语：vector_only 模式使用 */
+    private final VectorRetriever vectorRetriever;
     private final QueryRewriteService queryRewriteService;
     private final RerankerService rerankerService;
-    private final ChineseTokenizerService tokenizerService;
-    private final EmbeddingStore<TextSegment> embeddingStore;
-    private final EmbeddingModel embeddingModel;
+    /** Rerank 编排器：排除词过滤 / 精排 / 阈值过滤 */
+    private final RerankOrchestrator rerankOrchestrator;
     private final ThresholdsConfig thresholdsConfig;
 
     @PostMapping("/retrieve")
@@ -94,44 +91,28 @@ public class EvalController {
         }
 
         // 阶段1：检索（向量 only 或 混合检索）
-        List<HybridSearchService.RankedResult> hybridResults;
+        List<RankedResult> hybridResults;
         if (doHybrid) {
             hybridResults = new ArrayList<>(
-                    hybridSearchService.hybridSearchRanked(searchQuery, topK, thresholdsConfig.getRetrieval().getVectorMinScore()));
+                    retrievalCoordinator.hybridSearchRanked(searchQuery, topK, thresholdsConfig.getRetrieval().getVectorMinScore()));
         } else {
-            hybridResults = vectorOnlySearch(searchQuery, topK);
+            hybridResults = vectorRetriever.vectorSearchRanked(searchQuery, topK);
         }
         builder.hybrid(toStageResult(hybridResults));
 
-        // 阶段2：排除关键词过滤
+        // 阶段2：排除关键词过滤（复用 RerankOrchestrator，过滤为空时降级保留原始结果）
         int beforeFilter = hybridResults.size();
         List<Integer> removedIndices = new ArrayList<>();
-        List<HybridSearchService.RankedResult> filteredResults = hybridResults;
-
-        if (excludeKeywords != null && !excludeKeywords.isEmpty()) {
-            filteredResults = new ArrayList<>();
+        List<RankedResult> filteredResults =
+                rerankOrchestrator.filterByExcludeKeywords(hybridResults, excludeKeywords);
+        // 发生过滤时按对象身份比对，还原被剔除片段的下标（供评估报告展示）
+        if (filteredResults != hybridResults) {
             for (int i = 0; i < hybridResults.size(); i++) {
-                HybridSearchService.RankedResult rr = hybridResults.get(i);
-                String text = rr.getSegment().text();
-                List<String> segTokens = tokenizerService.tokenize(text, true);
-                Set<String> tokenSet = new HashSet<>(segTokens);
-                boolean excluded = false;
-                for (String exclude : excludeKeywords) {
-                    if (tokenSet.contains(exclude)) {
-                        excluded = true;
-                        break;
-                    }
-                }
-                if (excluded) {
+                RankedResult rr = hybridResults.get(i);
+                boolean kept = filteredResults.stream().anyMatch(f -> f == rr);
+                if (!kept) {
                     removedIndices.add(i);
-                } else {
-                    filteredResults.add(rr);
                 }
-            }
-            if (filteredResults.isEmpty() && beforeFilter > 0) {
-                log.warn("排除关键词过滤导致所有片段被剔除({} -> 0)，降级保留原始结果", beforeFilter);
-                filteredResults = hybridResults;
-                removedIndices.clear();
             }
         }
         builder.excludeFilter(ExcludeFilterResult.builder()
@@ -140,31 +121,16 @@ public class EvalController {
                 .removedIndices(removedIndices)
                 .build());
 
-        // 阶段3：Rerank 精排
-        List<HybridSearchService.RankedResult> rerankedResults = filteredResults;
+        // 阶段3：Rerank 精排（复用 RerankOrchestrator）
+        List<RankedResult> rerankedResults = filteredResults;
         if (doRerank && rerankerService.isAvailable() && !filteredResults.isEmpty()) {
-            List<String> docTexts = filteredResults.stream()
-                    .map(r -> r.getSegment().text())
-                    .collect(Collectors.toList());
-
-            List<RerankerService.RerankResult> rerankResults = rerankerService.rerank(searchQuery, docTexts, filteredResults.size());
-            rerankedResults = new ArrayList<>();
-            for (RerankerService.RerankResult rr : rerankResults) {
-                HybridSearchService.RankedResult original = filteredResults.get(rr.getIndex());
-                rerankedResults.add(new HybridSearchService.RankedResult(original.getSegment(), rr.getScore()));
-            }
+            rerankedResults = rerankOrchestrator.rerank(searchQuery, filteredResults);
         }
         builder.rerank(toStageResult(rerankedResults));
 
-        // 阶段4：Rerank 分数阈值过滤
+        // 阶段4：Rerank 分数阈值过滤（复用 RerankOrchestrator，全剔除时降级保留）
         double minRerankScore = thresholdsConfig.getReranker().getMinScore();
-        List<HybridSearchService.RankedResult> finalResults = rerankedResults.stream()
-                .filter(r -> r.getScore() >= minRerankScore)
-                .collect(Collectors.toList());
-        if (finalResults.isEmpty() && !rerankedResults.isEmpty()) {
-            log.warn("Rerank 阈值过滤({})导致所有片段被剔除，降级保留原始结果", minRerankScore);
-            finalResults = rerankedResults;
-        }
+        List<RankedResult> finalResults = rerankOrchestrator.filterByMinScore(rerankedResults, minRerankScore);
 
         // 最终排序
         finalResults.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
@@ -173,28 +139,14 @@ public class EvalController {
         return builder.build();
     }
 
-    private List<HybridSearchService.RankedResult> vectorOnlySearch(String query, int topK) {
-        Embedding queryEmbedding = embeddingModel.embed(query).content();
-        EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
-                .queryEmbedding(queryEmbedding)
-                .maxResults(topK)
-                .build();
-        List<EmbeddingMatch<TextSegment>> matches = embeddingStore.search(request).matches();
-        List<HybridSearchService.RankedResult> results = new ArrayList<>();
-        for (EmbeddingMatch<TextSegment> match : matches) {
-            results.add(new HybridSearchService.RankedResult(match.embedded(), match.score()));
-        }
-        return results;
-    }
-
-    private StageResult toStageResult(List<HybridSearchService.RankedResult> results) {
+    private StageResult toStageResult(List<RankedResult> results) {
         return StageResult.builder()
                 .results(toRetrievedDocList(results))
                 .count(results.size())
                 .build();
     }
 
-    private List<RetrievedDoc> toRetrievedDocList(List<HybridSearchService.RankedResult> results) {
+    private List<RetrievedDoc> toRetrievedDocList(List<RankedResult> results) {
         return results.stream()
                 .map(rr -> {
                     TextSegment seg = rr.getSegment();

@@ -1,5 +1,6 @@
 package com.hai.aiknowledgebase.service;
 
+import com.hai.aiknowledgebase.retrieve.RankedResult;
 import dev.langchain4j.data.segment.TextSegment;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -42,8 +43,8 @@ public class ParentContextExpander {
      * @param results 检索结果列表（按分数降序）
      * @return 扩展并去重后的结果列表，分数不变
      */
-    public List<HybridSearchService.RankedResult> expand(
-            List<HybridSearchService.RankedResult> results) {
+    public List<RankedResult> expand(
+            List<RankedResult> results) {
         if (results == null || results.isEmpty()) {
             return results;
         }
@@ -51,13 +52,13 @@ public class ParentContextExpander {
         // ===== 阶段1：独立扩展 =====
         // 每个 chunk 用自己的 parent_text 替换原始文本，不跨 chunk 合并
         int expandedCount = 0;
-        List<HybridSearchService.RankedResult> expanded = new ArrayList<>(results.size());
+        List<RankedResult> expanded = new ArrayList<>(results.size());
 
-        for (HybridSearchService.RankedResult r : results) {
+        for (RankedResult r : results) {
             String parentText = r.getSegment().metadata().getString("parent_text");
             if (parentText != null && !parentText.isBlank()) {
                 TextSegment expandedSegment = TextSegment.from(parentText, r.getSegment().metadata());
-                expanded.add(new HybridSearchService.RankedResult(
+                expanded.add(new RankedResult(
                         expandedSegment, r.getScore(), r.getVectorScore(), r.getBm25Score()));
                 expandedCount++;
             } else {
@@ -73,7 +74,7 @@ public class ParentContextExpander {
         // 相邻 chunk 的 parent_text 高度重叠（如 chunk 1 和 chunk 2 共享 4/5 内容）
         // 按段落 hash 去重，保留分数最高的
         int beforeDedup = expanded.size();
-        List<HybridSearchService.RankedResult> deduplicated = deduplicateByParagraphHash(expanded);
+        List<RankedResult> deduplicated = deduplicateByParagraphHash(expanded);
         if (deduplicated.size() < beforeDedup) {
             log.info("父上下文去重: {} -> {} 个片段", beforeDedup, deduplicated.size());
         }
@@ -97,14 +98,14 @@ public class ParentContextExpander {
      * @param results 扩展后的结果列表
      * @return 去重后的结果列表，保持原始顺序
      */
-    private List<HybridSearchService.RankedResult> deduplicateByParagraphHash(
-            List<HybridSearchService.RankedResult> results) {
+    private List<RankedResult> deduplicateByParagraphHash(
+            List<RankedResult> results) {
         if (results.size() <= 1) return results;
 
-        Map<Integer, HybridSearchService.RankedResult> seen = new LinkedHashMap<>();
-        for (HybridSearchService.RankedResult r : results) {
+        Map<Integer, RankedResult> seen = new LinkedHashMap<>();
+        for (RankedResult r : results) {
             int hash = computeParagraphHash(r.getSegment().text());
-            HybridSearchService.RankedResult existing = seen.get(hash);
+            RankedResult existing = seen.get(hash);
             if (existing == null || r.getScore() > existing.getScore()) {
                 seen.put(hash, r);
             }

@@ -75,6 +75,8 @@ public class ChatService {
     private final TokenCountEstimator tokenCountEstimator;
     private final ThreadPoolTaskExecutor chatTaskExecutor;
     private final KbPermissionService kbPermissionService;
+    /** 参数值读取器，按作用域动态读取检索调优参数（retrieval.topK 等） */
+    private final ParamValueProvider paramValueProvider;
 
     @Value("${chat.prompt.max-context-tokens:3000}")
     private int maxContextTokens;
@@ -118,7 +120,8 @@ public class ChatService {
                        QueryRewriteService queryRewriteService,
                        TokenCountEstimator tokenCountEstimator,
                        @Qualifier("chatTaskExecutor") ThreadPoolTaskExecutor chatTaskExecutor,
-                       KbPermissionService kbPermissionService) {
+                       KbPermissionService kbPermissionService,
+                       ParamValueProvider paramValueProvider) {
         this.chatModel = chatModel;
         this.streamingChatModel = streamingChatModel;
         this.embeddingStore = embeddingStore;
@@ -130,6 +133,7 @@ public class ChatService {
         this.tokenCountEstimator = tokenCountEstimator;
         this.chatTaskExecutor = chatTaskExecutor;
         this.kbPermissionService = kbPermissionService;
+        this.paramValueProvider = paramValueProvider;
     }
 
 
@@ -234,12 +238,15 @@ public class ChatService {
     @Timed("RAG 全流程")
     public HaiChatResponse chat(String sessionId, String question, Long userId,
                                Integer requestTopK, Double requestMinScore, Long kbId) {
-        int effectiveTopK = (requestTopK != null && requestTopK > 0) ? requestTopK : this.topK;
         double effectiveMinScore = (requestMinScore != null) ? requestMinScore : -1;
         long startTime = System.currentTimeMillis();
 
         // 知识库隔离：指定 kbId 时校验权限；未指定时回退到当前用户可见的知识库范围
         Set<Long> kbIds = resolveSearchScope(userId, kbId);
+        // topK：请求指定优先，其次动态参数（retrieval.topK，代表 kbId 级覆盖 → 全局），最后 yml 兜底
+        int effectiveTopK = (requestTopK != null && requestTopK > 0)
+                ? requestTopK
+                : paramValueProvider.getInt("retrieval.topK", representativeKbId(kbIds), this.topK);
 
         // 步骤0：查询改写（含指代消解，使用对话历史）
         // 0.1 获取当前会话的 ChatMemory，提取最近 2 轮对话历史
@@ -342,13 +349,16 @@ public class ChatService {
      */
     public SseEmitter chatStream(String sessionId, String question, Long userId,
                                   Integer requestTopK, Double requestMinScore, Long kbId) {
-        int effectiveTopK = (requestTopK != null && requestTopK > 0) ? requestTopK : this.topK;
         double effectiveMinScore = (requestMinScore != null) ? requestMinScore : -1;
         SseEmitter emitter = new SseEmitter(120_000L);
         String messageId = UUID.randomUUID().toString();
 
         // 知识库隔离：指定 kbId 时校验权限；未指定时回退到当前用户可见的知识库范围
         Set<Long> kbIds = resolveSearchScope(userId, kbId);
+        // topK：请求指定优先，其次动态参数（retrieval.topK，代表 kbId 级覆盖 → 全局），最后 yml 兜底
+        int effectiveTopK = (requestTopK != null && requestTopK > 0)
+                ? requestTopK
+                : paramValueProvider.getInt("retrieval.topK", representativeKbId(kbIds), this.topK);
 
         chatTaskExecutor.execute(() -> {
             try {
@@ -991,6 +1001,20 @@ public class ChatService {
             return Set.of(kbId);
         }
         return new HashSet<>(kbPermissionService.getVisibleKbIds(userId));
+    }
+
+    /**
+     * 选取本轮检索的代表知识库 ID（方案 A）：取集合最小值以保证确定性。
+     * 全局倾向参数（如 retrieval.topK）按代表库读取，无覆盖则回退全局。
+     *
+     * @param kbIds 检索范围（null/空 表示全局）
+     * @return 代表 kbId；全局检索时返回 null
+     */
+    private Long representativeKbId(Set<Long> kbIds) {
+        if (kbIds == null || kbIds.isEmpty()) {
+            return null;
+        }
+        return Collections.min(kbIds);
     }
 
     private ContextBuildResult buildContextWithinBudget(List<TextSegment> segments, int maxTokens) {

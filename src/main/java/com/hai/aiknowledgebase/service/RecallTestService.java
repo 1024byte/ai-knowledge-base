@@ -15,6 +15,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -48,6 +49,7 @@ public class RecallTestService {
     private final KnowledgeDocumentMapper documentMapper;
     private final KnowledgeBaseMapper kbMapper;
     private final ThresholdsConfig thresholdsConfig;
+    private final ParamValueProvider paramValueProvider;
 
     /**
      * 执行一次召回测试。
@@ -62,7 +64,10 @@ public class RecallTestService {
         int rrfK = request.getRrfK() == null ? 60 : request.getRrfK();
         boolean enableRerank = request.isEnableRerank();
         double rerankThreshold = request.getRerankThreshold() == null
-                ? thresholdsConfig.getReranker().getMinScore()
+                ? paramValueProvider.getDouble("rerank.minScore",
+                        (request.getKbIds() == null || request.getKbIds().isEmpty())
+                                ? null : Collections.min(request.getKbIds()),
+                        thresholdsConfig.getReranker().getMinScore())
                 : request.getRerankThreshold();
 
         // 1. 检索范围解析：kbIds 必选；documentIds 为空表示所选知识库下全部文档（不过滤文档范围）

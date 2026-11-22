@@ -83,9 +83,32 @@ public class RAGSearchService {
 
     private final ThresholdsConfig thresholdsConfig; // 阈值配置
 
+    /** 参数管理服务，用于按知识库计算参数指纹（多库检索时拆库分组） */
+    private final ParamService paramService;
+
+    /** 参数值读取器，按作用域动态读取检索调优参数（rrfK / vectorMinScore 等） */
+    private final ParamValueProvider paramValueProvider;
+
     /** 向量检索最低余弦相似度阈值，由 ThresholdsConfig 统一管理 */
     private double getMinVectorScore() {
         return thresholdsConfig.getRetrieval().getVectorMinScore();
+    }
+
+    /**
+     * 选取本轮检索的代表知识库 ID（方案 A）。
+     *
+     * <p>多库检索时，rerank.enabled / rerank.minScore / contentType.*.weight /
+     * retrieval.parentContextEnabled 这类「全局倾向」参数以代表 kbId 读取：
+     * 优先取该知识库的 KB 级覆盖，无则回退全局。代表值取集合最小值以保证确定性。</p>
+     *
+     * @param kbIds 检索范围（null/空 表示全局）
+     * @return 代表 kbId；全局检索时返回 null
+     */
+    private Long representativeKbId(Set<Long> kbIds) {
+        if (kbIds == null || kbIds.isEmpty()) {
+            return null;
+        }
+        return Collections.min(kbIds);
     }
 
     // ==================== 核心检索方法 ====================
@@ -140,22 +163,34 @@ public class RAGSearchService {
                                               List<String> excludeKeywords,
                                               Set<Long> kbIds) {
         double effectiveMinScore = (minScore > 0) ? minScore : getMinVectorScore();
-        log.info("开始检索，用户查询: {} | topK: {} | minScore: {} | 扩展词: {} | 排除词: {} | kbIds: {}",
-                userQuery, topK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
+        // 多库检索的代表 kbId（方案 A）：全局倾向参数按代表库读取，无覆盖则回退全局
+        Long repKbId = representativeKbId(kbIds);
+        // 动态参数（param 优先，yml/硬编码兜底）
+        boolean rerankEnabled = paramValueProvider.getBoolean(
+                "rerank.enabled", repKbId, rerankerService.isEnabled());
+        double rerankMinScore = paramValueProvider.getDouble(
+                "rerank.minScore", repKbId, rerankerService.getMinScore());
+        boolean parentContextEnabled = paramValueProvider.getBoolean(
+                "retrieval.parentContextEnabled", repKbId, true);
+        log.info("开始检索，用户查询: {} | topK: {} | minScore: {} | 扩展词: {} | 排除词: {} | kbIds: {} | 代表kbId: {} | rerankEnabled: {} | parentContextEnabled: {}",
+                userQuery, topK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds, repKbId, rerankEnabled, parentContextEnabled);
 
         // ===== 阶段1：混合检索（主路径）=====
-        // 并行执行向量检索 + BM25 关键词检索，RRF 融合排序
-        // minVectorScore 过滤掉余弦相似度低于阈值的向量结果，避免无关片段进入融合
-
+        // 按参数指纹拆库分组检索：指纹相同的知识库合并为一次检索，
+        // 指纹不同的知识库拆分检索，避免多库混查时的参数歧义（rrfK / vectorMinScore）。
         List<HybridSearchService.RankedResult> allResults = new ArrayList<>(
-                hybridSearchService.hybridSearchRanked(userQuery, topK, effectiveMinScore, kbIds));
+                retrieveByFingerprintGroups(userQuery, topK, effectiveMinScore, kbIds));
 
         log.info("混合检索召回 {} 个片段", allResults.size());
 
         // ===== 阶段1.5：父上下文扩展 =====
         // 用入库时预计算的 parent_text 替换 chunk 文本，实现零延迟的上下文补全。
         // 解决 PDF 解析将编号列表/长段落误切分导致的碎片化问题。
-        allResults = parentContextExpander.expand(allResults);
+        if (parentContextEnabled) {
+            allResults = parentContextExpander.expand(allResults);
+        } else {
+            log.debug("父上下文扩展已关闭（retrieval.parentContextEnabled=false），跳过 parent_text 替换");
+        }
 
         // ===== 阶段2：排除关键词过滤 =====
         // 对片段分词后精确匹配排除词（避免子串误杀，如排除"Java"误杀"JavaScript"）
@@ -164,7 +199,9 @@ public class RAGSearchService {
         // ===== 阶段3：Cross-Encoder Rerank 精排 =====
         // 使用 BGE-Reranker-v2-m3 对候选片段进行 Cross-Encoder 精排
         // Cross-Encoder 将 (query, doc) 联合编码，捕捉 Bi-Encoder 无法建模的词间交互
-        if (rerankerService.isAvailable() && !allResults.isEmpty()) {
+        boolean rerankApplied = false;
+        if (rerankEnabled && rerankerService.isAvailable() && !allResults.isEmpty()) {
+            rerankApplied = true;
             log.info("开始 Rerank 精排，候选片段数: {}", allResults.size());
 
             List<String> docTexts = allResults.stream()
@@ -187,14 +224,21 @@ public class RAGSearchService {
                     allResults.stream().limit(3)
                             .map(r -> String.format("%.4f", r.getScore()))
                             .collect(Collectors.joining(", ")));
-        } else if (rerankerService.isEnabled() && !rerankerService.isAvailable()) {
-            log.info("Reranker 已启用但未初始化，跳过精排");
+        } else if (rerankEnabled && !rerankerService.isAvailable()) {
+            log.warn("rerank.enabled 已开启（代表kbId={}）但 Reranker 模型未加载（yml reranker.enabled=false 或初始化失败），跳过精排", repKbId);
         }
 
-        // ===== 最终重排序：按分数降序统一排序 =====
-        // 阶段1(RRF分数) + 阶段2(向量相似度) 的结果混合后，按分数统一重排序
-        // 确保最相关的片段排在前面，缓解 LLM "lost in the middle" 问题
-        allResults.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
+        // ===== 最终重排序 =====
+        // - Rerank 开启：score 已为 Cross-Encoder 精排分，直接按精排分降序。
+        // - Rerank 关闭：跨库合并后绝不能用 RRF 分做最终排序，改按原始向量相似度
+        //   （vectorScore）降序，无向量分则回退 BM25 分（bm25Score）；并把 score 重指为
+        //   实际排序值，否则后续 applyContentTypeWeighting 内部重新 sort 会再次用 RRF 分破坏顺序。
+        if (rerankApplied) {
+            allResults.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
+        } else {
+            // 跨库合并后绝不能用 RRF 分做最终排序，改按原始向量相似度重排（生产与召回测试共用此逻辑）
+            allResults = reorderByRawScore(allResults);
+        }
         log.info("分数重排序完成，Top-3 分数: {}",
                 allResults.stream().limit(3)
                         .map(r -> String.format("%.4f", r.getScore()))
@@ -204,7 +248,7 @@ public class RAGSearchService {
         // 剔除 Rerank 分数过低的片段，避免噪音进入 LLM 上下文
         int beforeFilter = allResults.size();
         List<HybridSearchService.RankedResult> filtered = allResults.stream()
-                .filter(r -> r.getScore() >= rerankerService.getMinScore())
+                .filter(r -> r.getScore() >= rerankMinScore)
                 .collect(Collectors.toList());
         if (filtered.isEmpty() && beforeFilter > 0) {
             log.warn("分数阈值过滤剔除了所有片段({} -> 0)，降级保留全部", beforeFilter);
@@ -212,14 +256,96 @@ public class RAGSearchService {
             allResults = filtered;
         }
         log.info("分数阈值过滤: {} -> {} 个片段 (阈值={})", beforeFilter, allResults.size(),
-                String.format("%.2f", rerankerService.getMinScore()));
+                String.format("%.2f", rerankMinScore));
 
         // ===== 阶段5：content_type 降权 =====
         // 对非正文内容（题目、词汇表、答案）降低分数，确保正文优先
-        allResults = applyContentTypeWeighting(allResults);
+        allResults = applyContentTypeWeighting(allResults, repKbId);
 
         log.info("最终返回 {} 个片段", allResults.size());
         return allResults;
+    }
+
+    /**
+     * <h3>按参数指纹拆库分组检索</h3>
+     *
+     * <p>多库混查时，不同知识库可能配置了不同的 {@code retrieval.rrfK} /
+     * {@code retrieval.vectorMinScore}。若合并为一次检索，只能取单一参数值，
+     * 会产生「参数歧义」（部分库的阈值被错误应用到其他库）。</p>
+     *
+     * <p>本方法以 {@link ParamService#fingerprint(Long)} 生成的参数指纹为分组键：
+     * 指纹相同的知识库合并为一次检索（共享同一组参数），指纹不同的知识库拆分检索，
+     * 各组结果直接合并返回，由调用方统一重排。</p>
+     *
+     * <h4>分支规则</h4>
+     * <ul>
+     *   <li>{@code kbIds == null}：全局检索（不过滤知识库），读取全局 {@code retrieval.rrfK}，
+     *       向量阈值沿用调用方传入的 {@code effectiveMinScore}。</li>
+     *   <li>{@code kbIds} 为空集合：无可见知识库，返回空列表。</li>
+     *   <li>否则：按指纹分组，每组取代表 kbId 读取该组的 {@code rrfK} 与 {@code vectorMinScore}
+     *       （兜底分别为 yml 默认值与 {@code effectiveMinScore}），分别检索后合并。</li>
+     * </ul>
+     *
+     * @param query             用户查询文本
+     * @param topK              每组返回结果数量上限
+     * @param effectiveMinScore 向量最低相似度兜底阈值（调用方已解析）
+     * @param kbIds             知识库范围（null 表示不过滤）
+     * @return 合并后的检索结果（尚未跨库重排）
+     */
+    private List<HybridSearchService.RankedResult> retrieveByFingerprintGroups(
+            String query, int topK, double effectiveMinScore, Set<Long> kbIds) {
+        if (kbIds == null) {
+            int globalRrfK = paramValueProvider.getInt(
+                    "retrieval.rrfK", null, hybridSearchService.getDefaultRrfK());
+            return hybridSearchService.hybridSearchRanked(
+                    query, topK, effectiveMinScore, null, globalRrfK);
+        }
+        if (kbIds.isEmpty()) {
+            return Collections.emptyList();
+        }
+        // 按参数指纹分组（LinkedHashMap 保持分组顺序稳定）
+        Map<String, List<Long>> groups = new LinkedHashMap<>();
+        for (Long kbId : kbIds) {
+            groups.computeIfAbsent(paramService.fingerprint(kbId), k -> new ArrayList<>()).add(kbId);
+        }
+        List<HybridSearchService.RankedResult> merged = new ArrayList<>();
+        for (List<Long> group : groups.values()) {
+            Long rep = group.get(0);
+            int rrfK = paramValueProvider.getInt("retrieval.rrfK", rep, hybridSearchService.getDefaultRrfK());
+            double groupMin = paramValueProvider.getDouble("retrieval.vectorMinScore", rep, effectiveMinScore);
+            merged.addAll(hybridSearchService.hybridSearchRanked(
+                    query, topK, groupMin, new HashSet<>(group), rrfK));
+        }
+        return merged;
+    }
+
+    /**
+     * <h3>跨库重排（Rerank 关闭时）：按原始分重排并重指 score</h3>
+     *
+     * <p>跨库合并后绝不能用 RRF 融合分做最终排序，否则不同知识库的片段会被 RRF 分
+     * 混排，掩盖真实的向量相似度差距。本方法按原始向量相似度 {@code vectorScore} 降序，
+     * 无向量分时回退 BM25 分 {@code bm25Score}，两者皆无则回退原 {@code score}；
+     * 并把 {@code score} 重指为实际排序值，确保后续 {@code applyContentTypeWeighting}
+     * 内部重新 sort 时使用的是真实相似度而非 RRF 分。</p>
+     *
+     * <p>生产检索（{@link #retrieveSegments}）与召回测试（{@link #retrieveWithTrace}）
+     * 共用此方法，保证两条链路的「Rerank 关闭」排序语义完全一致。</p>
+     *
+     * @param results 待重排的检索结果（已携带 vectorScore / bm25Score）
+     * @return 重排后的结果列表，score 已重指为排序依据值
+     */
+    private List<HybridSearchService.RankedResult> reorderByRawScore(
+            List<HybridSearchService.RankedResult> results) {
+        return results.stream()
+                .map(r -> {
+                    double sortValue = (r.getVectorScore() != null)
+                            ? r.getVectorScore()
+                            : (r.getBm25Score() != null ? r.getBm25Score() : r.getScore());
+                    return new HybridSearchService.RankedResult(
+                            r.getSegment(), sortValue, r.getVectorScore(), r.getBm25Score());
+                })
+                .sorted((a, b) -> Double.compare(b.getScore(), a.getScore()))
+                .collect(Collectors.toList());
     }
 
     /**
@@ -243,7 +369,7 @@ public class RAGSearchService {
      * @return 降权后的结果列表
      */
     private List<HybridSearchService.RankedResult> applyContentTypeWeighting(
-            List<HybridSearchService.RankedResult> results) {
+            List<HybridSearchService.RankedResult> results, Long repKbId) {
         List<HybridSearchService.RankedResult> weighted = new ArrayList<>();
         int passageCount = 0;
         int nonPassageCount = 0;
@@ -251,7 +377,7 @@ public class RAGSearchService {
         for (HybridSearchService.RankedResult result : results) {
             String contentType = getContentTypeOf(result.getSegment());
 
-            double weight = getContentTypeWeight(contentType);
+            double weight = getContentTypeWeight(contentType, repKbId);
             double newScore = result.getScore() * weight;
 
             weighted.add(new HybridSearchService.RankedResult(result.getSegment(), newScore));
@@ -274,7 +400,9 @@ public class RAGSearchService {
     }
 
     /**
-     * 获取内容类型的分数权重系数。
+     * 获取 content_type 的分数权重系数（硬编码默认值，不读动态参数）。
+     * 供 trace 路径 {@link #applyContentTypeWeightingToReranked} 调用，保持行为不变；
+     * 生产路径请使用带 repKbId 的重载以支持动态覆盖。
      */
     private double getContentTypeWeight(String contentType) {
         if (contentType == null) {
@@ -288,6 +416,25 @@ public class RAGSearchService {
             case "mixed" -> 0.7;
             default -> 1.0;
         };
+    }
+
+    /**
+     * 获取 content_type 的分数权重系数（动态参数优先，硬编码兜底）。
+     *
+     * <p>按 contentType 映射到参数键 {@code contentType.{type}.weight}，以代表 kbId 读取：
+     * 优先 KB 级覆盖 → 回退全局 → 最后回退硬编码默认值。passage 与未知类型权重恒为 1.0，
+     * 不发起参数查询。</p>
+     *
+     * @param contentType 内容类型（不区分大小写）
+     * @param repKbId     代表知识库 ID（null 表示仅读全局）
+     */
+    private double getContentTypeWeight(String contentType, Long repKbId) {
+        double fallback = getContentTypeWeight(contentType);
+        if (fallback == 1.0) {
+            return 1.0;
+        }
+        return paramValueProvider.getDouble(
+                "contentType." + contentType.toLowerCase() + ".weight", repKbId, fallback);
     }
 
     /**
@@ -305,10 +452,14 @@ public class RAGSearchService {
      * <h3>对 Rerank 精排结果执行 content_type 降权</h3>
      *
      * <p>与 {@link #applyContentTypeWeighting} 逻辑一致，作用于 {@link RetrievalTrace.RerankedResult}
-     * 列表：按 content_type 权重乘以精排分数后降序重排，coarseRank（粗排位次）保持不变。</p>
+     * 列表：按 content_type 权重乘以精排分数后降序重排，coarseRank（粗排位次）保持不变。
+     * 权重以代表 kbId 读取动态参数（{@code contentType.{type}.weight}），与生产链路保持一致。</p>
+     *
+     * @param results 精排结果列表
+     * @param repKbId 代表知识库 ID（null 表示仅读全局）
      */
     private List<RetrievalTrace.RerankedResult> applyContentTypeWeightingToReranked(
-            List<RetrievalTrace.RerankedResult> results) {
+            List<RetrievalTrace.RerankedResult> results, Long repKbId) {
         if (results.isEmpty()) {
             return results;
         }
@@ -318,7 +469,7 @@ public class RAGSearchService {
 
         for (RetrievalTrace.RerankedResult rr : results) {
             String contentType = getContentTypeOf(rr.getSegment());
-            double weight = getContentTypeWeight(contentType);
+            double weight = getContentTypeWeight(contentType, repKbId);
             weighted.add(new RetrievalTrace.RerankedResult(
                     rr.getSegment(), rr.getRerankScore() * weight, rr.getCoarseRank()));
 
@@ -408,6 +559,10 @@ public class RAGSearchService {
                                             List<String> excludeKeywords) {
         boolean needVector = !"bm25".equals(strategy);
         boolean needBm25 = !"vector".equals(strategy);
+        // 代表 kbId（方案 A）：全局倾向参数（父上下文开关 / content_type 权重）按代表库读取，无覆盖则回退全局
+        Long repKbId = representativeKbId(kbIds);
+        boolean parentContextEnabled = paramValueProvider.getBoolean(
+                "retrieval.parentContextEnabled", repKbId, true);
 
         List<HybridSearchService.RankedResult> vector = new ArrayList<>();
         List<HybridSearchService.RankedResult> bm25 = new ArrayList<>();
@@ -449,7 +604,11 @@ public class RAGSearchService {
         }
 
         // ===== 父上下文扩展（对齐生产阶段1.5）：用入库预计算的 parent_text 替换片段文本 =====
-        fusion = parentContextExpander.expand(fusion);
+        if (parentContextEnabled) {
+            fusion = parentContextExpander.expand(fusion);
+        } else {
+            log.debug("召回测试-父上下文扩展已关闭（retrieval.parentContextEnabled=false），跳过 parent_text 替换");
+        }
 
         // ===== 排除关键词过滤（对齐生产阶段2）：分词后精确匹配排除词，避免子串误杀 =====
         fusion = filterByExcludeKeywords(fusion, excludeKeywords);
@@ -458,11 +617,13 @@ public class RAGSearchService {
         Long rerankMs = null;
         if (needVector && needBm25 && enableRerank) {
             long start = System.currentTimeMillis();
-            rerank = traceRerank(query, fusion, rerankThreshold);
+            rerank = traceRerank(query, fusion, rerankThreshold, repKbId);
             rerankMs = System.currentTimeMillis() - start;
         } else if (needVector && needBm25) {
+            // ===== 跨库重排（对齐生产最终重排序）：Rerank 关闭时按原始向量相似度排序，避免用 RRF 分混排 =====
+            fusion = reorderByRawScore(fusion);
             // ===== content_type 降权（对齐生产阶段5）：Rerank 关闭时，融合结果即最终结果 =====
-            fusion = applyContentTypeWeighting(fusion);
+            fusion = applyContentTypeWeighting(fusion, repKbId);
         }
 
         return new RetrievalTrace(vector, bm25, fusion, rerank, vectorMs, bm25Ms, rerankMs);
@@ -509,7 +670,7 @@ public class RAGSearchService {
     }
 
     private List<RetrievalTrace.RerankedResult> traceRerank(String query, List<HybridSearchService.RankedResult> fusion,
-                                                            double rerankThreshold) {
+                                                            double rerankThreshold, Long repKbId) {
         if (!rerankerService.isAvailable()) {
             log.error("召回测试-Rerank重排序失败: Reranker 不可用");
             throw new BusinessException(500, "Rerank 重排序失败");
@@ -532,7 +693,7 @@ public class RAGSearchService {
                 items.add(new RetrievalTrace.RerankedResult(base.getSegment(), rr.getScore(), rr.getIndex() + 1));
             }
             // ===== content_type 降权（对齐生产阶段5）：非正文片段（题目/词汇/答案）降权后重排 =====
-            return applyContentTypeWeightingToReranked(items);
+            return applyContentTypeWeightingToReranked(items, repKbId);
         } catch (BusinessException e) {
             throw e;
         } catch (Exception e) {

@@ -5,6 +5,7 @@ import com.hai.aiknowledgebase.config.ThresholdsConfig;
 import com.hai.aiknowledgebase.dto.RecallTestRequest;
 import com.hai.aiknowledgebase.dto.RecallTestResponse;
 import com.hai.aiknowledgebase.exception.BusinessException;
+import com.hai.aiknowledgebase.service.ParamValueProvider;
 import com.hai.aiknowledgebase.service.RecallTestService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -14,6 +15,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Set;
 
 /**
@@ -29,6 +31,7 @@ public class RecallTestController {
 
     private final RecallTestService recallTestService;
     private final ThresholdsConfig thresholdsConfig;
+    private final ParamValueProvider paramValueProvider;
 
     @PostMapping("/run")
     public Result<RecallTestResponse> run(@RequestBody RecallTestRequest request) {
@@ -77,7 +80,12 @@ public class RecallTestController {
 
             if (request.isEnableRerank()) {
                 if (request.getRerankThreshold() == null) {
-                    request.setRerankThreshold(thresholdsConfig.getReranker().getMinScore());
+                    Long rep = request.getKbIds().isEmpty()
+                            ? null
+                            : Collections.min(request.getKbIds());
+                    request.setRerankThreshold(
+                            paramValueProvider.getDouble("rerank.minScore", rep,
+                                    thresholdsConfig.getReranker().getMinScore()));
                 }
                 if (request.getRerankThreshold() < -100 || request.getRerankThreshold() > 100) {
                     throw new BusinessException(400, "rerankThreshold 非法（Cross-Encoder 原始 logits，通常 -20~20 之间）");

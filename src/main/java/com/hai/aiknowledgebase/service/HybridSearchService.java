@@ -367,6 +367,14 @@ public class HybridSearchService {
         return hybridEnabled;
     }
 
+    /**
+     * 获取 RRF 平滑系数的配置默认值（yml 兜底）。
+     * 供上层按参数动态读取时作为 fallback 使用。
+     */
+    public int getDefaultRrfK() {
+        return rrfK;
+    }
+
     // ==================== 核心检索方法 ====================
 
 
@@ -383,10 +391,28 @@ public class HybridSearchService {
      * @return 按 RRF 融合分数降序排列的 RankedResult 列表
      */
     public List<RankedResult> hybridSearchRanked(String query, int topK, double minVectorScore) {
-        return hybridSearchRanked(query, topK, minVectorScore, null);
+        return hybridSearchRanked(query, topK, minVectorScore, null, rrfK);
     }
 
     public List<RankedResult> hybridSearchRanked(String query, int topK, double minVectorScore, Set<Long> kbIds) {
+        return hybridSearchRanked(query, topK, minVectorScore, kbIds, rrfK);
+    }
+
+    /**
+     * <h3>混合检索（带向量相关性阈值，支持显式 RRF 平滑系数）</h3>
+     *
+     * <p>显式传入 {@code rrfK}，供拆库按参数指纹分组检索时，
+     * 不同参数分组的知识库使用各自的 RRF 平滑系数，避免多库混查的参数歧义。</p>
+     *
+     * @param query          用户查询文本
+     * @param topK           返回结果数量上限
+     * @param minVectorScore 向量路径最低余弦相似度阈值（0.0~1.0）
+     * @param kbIds          知识库范围（null 表示不过滤）
+     * @param rrfK           RRF 平滑系数
+     * @return 按 RRF 融合分数降序排列的 RankedResult 列表
+     */
+    public List<RankedResult> hybridSearchRanked(String query, int topK, double minVectorScore,
+                                                 Set<Long> kbIds, int rrfK) {
         // 降级判断：如果混合检索关闭或关键词索引为空，直接走纯向量检索
         if (!hybridEnabled || keywordIndex.size() == 0) {
             log.info("混合检索已关闭或关键词索引为空，降级为纯向量检索");
@@ -409,7 +435,7 @@ public class HybridSearchService {
         log.info("双路检索完成: 向量结果={} (过滤后), 关键词结果={}", vectorResults.size(), keywordResults.size());
 
         // RRF 融合排序
-        List<RankedResult> fused = reciprocalRankFusion(vectorResults, keywordResults, topK);
+        List<RankedResult> fused = reciprocalRankFusion(vectorResults, keywordResults, topK, rrfK);
         log.info("RRF 融合结果数量: {}", fused.size());
 
         return fused;
@@ -549,7 +575,7 @@ public class HybridSearchService {
                     .filter(m -> m != null && m.embedded() != null)
                     .filter(m -> !isChunkDisabled(m.embedded()))
                     .filter(m -> !isChunkNotCompleted(m.embedded()))
-                    .map(m -> new RankedResult(m.embedded(), m.score()))
+                    .map(m -> new RankedResult(m.embedded(), m.score(), m.score(), null))
                     .sorted((a, b) -> Double.compare(b.getScore(), a.getScore())) // 降序
                     .limit(topK)
                     .collect(Collectors.toList());
@@ -634,7 +660,7 @@ public class HybridSearchService {
                 }
                 TextSegment segment = TextSegment.from(text, metadata);
 
-                results.add(new RankedResult(segment, entry.getValue()));
+                results.add(new RankedResult(segment, entry.getValue(), null, entry.getValue()));
             }
             return results;
         } catch (Exception e) {
@@ -736,7 +762,8 @@ public class HybridSearchService {
     private List<RankedResult> reciprocalRankFusion(
             List<RankedResult> vectorResults,
             List<RankedResult> keywordResults,
-            int topK) {
+            int topK,
+            int rrfK) {
 
         // 使用 LinkedHashMap 保持插入顺序，用于最终结果映射
         // key: 文档唯一标识（由 generateKey 生成）
@@ -774,7 +801,8 @@ public class HybridSearchService {
                     // 从 allResults 中取出原始 RankedResult，
                     // 用新的 RRF 总分替换原来的单一路径分数
                     RankedResult original = allResults.get(entry.getKey());
-                    return new RankedResult(original.getSegment(), entry.getValue());
+                    return new RankedResult(original.getSegment(), entry.getValue(),
+                            original.getVectorScore(), original.getBm25Score());
                 })
                 .collect(Collectors.toList());
     }
@@ -820,7 +848,8 @@ public class HybridSearchService {
                 .limit(topK)
                 .map(entry -> {
                     RankedResult original = allResults.get(entry.getKey());
-                    return new RankedResult(original.getSegment(), entry.getValue());
+                    return new RankedResult(original.getSegment(), entry.getValue(),
+                            original.getVectorScore(), original.getBm25Score());
                 })
                 .collect(Collectors.toList());
     }
@@ -936,13 +965,25 @@ public class HybridSearchService {
         private final TextSegment segment;
         /** 检索分数（向量相似度 / BM25分数 / RRF融合分数） */
         private final double score;
+        /** 原始向量相似度（0~1），无向量路径命中时为 null */
+        private final Double vectorScore;
+        /** 原始 BM25 分数，无关键词路径命中时为 null */
+        private final Double bm25Score;
 
         public RankedResult(TextSegment segment, double score) {
+            this(segment, score, null, null);
+        }
+
+        public RankedResult(TextSegment segment, double score, Double vectorScore, Double bm25Score) {
             this.segment = segment;
             this.score = score;
+            this.vectorScore = vectorScore;
+            this.bm25Score = bm25Score;
         }
 
         public TextSegment getSegment() { return segment; }
         public double getScore() { return score; }
+        public Double getVectorScore() { return vectorScore; }
+        public Double getBm25Score() { return bm25Score; }
     }
 }

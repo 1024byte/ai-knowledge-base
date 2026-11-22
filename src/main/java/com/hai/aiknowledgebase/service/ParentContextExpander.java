@@ -57,7 +57,8 @@ public class ParentContextExpander {
             String parentText = r.getSegment().metadata().getString("parent_text");
             if (parentText != null && !parentText.isBlank()) {
                 TextSegment expandedSegment = TextSegment.from(parentText, r.getSegment().metadata());
-                expanded.add(new HybridSearchService.RankedResult(expandedSegment, r.getScore()));
+                expanded.add(new HybridSearchService.RankedResult(
+                        expandedSegment, r.getScore(), r.getVectorScore(), r.getBm25Score()));
                 expandedCount++;
             } else {
                 expanded.add(r);

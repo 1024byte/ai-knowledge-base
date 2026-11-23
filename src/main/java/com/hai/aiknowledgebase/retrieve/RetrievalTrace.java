@@ -18,12 +18,15 @@ public class RetrievalTrace {
     private final Long vectorMs;
     private final Long bm25Ms;
     private final Long rerankMs;
+    /** 本次是否实际执行了 Rerank 精排（候选非空且精排成功） */
+    private final boolean rerankApplied;
 
     public RetrievalTrace(List<RankedResult> vector,
                           List<RankedResult> bm25,
                           List<RankedResult> fusion,
                           List<RerankedResult> rerank,
-                          Long vectorMs, Long bm25Ms, Long rerankMs) {
+                          Long vectorMs, Long bm25Ms, Long rerankMs,
+                          boolean rerankApplied) {
         this.vector = vector;
         this.bm25 = bm25;
         this.fusion = fusion;
@@ -31,6 +34,7 @@ public class RetrievalTrace {
         this.vectorMs = vectorMs;
         this.bm25Ms = bm25Ms;
         this.rerankMs = rerankMs;
+        this.rerankApplied = rerankApplied;
     }
 
     public List<RankedResult> getVector() { return vector; }
@@ -40,4 +44,5 @@ public class RetrievalTrace {
     public Long getVectorMs() { return vectorMs; }
     public Long getBm25Ms() { return bm25Ms; }
     public Long getRerankMs() { return rerankMs; }
+    public boolean isRerankApplied() { return rerankApplied; }
 }

@@ -7,12 +7,14 @@ import com.hai.aiknowledgebase.service.ParamService;
 import com.hai.aiknowledgebase.service.ParamValueProvider;
 import com.hai.aiknowledgebase.service.ParentContextExpander;
 import com.hai.aiknowledgebase.service.RerankerService;
+import dev.langchain4j.data.segment.TextSegment;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -328,9 +330,10 @@ public class RetrievalCoordinator {
      * <p>将向量 / BM25 单路检索、RRF 融合、Rerank 精排统一编排在本服务内，
      * 复用检索原语与精排能力，避免召回测试独立实现重复逻辑。</p>
      *
-     * <p>融合结果依次经过生产链路的父上下文扩展（parent_text）、排除关键词过滤，
+     * <p>hybrid 的融合结果依次经过生产链路的父上下文扩展（parent_text）、排除关键词过滤，
      * 最终结果（Rerank 开启时为精排结果，否则为融合结果）经过 content_type 降权，
-     * 确保召回测试观测到的检索行为与智慧问答生产链路一致。</p>
+     * 确保召回测试观测到的检索行为与智慧问答生产链路一致。开启 Rerank 时，
+     * 该精排层同样可挂载在 vector / bm25 单路结果之后。</p>
      *
      * @param query           查询文本
      * @param strategy        检索策略：hybrid / vector / bm25
@@ -339,16 +342,28 @@ public class RetrievalCoordinator {
      * @param kbIds           知识库范围（null 表示不过滤）
      * @param documentIds     文档范围（null/空 表示不过滤）
      * @param rrfK            RRF 平滑系数
-     * @param enableRerank    是否启用 Rerank 精排（仅 hybrid 生效）
+     * @param enableRerank    是否启用 Rerank 精排（hybrid / vector / bm25 均可挂载）
      * @param rerankThreshold Rerank 分数阈值（Cross-Encoder 原始 logits）
      * @param excludeKeywords 排除关键词列表（null/空 表示不过滤）
+     * @param candidateMultiplier 候选池倍数（开启 Rerank 时生效）
+     * @param maxCandidates       候选池上限（开启 Rerank 时生效）
+     * @param topN                最终返回数量（开启 Rerank 时在精排过滤后截取）
+     * @param rerankStage         Rerank 挂载阶段：fuse_rerank（默认）/ rerank_fuse（实验）
      */
     public RetrievalTrace retrieveWithTrace(String query, String strategy, int topK, double threshold,
                                             Set<Long> kbIds, Set<Long> documentIds,
                                             int rrfK, boolean enableRerank, double rerankThreshold,
-                                            List<String> excludeKeywords) {
+                                            List<String> excludeKeywords,
+                                            int candidateMultiplier, int maxCandidates, int topN,
+                                            String rerankStage) {
         boolean needVector = !"bm25".equals(strategy);
         boolean needBm25 = !"vector".equals(strategy);
+        // 候选池：开启 Rerank 时先扩大召回，精排后再截取 topN；未开启时保持原 topK 行为
+        int retrieveTopK = enableRerank
+                ? Math.max(topK, Math.min(maxCandidates, topK * Math.max(1, candidateMultiplier)))
+                : topK;
+        // rerank_fuse：两路各自精排后再 RRF（仅 hybrid 实验模式，默认 fuse_rerank）
+        boolean rerankFuse = enableRerank && needVector && needBm25 && "rerank_fuse".equals(rerankStage);
         // 代表 kbId（方案 A）：全局倾向参数（父上下文开关 / content_type 权重）按代表库读取，无覆盖则回退全局
         Long repKbId = representativeKbId(kbIds);
         boolean parentContextEnabled = paramValueProvider.getBoolean(
@@ -363,13 +378,13 @@ public class RetrievalCoordinator {
             CompletableFuture<TimedResult> vectorFuture = CompletableFuture.supplyAsync(() -> {
                 long start = System.currentTimeMillis();
                 List<RankedResult> r =
-                        traceVectorRetrieve(query, topK, kbIds, documentIds, threshold);
+                        traceVectorRetrieve(query, retrieveTopK, kbIds, documentIds, threshold);
                 return new TimedResult(r, System.currentTimeMillis() - start);
             });
             CompletableFuture<TimedResult> bm25Future = CompletableFuture.supplyAsync(() -> {
                 long start = System.currentTimeMillis();
                 List<RankedResult> r =
-                        traceBm25Retrieve(query, topK, kbIds, documentIds, threshold);
+                        traceBm25Retrieve(query, retrieveTopK, kbIds, documentIds, threshold);
                 return new TimedResult(r, System.currentTimeMillis() - start);
             });
             TimedResult vr = vectorFuture.join();
@@ -380,35 +395,75 @@ public class RetrievalCoordinator {
             bm25Ms = br.elapsedMs;
         } else if (needVector) {
             long start = System.currentTimeMillis();
-            vector = traceVectorRetrieve(query, topK, kbIds, documentIds, threshold);
+            vector = traceVectorRetrieve(query, retrieveTopK, kbIds, documentIds, threshold);
             vectorMs = System.currentTimeMillis() - start;
         } else {
             long start = System.currentTimeMillis();
-            bm25 = traceBm25Retrieve(query, topK, kbIds, documentIds, threshold);
+            bm25 = traceBm25Retrieve(query, retrieveTopK, kbIds, documentIds, threshold);
             bm25Ms = System.currentTimeMillis() - start;
         }
 
         List<RankedResult> fusion = new ArrayList<>();
-        if (needVector && needBm25) {
-            fusion = rankFusion.fuseRanked(vector, bm25, topK, rrfK);
-        }
+        if (!rerankFuse) {
+            if (needVector && needBm25) {
+                fusion = rankFusion.fuseRanked(vector, bm25, retrieveTopK, rrfK);
+            }
 
-        // ===== 父上下文扩展（对齐生产阶段1.5）：用入库预计算的 parent_text 替换片段文本 =====
-        if (parentContextEnabled) {
-            fusion = parentContextExpander.expand(fusion);
-        } else {
-            log.debug("召回测试-父上下文扩展已关闭（retrieval.parentContextEnabled=false），跳过 parent_text 替换");
-        }
+            // ===== 父上下文扩展（对齐生产阶段1.5）：用入库预计算的 parent_text 替换片段文本 =====
+            if (parentContextEnabled) {
+                fusion = parentContextExpander.expand(fusion);
+            } else {
+                log.debug("召回测试-父上下文扩展已关闭（retrieval.parentContextEnabled=false），跳过 parent_text 替换");
+            }
 
-        // ===== 排除关键词过滤（对齐生产阶段2）：分词后精确匹配排除词，避免子串误杀 =====
-        fusion = rerankOrchestrator.filterByExcludeKeywords(fusion, excludeKeywords);
+            // ===== 排除关键词过滤（对齐生产阶段2）：分词后精确匹配排除词，避免子串误杀 =====
+            fusion = rerankOrchestrator.filterByExcludeKeywords(fusion, excludeKeywords);
+        }
 
         List<RerankedResult> rerank = new ArrayList<>();
         Long rerankMs = null;
-        if (needVector && needBm25 && enableRerank) {
+        boolean rerankApplied = false;
+        if (rerankFuse) {
+            // 实验模式：两路各自精排（先补父上下文与排除词过滤），再 RRF 融合，最后 content_type 降权
             long start = System.currentTimeMillis();
-            rerank = traceRerank(query, fusion, rerankThreshold, repKbId);
+            List<RankedResult> vectorCandidates = parentContextEnabled
+                    ? parentContextExpander.expand(vector) : vector;
+            vectorCandidates = rerankOrchestrator.filterByExcludeKeywords(vectorCandidates, excludeKeywords);
+            List<RankedResult> bm25Candidates = parentContextEnabled
+                    ? parentContextExpander.expand(bm25) : bm25;
+            bm25Candidates = rerankOrchestrator.filterByExcludeKeywords(bm25Candidates, excludeKeywords);
+            List<RankedResult> vectorReranked = traceRerankToRanked(query, vectorCandidates, rerankThreshold);
+            List<RankedResult> bm25Reranked = traceRerankToRanked(query, bm25Candidates, rerankThreshold);
+            fusion = rerankOrchestrator.applyContentTypeWeighting(
+                    rankFusion.fuseRanked(vectorReranked, bm25Reranked, retrieveTopK, rrfK), repKbId);
+            rerank = toRerankedResults(fusion, vectorReranked, bm25Reranked);
             rerankMs = System.currentTimeMillis() - start;
+            rerankApplied = !(vectorReranked.isEmpty() && bm25Reranked.isEmpty());
+            // rerank_fuse 下：fusion（最终 RRF 结果）按 topN 截取，rerank 列表保持完整供观测
+            if (fusion.size() > topN) {
+                fusion = new ArrayList<>(fusion.subList(0, Math.max(1, topN)));
+            }
+        } else if (enableRerank) {
+            // 通用精排层：hybrid 精排 RRF 融合结果，vector / bm25 精排各自单路结果。
+            // 其余后处理阶段（父上下文扩展 / 排除词过滤 / content_type 降权）仍仅 hybrid 生效。
+            List<RankedResult> rerankInput;
+            boolean applyWeighting;
+            if (needVector && needBm25) {
+                rerankInput = fusion;
+                applyWeighting = true;
+            } else if (needVector) {
+                rerankInput = vector;
+                applyWeighting = false;
+            } else {
+                rerankInput = bm25;
+                applyWeighting = false;
+            }
+            long start = System.currentTimeMillis();
+            rerank = traceRerank(query, rerankInput, rerankThreshold, repKbId, applyWeighting);
+            rerankMs = System.currentTimeMillis() - start;
+            rerankApplied = !rerankInput.isEmpty();
+            // rerank 列表保留完整精排结果（经阈值过滤），topN 截断仅作用于 final 列表（RecallTestService 侧）。
+            // 这样前端可以在 rerank Tab 看到完整的精排排序分布，而主表 final 只展示 topN。
         } else if (needVector && needBm25) {
             // ===== 跨库重排（对齐生产最终重排序）：Rerank 关闭时按原始向量相似度排序，避免用 RRF 分混排 =====
             fusion = rerankOrchestrator.reorderByRawScore(fusion);
@@ -416,7 +471,7 @@ public class RetrievalCoordinator {
             fusion = rerankOrchestrator.applyContentTypeWeighting(fusion, repKbId);
         }
 
-        return new RetrievalTrace(vector, bm25, fusion, rerank, vectorMs, bm25Ms, rerankMs);
+        return new RetrievalTrace(vector, bm25, fusion, rerank, vectorMs, bm25Ms, rerankMs, rerankApplied);
     }
 
     private List<RankedResult> traceVectorRetrieve(String query, int topK, Set<Long> kbIds,
@@ -459,17 +514,18 @@ public class RetrievalCoordinator {
         }
     }
 
-    private List<RerankedResult> traceRerank(String query, List<RankedResult> fusion,
-                                             double rerankThreshold, Long repKbId) {
+    private List<RerankedResult> traceRerank(String query, List<RankedResult> candidates,
+                                             double rerankThreshold, Long repKbId,
+                                             boolean applyContentTypeWeighting) {
         if (!rerankerService.isAvailable()) {
             log.error("召回测试-Rerank重排序失败: Reranker 不可用");
             throw new BusinessException(500, "Rerank 重排序失败");
         }
-        if (fusion.isEmpty()) {
+        if (candidates.isEmpty()) {
             return new ArrayList<>();
         }
         try {
-            List<String> docTexts = fusion.stream()
+            List<String> docTexts = candidates.stream()
                     .map(r -> r.getSegment().text())
                     .collect(Collectors.toList());
             List<RerankerService.RerankResult> rerankResults =
@@ -479,8 +535,11 @@ public class RetrievalCoordinator {
                 if (rr.getScore() < rerankThreshold) {
                     continue;
                 }
-                RankedResult base = fusion.get(rr.getIndex());
+                RankedResult base = candidates.get(rr.getIndex());
                 items.add(new RerankedResult(base.getSegment(), rr.getScore(), rr.getIndex() + 1));
+            }
+            if (!applyContentTypeWeighting) {
+                return items;
             }
             // ===== content_type 降权（对齐生产阶段5）：非正文片段（题目/词汇/答案）降权后重排 =====
             return rerankOrchestrator.applyContentTypeWeightingToReranked(items, repKbId);
@@ -490,6 +549,77 @@ public class RetrievalCoordinator {
             log.error("召回测试-Rerank重排序失败", e);
             throw new BusinessException(500, "Rerank 重排序失败");
         }
+    }
+
+    /**
+     * 精排单路候选并返回带精排分的结果列表（供 rerank_fuse 实验模式做二次 RRF）。
+     */
+    private List<RankedResult> traceRerankToRanked(String query, List<RankedResult> candidates,
+                                                   double rerankThreshold) {
+        if (!rerankerService.isAvailable()) {
+            log.error("召回测试-Rerank重排序失败: Reranker 不可用");
+            throw new BusinessException(500, "Rerank 重排序失败");
+        }
+        if (candidates.isEmpty()) {
+            return new ArrayList<>();
+        }
+        try {
+            List<String> docTexts = candidates.stream()
+                    .map(r -> r.getSegment().text())
+                    .collect(Collectors.toList());
+            List<RerankerService.RerankResult> rerankResults =
+                    rerankerService.rerank(query, docTexts, docTexts.size());
+            List<RankedResult> reranked = new ArrayList<>();
+            for (RerankerService.RerankResult rr : rerankResults) {
+                if (rr.getScore() < rerankThreshold) {
+                    continue;
+                }
+                reranked.add(new RankedResult(candidates.get(rr.getIndex()).getSegment(), rr.getScore()));
+            }
+            return reranked;
+        } catch (BusinessException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("召回测试-Rerank重排序失败", e);
+            throw new BusinessException(500, "Rerank 重排序失败");
+        }
+    }
+
+    /**
+     * 将 rerank_fuse 的 RRF 融合结果映射为精排结果视图：
+     * rerankScore 取该片段在所属单路中的精排原始分（两路都命中时取较大值），coarseRank 为融合位次。
+     */
+    private List<RerankedResult> toRerankedResults(List<RankedResult> fused,
+                                                   List<RankedResult> vectorReranked,
+                                                   List<RankedResult> bm25Reranked) {
+        Map<String, Double> logits = new HashMap<>();
+        for (RankedResult r : vectorReranked) {
+            putLogits(logits, r);
+        }
+        for (RankedResult r : bm25Reranked) {
+            putLogits(logits, r);
+        }
+        List<RerankedResult> items = new ArrayList<>();
+        for (int i = 0; i < fused.size(); i++) {
+            RankedResult r = fused.get(i);
+            String key = chunkKey(r.getSegment());
+            double score = (key != null && logits.containsKey(key)) ? logits.get(key) : r.getScore();
+            items.add(new RerankedResult(r.getSegment(), score, i + 1));
+        }
+        return items;
+    }
+
+    private void putLogits(Map<String, Double> logits, RankedResult result) {
+        String key = chunkKey(result.getSegment());
+        if (key != null) {
+            logits.merge(key, result.getScore(), Math::max);
+        }
+    }
+
+    /** 读取片段主键作为跨路对齐键，缺失时返回 null */
+    private String chunkKey(TextSegment segment) {
+        String value = segment.metadata().getString("chunk_id");
+        return (value == null || value.isBlank()) ? null : value;
     }
 
     /** 带耗时的检索结果包装，用于 hybrid 并行检索时的分路计时 */

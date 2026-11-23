@@ -28,6 +28,7 @@ import java.util.Set;
 public class RecallTestController {
 
     private static final Set<String> STRATEGIES = Set.of("hybrid", "vector", "bm25");
+    private static final Set<String> RERANK_STAGES = Set.of("fuse_rerank", "rerank_fuse");
 
     private final RecallTestService recallTestService;
     private final ThresholdsConfig thresholdsConfig;
@@ -56,11 +57,36 @@ public class RecallTestController {
             throw new BusinessException(400, "不支持的检索策略");
         }
 
+        if (request.getRerankStage() == null || request.getRerankStage().isBlank()) {
+            request.setRerankStage("fuse_rerank");
+        } else if (!RERANK_STAGES.contains(request.getRerankStage())) {
+            throw new BusinessException(400, "不支持的 rerankStage");
+        }
+
         if (request.getTopK() == null) {
             request.setTopK(5);
         }
         if (request.getTopK() < 1 || request.getTopK() > 50) {
             throw new BusinessException(400, "topK 必须在 1~50 之间");
+        }
+
+        if (request.getCandidateMultiplier() == null) {
+            request.setCandidateMultiplier(3);
+        }
+        if (request.getCandidateMultiplier() < 1 || request.getCandidateMultiplier() > 10) {
+            throw new BusinessException(400, "candidateMultiplier 必须在 1~10 之间");
+        }
+        if (request.getMaxCandidates() == null) {
+            request.setMaxCandidates(100);
+        }
+        if (request.getMaxCandidates() < 1 || request.getMaxCandidates() > 500) {
+            throw new BusinessException(400, "maxCandidates 必须在 1~500 之间");
+        }
+        if (request.getTopN() == null) {
+            request.setTopN(request.getTopK());
+        }
+        if (request.getTopN() < 1 || request.getTopN() > 50) {
+            throw new BusinessException(400, "topN 必须在 1~50 之间");
         }
 
         if (request.getThreshold() == null) {
@@ -77,19 +103,20 @@ public class RecallTestController {
             if (request.getRrfK() < 1 || request.getRrfK() > 1000) {
                 throw new BusinessException(400, "rrfK 必须在 1~1000 之间");
             }
+        }
 
-            if (request.isEnableRerank()) {
-                if (request.getRerankThreshold() == null) {
-                    Long rep = request.getKbIds().isEmpty()
-                            ? null
-                            : Collections.min(request.getKbIds());
-                    request.setRerankThreshold(
-                            paramValueProvider.getDouble("rerank.minScore", rep,
-                                    thresholdsConfig.getReranker().getMinScore()));
-                }
-                if (request.getRerankThreshold() < -100 || request.getRerankThreshold() > 100) {
-                    throw new BusinessException(400, "rerankThreshold 非法（Cross-Encoder 原始 logits，通常 -20~20 之间）");
-                }
+        // Rerank 校验与策略无关：hybrid / vector / bm25 均可挂载
+        if (request.isEnableRerank()) {
+            if (request.getRerankThreshold() == null) {
+                Long rep = request.getKbIds().isEmpty()
+                        ? null
+                        : Collections.min(request.getKbIds());
+                request.setRerankThreshold(
+                        paramValueProvider.getDouble("rerank.minScore", rep,
+                                thresholdsConfig.getReranker().getMinScore()));
+            }
+            if (request.getRerankThreshold() < -100 || request.getRerankThreshold() > 100) {
+                throw new BusinessException(400, "rerankThreshold 非法（Cross-Encoder 原始 logits，通常 -20~20 之间）");
             }
         }
     }

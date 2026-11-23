@@ -1,5 +1,6 @@
 package com.hai.aiknowledgebase.dto;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -35,6 +36,12 @@ public class RecallTestResponse {
     /** Rerank 重排序耗时（毫秒），未开启 Rerank 时为 null */
     private Long rerankMs;
 
+    /** 本次是否实际执行了 Rerank 精排（候选为空或未开启时为 false） */
+    private Boolean rerankApplied;
+
+    /** 本次实际生效的分数口径：cosine / bm25_normalized / rrf / rerank_logits */
+    private String scoreType;
+
     /** BM25 分词结果，vector 策略为空数组 */
     private List<String> tokens;
 
@@ -59,9 +66,17 @@ public class RecallTestResponse {
         @Builder.Default
         private List<RecallResultItem> bm25 = new ArrayList<>();
 
-        /** 重排结果列表，仅 hybrid 且 enableRerank=true 时有值，否则为空数组 */
+        /** 重排结果列表，enableRerank=true 且候选非空时有值，否则为空数组 */
         @Builder.Default
         private List<RecallResultItem> rerank = new ArrayList<>();
+
+        /**
+         * 最终结果：指向实际生效的那一路。
+         * <p>Rerank 生效时为 rerank；hybrid 未精排时为 fusion；单路未精排时为对应单路。</p>
+         */
+        @JsonProperty("final")
+        @Builder.Default
+        private List<RecallResultItem> finalResults = new ArrayList<>();
     }
 
     @Data

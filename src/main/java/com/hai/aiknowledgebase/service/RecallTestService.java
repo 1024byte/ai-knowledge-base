@@ -67,6 +67,10 @@ public class RecallTestService {
         double threshold = request.getThreshold();
         int rrfK = request.getRrfK() == null ? 60 : request.getRrfK();
         boolean enableRerank = request.isEnableRerank();
+        int candidateMultiplier = request.getCandidateMultiplier() == null ? 3 : request.getCandidateMultiplier();
+        int maxCandidates = request.getMaxCandidates() == null ? 100 : request.getMaxCandidates();
+        int topN = request.getTopN() == null ? topK : request.getTopN();
+        String rerankStage = request.getRerankStage() == null ? "fuse_rerank" : request.getRerankStage();
         double rerankThreshold = request.getRerankThreshold() == null
                 ? paramValueProvider.getDouble("rerank.minScore",
                         (request.getKbIds() == null || request.getKbIds().isEmpty())
@@ -93,20 +97,49 @@ public class RecallTestService {
         // 3. 复用生产检索编排，一次性拿到向量/BM25/融合/精排四路观测结果
         RetrievalTrace trace = retrievalCoordinator.retrieveWithTrace(
                 query, strategy, topK, threshold, kbIds, documentIds, rrfK, enableRerank, rerankThreshold,
-                excludeKeywords);
+                excludeKeywords, candidateMultiplier, maxCandidates, topN, rerankStage);
 
         // 4. 数据补全：以片段主键为锚点反查 documentId / source / kbName
         CompletionContext context = buildCompletionContext(trace);
         List<RecallTestResponse.RecallResultItem> vectorItems = complete(trace.getVector(), context);
         List<RecallTestResponse.RecallResultItem> bm25Items = complete(trace.getBm25(), context);
         List<RecallTestResponse.RecallResultItem> fusionItems = completeFusion(trace, context);
-        List<RecallTestResponse.RecallResultItem> rerankItems = completeRerank(trace, context, fusionItems);
+        // 精排的粗排基准：hybrid 为融合结果，单路为对应单路结果
+        List<RecallTestResponse.RecallResultItem> coarseItems = "vector".equals(strategy)
+                ? vectorItems
+                : ("bm25".equals(strategy) ? bm25Items : fusionItems);
+        List<RecallTestResponse.RecallResultItem> rerankItems = completeRerank(trace, context, coarseItems);
+
+        // 5. 统一最终结果与分数口径：final 指向实际生效的那一路
+        List<RecallTestResponse.RecallResultItem> finalItems;
+        String scoreType;
+        boolean rerankFuse = enableRerank && "hybrid".equals(strategy) && "rerank_fuse".equals(rerankStage);
+        if (rerankFuse) {
+            // 两路各自精排后再 RRF，最终排序依据仍是 RRF
+            finalItems = fusionItems;
+            scoreType = "rrf";
+        } else if (trace.isRerankApplied()) {
+            finalItems = rerankItems;
+            scoreType = "rerank_logits";
+        } else if ("hybrid".equals(strategy)) {
+            finalItems = fusionItems;
+            scoreType = "rrf";
+        } else if ("vector".equals(strategy)) {
+            finalItems = vectorItems;
+            scoreType = "cosine";
+        } else {
+            finalItems = bm25Items;
+            scoreType = "bm25_normalized";
+        }
+        if (finalItems.size() > topN) {
+            finalItems = new ArrayList<>(finalItems.subList(0, Math.max(1, topN)));
+        }
 
         long totalMs = System.currentTimeMillis() - totalStart;
 
-        log.info("召回测试完成: query={}, strategy={}, 向量命中={}, BM25命中={}, 融合={}, 重排={}, 总耗时={}ms",
+        log.info("召回测试完成: query={}, strategy={}, 向量命中={}, BM25命中={}, 融合={}, 重排={}, 精排生效={}, 分数口径={}, 总耗时={}ms",
                 query, strategy, trace.getVector().size(), trace.getBm25().size(),
-                fusionItems.size(), rerankItems.size(), totalMs);
+                fusionItems.size(), rerankItems.size(), trace.isRerankApplied(), scoreType, totalMs);
 
         return RecallTestResponse.builder()
                 .query(query)
@@ -115,12 +148,15 @@ public class RecallTestService {
                 .vectorMs(trace.getVectorMs())
                 .bm25Ms(trace.getBm25Ms())
                 .rerankMs(trace.getRerankMs())
+                .rerankApplied(trace.isRerankApplied())
+                .scoreType(scoreType)
                 .tokens(tokens)
                 .results(RecallTestResponse.Results.builder()
                         .fusion(fusionItems)
                         .vector(vectorItems)
                         .bm25(bm25Items)
                         .rerank(rerankItems)
+                        .finalResults(finalItems)
                         .build())
                 .build();
     }
@@ -141,6 +177,9 @@ public class RecallTestService {
         }
         for (RankedResult r : trace.getFusion()) {
             addChunkId(chunkIds, r.getSegment());
+        }
+        for (RerankedResult rr : trace.getRerank()) {
+            addChunkId(chunkIds, rr.getSegment());
         }
 
         // 片段 → 文档
@@ -228,20 +267,34 @@ public class RecallTestService {
     }
 
     /**
-     * 组装 Rerank 精排结果：复用融合项的基础字段，补齐 rerankScore / coarseRank / rerankRank。
+     * 组装 Rerank 精排结果：以片段主键回填基础字段，补齐 rerankScore / coarseRank / rerankRank。
+     *
+     * <p>精排输入可能是融合结果（hybrid）或单路结果（vector / bm25），因此不能按下标
+     * 直接索引融合列表，统一按 chunk_id 回填；chunk_id 缺失时再按粗排下标兜底。</p>
      */
     private List<RecallTestResponse.RecallResultItem> completeRerank(RetrievalTrace trace,
                                                                      CompletionContext context,
-                                                                     List<RecallTestResponse.RecallResultItem> fusionItems) {
+                                                                     List<RecallTestResponse.RecallResultItem> coarseItems) {
+        Map<Long, RecallTestResponse.RecallResultItem> baseByChunk = new HashMap<>();
+        for (RecallTestResponse.RecallResultItem item : coarseItems) {
+            if (item.getChunkId() != null) {
+                baseByChunk.putIfAbsent(item.getChunkId(), item);
+            }
+        }
+
         List<RecallTestResponse.RecallResultItem> items = new ArrayList<>();
         int rerankRank = 1;
         for (RerankedResult rr : trace.getRerank()) {
-            int coarseIdx = rr.getCoarseRank() - 1;
-            RecallTestResponse.RecallResultItem base = (coarseIdx >= 0 && coarseIdx < fusionItems.size())
-                    ? fusionItems.get(coarseIdx)
-                    : null;
+            Long chunkId = chunkIdOf(rr.getSegment());
+            RecallTestResponse.RecallResultItem base = chunkId == null ? null : baseByChunk.get(chunkId);
+            if (base == null) {
+                int coarseIdx = rr.getCoarseRank() - 1;
+                if (coarseIdx >= 0 && coarseIdx < coarseItems.size()) {
+                    base = coarseItems.get(coarseIdx);
+                }
+            }
             items.add(RecallTestResponse.RecallResultItem.builder()
-                    .chunkId(chunkIdOf(rr.getSegment()))
+                    .chunkId(chunkId)
                     .documentId(base != null ? base.getDocumentId() : null)
                     .source(base != null ? base.getSource() : null)
                     .kbName(base != null ? base.getKbName() : null)

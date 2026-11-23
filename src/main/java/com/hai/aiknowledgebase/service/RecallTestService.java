@@ -75,8 +75,6 @@ public class RecallTestService {
         int rerankMaxDocs = request.getRerankMaxDocs() == null ? 0 : request.getRerankMaxDocs();
         double rerankThreshold = request.getRerankThreshold() == null
                 ? paramValueProvider.getDouble("rerank.minScore",
-                        (request.getKbIds() == null || request.getKbIds().isEmpty())
-                                ? null : Collections.min(request.getKbIds()),
                         thresholdsConfig.getReranker().getMinScore())
                 : request.getRerankThreshold();
 

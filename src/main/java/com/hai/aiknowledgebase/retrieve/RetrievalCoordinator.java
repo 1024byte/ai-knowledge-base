@@ -3,7 +3,6 @@ package com.hai.aiknowledgebase.retrieve;
 import com.hai.aiknowledgebase.annotation.Timed;
 import com.hai.aiknowledgebase.config.ThresholdsConfig;
 import com.hai.aiknowledgebase.exception.BusinessException;
-import com.hai.aiknowledgebase.service.ParamService;
 import com.hai.aiknowledgebase.service.ParamValueProvider;
 import com.hai.aiknowledgebase.service.ParentContextExpander;
 import com.hai.aiknowledgebase.service.RerankerService;
@@ -71,10 +70,7 @@ public class RetrievalCoordinator {
     /** 阈值配置 */
     private final ThresholdsConfig thresholdsConfig;
 
-    /** 参数管理服务，用于按知识库计算参数指纹（多库检索时拆库分组） */
-    private final ParamService paramService;
-
-    /** 参数值读取器，按作用域动态读取检索调优参数（rrfK / vectorMinScore 等） */
+    /** 参数值读取器，按全局作用域动态读取检索调优参数（rrfK / vectorMinScore 等） */
     private final ParamValueProvider paramValueProvider;
 
     /** Rerank 编排器：精排 / 阈值过滤 / 排除词过滤 / 降权 / 跨库重排 */
@@ -83,23 +79,6 @@ public class RetrievalCoordinator {
     /** 向量检索最低余弦相似度阈值，由 ThresholdsConfig 统一管理 */
     private double getMinVectorScore() {
         return thresholdsConfig.getRetrieval().getVectorMinScore();
-    }
-
-    /**
-     * 选取本轮检索的代表知识库 ID（方案 A）。
-     *
-     * <p>多库检索时，rerank.enabled / rerank.minScore / contentType.*.weight /
-     * retrieval.parentContextEnabled 这类「全局倾向」参数以代表 kbId 读取：
-     * 优先取该知识库的 KB 级覆盖，无则回退全局。代表值取集合最小值以保证确定性。</p>
-     *
-     * @param kbIds 检索范围（null/空 表示全局）
-     * @return 代表 kbId；全局检索时返回 null
-     */
-    private Long representativeKbId(Set<Long> kbIds) {
-        if (kbIds == null || kbIds.isEmpty()) {
-            return null;
-        }
-        return Collections.min(kbIds);
     }
 
     // ==================== 核心检索方法 ====================
@@ -140,29 +119,32 @@ public class RetrievalCoordinator {
                                                List<String> expandKeywords,
                                                List<String> excludeKeywords,
                                                Set<Long> kbIds) {
-        double effectiveMinScore = (minScore > 0) ? minScore : getMinVectorScore();
-        // 多库检索的代表 kbId（方案 A）：全局倾向参数按代表库读取，无覆盖则回退全局
-        Long repKbId = representativeKbId(kbIds);
-        // 动态参数（param 优先，yml/硬编码兜底）
+        // 向量阈值：请求指定优先，其次全局动态参数，最后 yml 兜底
+        double effectiveMinScore = (minScore > 0) ? minScore
+                : paramValueProvider.getDouble("retrieval.vectorMinScore", getMinVectorScore());
+        // 动态参数全部按全局作用域读取（param 优先，yml/硬编码兜底）
         boolean rerankEnabled = paramValueProvider.getBoolean(
-                "rerank.enabled", repKbId, rerankerService.isEnabled());
+                "rerank.enabled", rerankerService.isEnabled());
         double rerankMinScore = paramValueProvider.getDouble(
-                "rerank.minScore", repKbId, rerankerService.getMinScore());
+                "rerank.minScore", rerankerService.getMinScore());
         boolean parentContextEnabled = paramValueProvider.getBoolean(
-                "retrieval.parentContextEnabled", repKbId, true);
+                "retrieval.parentContextEnabled", true);
         // 精排候选上限与超时：参数管理可热更，yml 兜底
         int rerankMaxDocs = paramValueProvider.getInt(
-                "rerank.maxDocs", repKbId, rerankerService.getMaxDocs());
+                "rerank.maxDocs", rerankerService.getMaxDocs());
         long rerankTimeoutMs = paramValueProvider.getInt(
-                "rerank.timeoutMs", repKbId, (int) rerankerService.getTimeoutMs());
-        log.info("开始检索，用户查询: {} | topK: {} | minScore: {} | 扩展词: {} | 排除词: {} | kbIds: {} | 代表kbId: {} | rerankEnabled: {} | parentContextEnabled: {} | rerankMaxDocs: {} | rerankTimeoutMs: {}",
-                userQuery, topK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds, repKbId, rerankEnabled, parentContextEnabled, rerankMaxDocs, rerankTimeoutMs);
+                "rerank.timeoutMs", (int) rerankerService.getTimeoutMs());
+        log.info("开始检索，用户查询: {} | topK: {} | minScore: {} | 扩展词: {} | 排除词: {} | kbIds: {} | rerankEnabled: {} | parentContextEnabled: {} | rerankMaxDocs: {} | rerankTimeoutMs: {}",
+                userQuery, topK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds, rerankEnabled, parentContextEnabled, rerankMaxDocs, rerankTimeoutMs);
 
         // ===== 阶段1：混合检索（主路径）=====
-        // 按参数指纹拆库分组检索：指纹相同的知识库合并为一次检索，
-        // 指纹不同的知识库拆分检索，避免多库混查时的参数歧义（rrfK / vectorMinScore）。
-        List<RankedResult> allResults = new ArrayList<>(
-                retrieveByFingerprintGroups(userQuery, topK, effectiveMinScore, kbIds));
+        // 参数已全局化，多库直接一次混合检索，不再按参数指纹拆库分组
+        List<RankedResult> allResults = new ArrayList<>();
+        if (kbIds == null || !kbIds.isEmpty()) {
+            int rrfK = paramValueProvider.getInt("retrieval.rrfK", rankFusion.getDefaultRrfK());
+            allResults = new ArrayList<>(
+                    hybridSearchRanked(userQuery, topK, effectiveMinScore, kbIds, rrfK));
+        }
 
         log.info("混合检索召回 {} 个片段", allResults.size());
 
@@ -183,7 +165,7 @@ public class RetrievalCoordinator {
                             .map(r -> String.format("%.4f", r.getScore()))
                             .collect(Collectors.joining(", ")));
         } else if (rerankEnabled && !rerankerService.isAvailable()) {
-            log.warn("rerank.enabled 已开启（代表kbId={}）但 Reranker 模型未加载（yml reranker.enabled=false 或初始化失败），跳过精排", repKbId);
+            log.warn("rerank.enabled 已开启但 Reranker 模型未加载（yml reranker.enabled=false 或初始化失败），跳过精排");
         }
 
         // ===== 最终重排序 =====
@@ -206,7 +188,7 @@ public class RetrievalCoordinator {
 
         // ===== 阶段5：content_type 降权 =====
         // 对非正文内容（题目、词汇表、答案）降低分数，确保正文优先
-        allResults = rerankOrchestrator.applyContentTypeWeighting(allResults, repKbId);
+        allResults = rerankOrchestrator.applyContentTypeWeighting(allResults, null);
 
         // ===== 阶段6：父上下文扩展 =====
         // 放在精排 / 阈值过滤 / 降权之后，只对最终结果扩展：
@@ -276,59 +258,6 @@ public class RetrievalCoordinator {
         return fused;
     }
 
-    /**
-     * <h3>按参数指纹拆库分组检索</h3>
-     *
-     * <p>多库混查时，不同知识库可能配置了不同的 {@code retrieval.rrfK} /
-     * {@code retrieval.vectorMinScore}。若合并为一次检索，只能取单一参数值，
-     * 会产生「参数歧义」（部分库的阈值被错误应用到其他库）。</p>
-     *
-     * <p>本方法以 {@link ParamService#fingerprint(Long)} 生成的参数指纹为分组键：
-     * 指纹相同的知识库合并为一次检索（共享同一组参数），指纹不同的知识库拆分检索，
-     * 各组结果直接合并返回，由调用方统一重排。</p>
-     *
-     * <h4>分支规则</h4>
-     * <ul>
-     *   <li>{@code kbIds == null}：全局检索（不过滤知识库），读取全局 {@code retrieval.rrfK}，
-     *       向量阈值沿用调用方传入的 {@code effectiveMinScore}。</li>
-     *   <li>{@code kbIds} 为空集合：无可见知识库，返回空列表。</li>
-     *   <li>否则：按指纹分组，每组取代表 kbId 读取该组的 {@code rrfK} 与 {@code vectorMinScore}
-     *       （兜底分别为 yml 默认值与 {@code effectiveMinScore}），分别检索后合并。</li>
-     * </ul>
-     *
-     * @param query             用户查询文本
-     * @param topK              每组返回结果数量上限
-     * @param effectiveMinScore 向量最低相似度兜底阈值（调用方已解析）
-     * @param kbIds             知识库范围（null 表示不过滤）
-     * @return 合并后的检索结果（尚未跨库重排）
-     */
-    private List<RankedResult> retrieveByFingerprintGroups(
-            String query, int topK, double effectiveMinScore, Set<Long> kbIds) {
-        if (kbIds == null) {
-            int globalRrfK = paramValueProvider.getInt(
-                    "retrieval.rrfK", null, rankFusion.getDefaultRrfK());
-            return hybridSearchRanked(
-                    query, topK, effectiveMinScore, null, globalRrfK);
-        }
-        if (kbIds.isEmpty()) {
-            return Collections.emptyList();
-        }
-        // 按参数指纹分组（LinkedHashMap 保持分组顺序稳定）
-        Map<String, List<Long>> groups = new LinkedHashMap<>();
-        for (Long kbId : kbIds) {
-            groups.computeIfAbsent(paramService.fingerprint(kbId), k -> new ArrayList<>()).add(kbId);
-        }
-        List<RankedResult> merged = new ArrayList<>();
-        for (List<Long> group : groups.values()) {
-            Long rep = group.get(0);
-            int rrfK = paramValueProvider.getInt("retrieval.rrfK", rep, rankFusion.getDefaultRrfK());
-            double groupMin = paramValueProvider.getDouble("retrieval.vectorMinScore", rep, effectiveMinScore);
-            merged.addAll(hybridSearchRanked(
-                    query, topK, groupMin, new HashSet<>(group), rrfK));
-        }
-        return merged;
-    }
-
     // ==================== 分路观测检索（召回测试复用） ====================
 
     /**
@@ -372,17 +301,15 @@ public class RetrievalCoordinator {
                 : topK;
         // rerank_fuse：两路各自精排后再 RRF（仅 hybrid 实验模式，默认 fuse_rerank）
         boolean rerankFuse = enableRerank && needVector && needBm25 && "rerank_fuse".equals(rerankStage);
-        // 代表 kbId（方案 A）：全局倾向参数（父上下文开关 / content_type 权重）按代表库读取，无覆盖则回退全局
-        Long repKbId = representativeKbId(kbIds);
+        // 动态参数全部按全局作用域读取；rerankMaxDocs 支持请求级覆盖（仅召回测试）
         boolean parentContextEnabled = paramValueProvider.getBoolean(
-                "retrieval.parentContextEnabled", repKbId, true);
-        // 精排候选上限与超时：请求覆盖 > 参数管理 > yml 兜底
+                "retrieval.parentContextEnabled", true);
+        // 精排候选上限与超时：请求覆盖 > 全局参数 > yml 兜底
         int rerankMaxDocs = rerankMaxDocsOverride > 0
                 ? rerankMaxDocsOverride
-                : paramValueProvider.getInt(
-                        "rerank.maxDocs", repKbId, rerankerService.getMaxDocs());
+                : paramValueProvider.getInt("rerank.maxDocs", rerankerService.getMaxDocs());
         long rerankTimeoutMs = paramValueProvider.getInt(
-                "rerank.timeoutMs", repKbId, (int) rerankerService.getTimeoutMs());
+                "rerank.timeoutMs", (int) rerankerService.getTimeoutMs());
 
         List<RankedResult> vector = new ArrayList<>();
         List<RankedResult> bm25 = new ArrayList<>();
@@ -444,7 +371,7 @@ public class RetrievalCoordinator {
             List<RankedResult> bm25Reranked = traceRerankToRanked(
                     query, bm25Candidates, rerankThreshold, rerankMaxDocs, rerankTimeoutMs);
             fusion = rerankOrchestrator.applyContentTypeWeighting(
-                    rankFusion.fuseRanked(vectorReranked, bm25Reranked, retrieveTopK, rrfK), repKbId);
+                    rankFusion.fuseRanked(vectorReranked, bm25Reranked, retrieveTopK, rrfK), null);
             // ===== 父上下文扩展：放在精排 / 融合 / 降权之后，只扩展最终结果 =====
             if (parentContextEnabled) {
                 fusion = parentContextExpander.expand(fusion);
@@ -472,7 +399,7 @@ public class RetrievalCoordinator {
                 applyWeighting = false;
             }
             long start = System.currentTimeMillis();
-            rerank = traceRerank(query, rerankInput, rerankThreshold, repKbId, applyWeighting,
+            rerank = traceRerank(query, rerankInput, rerankThreshold, applyWeighting,
                     rerankMaxDocs, rerankTimeoutMs);
             rerankMs = System.currentTimeMillis() - start;
             rerankApplied = !rerankInput.isEmpty();
@@ -486,7 +413,7 @@ public class RetrievalCoordinator {
             // ===== 跨库重排（对齐生产最终重排序）：Rerank 关闭时按原始向量相似度排序，避免用 RRF 分混排 =====
             fusion = rerankOrchestrator.reorderByRawScore(fusion);
             // ===== content_type 降权（对齐生产阶段5）：Rerank 关闭时，融合结果即最终结果 =====
-            fusion = rerankOrchestrator.applyContentTypeWeighting(fusion, repKbId);
+            fusion = rerankOrchestrator.applyContentTypeWeighting(fusion, null);
             // ===== 父上下文扩展：放在重排序 / 降权之后，只扩展最终结果 =====
             if (parentContextEnabled) {
                 fusion = parentContextExpander.expand(fusion);
@@ -538,7 +465,7 @@ public class RetrievalCoordinator {
     }
 
     private List<RerankedResult> traceRerank(String query, List<RankedResult> candidates,
-                                             double rerankThreshold, Long repKbId,
+                                             double rerankThreshold,
                                              boolean applyContentTypeWeighting,
                                              int maxDocs, long timeoutMs) {
         if (!rerankerService.isAvailable()) {
@@ -566,7 +493,7 @@ public class RetrievalCoordinator {
                 return items;
             }
             // ===== content_type 降权（对齐生产阶段5）：非正文片段（题目/词汇/答案）降权后重排 =====
-            return rerankOrchestrator.applyContentTypeWeightingToReranked(items, repKbId);
+            return rerankOrchestrator.applyContentTypeWeightingToReranked(items, null);
         } catch (BusinessException e) {
             throw e;
         } catch (Exception e) {

@@ -245,10 +245,10 @@ public class ChatService {
 
         // 知识库隔离：指定 kbId 时校验权限；未指定时回退到当前用户可见的知识库范围
         Set<Long> kbIds = resolveSearchScope(userId, kbId);
-        // topK：请求指定优先，其次动态参数（retrieval.topK，代表 kbId 级覆盖 → 全局），最后 yml 兜底
+        // topK：请求指定优先，其次全局动态参数（retrieval.topK），最后 yml 兜底
         int effectiveTopK = (requestTopK != null && requestTopK > 0)
                 ? requestTopK
-                : paramValueProvider.getInt("retrieval.topK", representativeKbId(kbIds), this.topK);
+                : paramValueProvider.getInt("retrieval.topK", this.topK);
 
         // 步骤0：查询改写（含指代消解，使用对话历史）
         // 0.1 获取当前会话的 ChatMemory，提取最近 2 轮对话历史
@@ -357,10 +357,10 @@ public class ChatService {
 
         // 知识库隔离：指定 kbId 时校验权限；未指定时回退到当前用户可见的知识库范围
         Set<Long> kbIds = resolveSearchScope(userId, kbId);
-        // topK：请求指定优先，其次动态参数（retrieval.topK，代表 kbId 级覆盖 → 全局），最后 yml 兜底
+        // topK：请求指定优先，其次全局动态参数（retrieval.topK），最后 yml 兜底
         int effectiveTopK = (requestTopK != null && requestTopK > 0)
                 ? requestTopK
-                : paramValueProvider.getInt("retrieval.topK", representativeKbId(kbIds), this.topK);
+                : paramValueProvider.getInt("retrieval.topK", this.topK);
 
         chatTaskExecutor.execute(() -> {
             try {
@@ -1003,20 +1003,6 @@ public class ChatService {
             return Set.of(kbId);
         }
         return new HashSet<>(kbPermissionService.getVisibleKbIds(userId));
-    }
-
-    /**
-     * 选取本轮检索的代表知识库 ID（方案 A）：取集合最小值以保证确定性。
-     * 全局倾向参数（如 retrieval.topK）按代表库读取，无覆盖则回退全局。
-     *
-     * @param kbIds 检索范围（null/空 表示全局）
-     * @return 代表 kbId；全局检索时返回 null
-     */
-    private Long representativeKbId(Set<Long> kbIds) {
-        if (kbIds == null || kbIds.isEmpty()) {
-            return null;
-        }
-        return Collections.min(kbIds);
     }
 
     private ContextBuildResult buildContextWithinBudget(List<TextSegment> segments, int maxTokens) {

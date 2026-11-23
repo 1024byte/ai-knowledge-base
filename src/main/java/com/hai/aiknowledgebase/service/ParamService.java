@@ -34,7 +34,7 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>实现检索调优参数「调参 → 保存草稿 → 审核应用 → 生产生效」的闭环核心逻辑：</p>
  * <ul>
- *   <li><b>参数解析</b>：KB 级覆盖 &gt; 全局已应用 &gt; 元数据默认值，结果带 30s TTL 缓存</li>
+ *   <li><b>参数解析</b>：全局已应用 &gt; 元数据默认值（参数已全局化，不再支持 KB 级覆盖），结果带 30s TTL 缓存</li>
  *   <li><b>save</b>：保存/更新草稿（登录即可）</li>
  *   <li><b>apply</b>：草稿置为已应用（事务 + 删除旧 APPLIED + 写历史 + 缓存失效）</li>
  *   <li><b>rollback</b>：回退到默认值（删除该参数在本作用域的所有配置）</li>
@@ -84,8 +84,8 @@ public class ParamService {
     /**
      * <h3>解析某作用域下的生效参数</h3>
      *
-     * <p>解析顺序：KB 级覆盖 &gt; 全局已应用 &gt; 元数据默认值。
-     * 结果以 {@code Map<paramKey, paramValue>} 返回（值为字符串，由消费方按类型转换）。</p>
+     * <p>解析顺序：全局已应用 &gt; 元数据默认值。
+     * 参数已全局化，KB 级历史配置不再参与解析；{@code kbId} 参数保留以便后续扩展。</p>
      *
      * @param kbId 知识库 ID，null 表示全局作用域
      * @return 生效参数映射（不可变语义，请勿修改）
@@ -113,15 +113,9 @@ public class ParamService {
         for (ParamMetadata meta : paramMetadataMapper.selectList(null)) {
             resolved.put(meta.getParamKey(), meta.getDefaultValue());
         }
-        // 2. 全局已应用覆盖
+        // 2. 全局已应用覆盖（参数已全局化，不再读取 KB 级覆盖）
         for (ParamConfig cfg : listApplied(SCOPE_GLOBAL, null)) {
             resolved.put(cfg.getParamKey(), cfg.getParamValue());
-        }
-        // 3. 知识库级覆盖
-        if (kbId != null) {
-            for (ParamConfig cfg : listApplied(SCOPE_KB, kbId)) {
-                resolved.put(cfg.getParamKey(), cfg.getParamValue());
-            }
         }
         return resolved;
     }
@@ -150,25 +144,6 @@ public class ParamService {
         } else {
             resolvedCache.invalidate(cacheKey(kbId));
         }
-    }
-
-    /**
-     * <h3>计算某作用域生效参数的稳定指纹</h3>
-     *
-     * <p>供多库检索按参数分组：指纹相同的知识库可合并为一次检索，
-     * 指纹不同的知识库必须拆分检索，从而避免「多库混查时的参数歧义」。
-     * 指纹由全部生效参数按 key 排序后拼接而成，任一参数差异都会产生不同指纹。</p>
-     *
-     * @param kbId 知识库 ID，null 表示全局作用域
-     * @return 参数指纹字符串
-     */
-    public String fingerprint(Long kbId) {
-        Map<String, String> resolved = resolveAll(kbId);
-        StringBuilder sb = new StringBuilder(256);
-        resolved.entrySet().stream()
-                .sorted(Map.Entry.comparingByKey())
-                .forEach(e -> sb.append(e.getKey()).append('=').append(e.getValue()).append(';'));
-        return sb.toString();
     }
 
     // ==================== 查询 ====================
@@ -250,7 +225,7 @@ public class ParamService {
         Long userId = requireLogin();
         String scopeType = scopeTypeOf(kbId);
         if (kbId != null) {
-            checkKbExists(kbId);
+            throw new BusinessException(400, "当前版本仅支持全局参数配置，不支持按知识库配置");
         }
         ParamMetadata meta = requireMetadata(paramKey);
         validateValue(meta, paramValue);

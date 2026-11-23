@@ -109,7 +109,7 @@ public class RerankOrchestrator {
      * 词汇表（VOCAB）、答案（ANSWER）的分数乘以折扣系数，确保检索时正文优先。</p>
      *
      * @param results 已排序的检索结果
-     * @param repKbId 代表知识库 ID（null 表示仅读全局）
+     * @param repKbId 参数作用域 kbId（当前版本调用方固定传 null，仅读全局）
      * @return 降权后的结果列表
      */
     public List<RankedResult> applyContentTypeWeighting(List<RankedResult> results, Long repKbId) {
@@ -149,7 +149,7 @@ public class RerankOrchestrator {
      * 按 content_type 权重乘以精排分数后降序重排，coarseRank（粗排位次）保持不变。</p>
      *
      * @param results 精排结果列表
-     * @param repKbId 代表知识库 ID（null 表示仅读全局）
+     * @param repKbId 参数作用域 kbId（当前版本调用方固定传 null，仅读全局）
      */
     public List<RerankedResult> applyContentTypeWeightingToReranked(List<RerankedResult> results, Long repKbId) {
         if (results.isEmpty()) {

@@ -113,11 +113,8 @@ public class RecallTestController {
         // Rerank 校验与策略无关：hybrid / vector / bm25 均可挂载
         if (request.isEnableRerank()) {
             if (request.getRerankThreshold() == null) {
-                Long rep = request.getKbIds().isEmpty()
-                        ? null
-                        : Collections.min(request.getKbIds());
                 request.setRerankThreshold(
-                        paramValueProvider.getDouble("rerank.minScore", rep,
+                        paramValueProvider.getDouble("rerank.minScore",
                                 thresholdsConfig.getReranker().getMinScore()));
             }
             if (request.getRerankThreshold() < -100 || request.getRerankThreshold() > 100) {

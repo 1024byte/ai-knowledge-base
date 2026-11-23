@@ -1,6 +1,7 @@
 package com.hai.aiknowledgebase.service;
 
 import com.hai.aiknowledgebase.retrieve.RankedResult;
+import com.hai.aiknowledgebase.retrieve.RerankedResult;
 import dev.langchain4j.data.segment.TextSegment;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -80,6 +81,48 @@ public class ParentContextExpander {
         }
 
         return deduplicated;
+    }
+
+    /**
+     * <h3>对精排结果执行父上下文扩展</h3>
+     *
+     * <p>用于「先精排、后扩展」的顺序：精排阶段使用原始 chunk 打分，
+     * 精排完成后再把返回结果替换为 parent_text，并按段落 hash 去重。</p>
+     *
+     * @param results 精排结果列表（按精排分降序）
+     * @return 扩展并去重后的精排结果，精排分与粗排位次保持不变
+     */
+    public List<RerankedResult> expandReranked(List<RerankedResult> results) {
+        if (results == null || results.isEmpty()) {
+            return results;
+        }
+
+        List<RerankedResult> expanded = new ArrayList<>(results.size());
+        for (RerankedResult r : results) {
+            String parentText = r.getSegment().metadata().getString("parent_text");
+            if (parentText != null && !parentText.isBlank()) {
+                expanded.add(new RerankedResult(
+                        TextSegment.from(parentText, r.getSegment().metadata()),
+                        r.getRerankScore(), r.getCoarseRank()));
+            } else {
+                expanded.add(r);
+            }
+        }
+
+        if (expanded.size() <= 1) {
+            return expanded;
+        }
+
+        // 相邻 chunk 的 parent_text 高度重叠，去重时保留精排分最高的版本
+        Map<Integer, RerankedResult> seen = new LinkedHashMap<>();
+        for (RerankedResult r : expanded) {
+            int hash = computeParagraphHash(r.getSegment().text());
+            RerankedResult existing = seen.get(hash);
+            if (existing == null || r.getRerankScore() > existing.getRerankScore()) {
+                seen.put(hash, r);
+            }
+        }
+        return new ArrayList<>(seen.values());
     }
 
     /**

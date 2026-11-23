@@ -26,8 +26,9 @@ import java.util.stream.Collectors;
 /**
  * <h2>检索协调器</h2>
  *
- * <p>负责编排「混合检索 → 父上下文扩展 → 排除词过滤 → Rerank 精排 → 阈值过滤 → content_type 降权」
- * 的完整链路。底层检索原语与事后处理分别委托给独立组件：</p>
+ * <p>负责编排「混合检索 → 排除词过滤 → Rerank 精排 → 阈值过滤 → content_type 降权 → 父上下文扩展」
+ * 的完整链路。父上下文扩展放在精排之后，避免 parent_text 过长被 Reranker 截断。
+ * 底层检索原语与事后处理分别委托给独立组件：</p>
  * <ul>
  *   <li>{@link VectorRetriever}：向量语义检索</li>
  *   <li>{@link KeywordRetriever}：BM25 关键词检索</li>
@@ -165,15 +166,6 @@ public class RetrievalCoordinator {
 
         log.info("混合检索召回 {} 个片段", allResults.size());
 
-        // ===== 阶段1.5：父上下文扩展 =====
-        // 用入库时预计算的 parent_text 替换 chunk 文本，实现零延迟的上下文补全。
-        // 解决 PDF 解析将编号列表/长段落误切分导致的碎片化问题。
-        if (parentContextEnabled) {
-            allResults = parentContextExpander.expand(allResults);
-        } else {
-            log.debug("父上下文扩展已关闭（retrieval.parentContextEnabled=false），跳过 parent_text 替换");
-        }
-
         // ===== 阶段2：排除关键词过滤 =====
         // 对片段分词后精确匹配排除词（避免子串误杀，如排除"Java"误杀"JavaScript"）
         allResults = rerankOrchestrator.filterByExcludeKeywords(allResults, excludeKeywords);
@@ -215,6 +207,16 @@ public class RetrievalCoordinator {
         // ===== 阶段5：content_type 降权 =====
         // 对非正文内容（题目、词汇表、答案）降低分数，确保正文优先
         allResults = rerankOrchestrator.applyContentTypeWeighting(allResults, repKbId);
+
+        // ===== 阶段6：父上下文扩展 =====
+        // 放在精排 / 阈值过滤 / 降权之后，只对最终结果扩展：
+        // 避免 parent_text 过长被 Reranker 的 max-seq-length 截断，导致精排看不到真正命中的 chunk；
+        // 同时只扩展最终结果，减少 token 与耗时。
+        if (parentContextEnabled) {
+            allResults = parentContextExpander.expand(allResults);
+        } else {
+            log.debug("父上下文扩展已关闭（retrieval.parentContextEnabled=false），跳过 parent_text 替换");
+        }
 
         log.info("最终返回 {} 个片段", allResults.size());
         return allResults;
@@ -335,9 +337,9 @@ public class RetrievalCoordinator {
      * <p>将向量 / BM25 单路检索、RRF 融合、Rerank 精排统一编排在本服务内，
      * 复用检索原语与精排能力，避免召回测试独立实现重复逻辑。</p>
      *
-     * <p>hybrid 的融合结果依次经过生产链路的父上下文扩展（parent_text）、排除关键词过滤，
-     * 最终结果（Rerank 开启时为精排结果，否则为融合结果）经过 content_type 降权，
-     * 确保召回测试观测到的检索行为与智慧问答生产链路一致。开启 Rerank 时，
+     * <p>hybrid 的融合结果依次经过排除关键词过滤、精排（可选）、阈值过滤、content_type 降权，
+     * 最后再做父上下文扩展（parent_text），保证 Reranker 看到的是原始命中 chunk。
+     * 这样召回测试观测到的检索行为与智慧问答生产链路一致。开启 Rerank 时，
      * 该精排层同样可挂载在 vector / bm25 单路结果之后。</p>
      *
      * @param query           查询文本
@@ -422,13 +424,6 @@ public class RetrievalCoordinator {
                 fusion = rankFusion.fuseRanked(vector, bm25, retrieveTopK, rrfK);
             }
 
-            // ===== 父上下文扩展（对齐生产阶段1.5）：用入库预计算的 parent_text 替换片段文本 =====
-            if (parentContextEnabled) {
-                fusion = parentContextExpander.expand(fusion);
-            } else {
-                log.debug("召回测试-父上下文扩展已关闭（retrieval.parentContextEnabled=false），跳过 parent_text 替换");
-            }
-
             // ===== 排除关键词过滤（对齐生产阶段2）：分词后精确匹配排除词，避免子串误杀 =====
             fusion = rerankOrchestrator.filterByExcludeKeywords(fusion, excludeKeywords);
         }
@@ -437,20 +432,23 @@ public class RetrievalCoordinator {
         Long rerankMs = null;
         boolean rerankApplied = false;
         if (rerankFuse) {
-            // 实验模式：两路各自精排（先补父上下文与排除词过滤），再 RRF 融合，最后 content_type 降权
+            // 实验模式：两路各自精排（先做排除词过滤），再 RRF 融合，最后降权与父上下文扩展
             long start = System.currentTimeMillis();
-            List<RankedResult> vectorCandidates = parentContextEnabled
-                    ? parentContextExpander.expand(vector) : vector;
-            vectorCandidates = rerankOrchestrator.filterByExcludeKeywords(vectorCandidates, excludeKeywords);
-            List<RankedResult> bm25Candidates = parentContextEnabled
-                    ? parentContextExpander.expand(bm25) : bm25;
-            bm25Candidates = rerankOrchestrator.filterByExcludeKeywords(bm25Candidates, excludeKeywords);
+            // 精排阶段使用原始 chunk；父上下文扩展统一放到精排 / 阈值过滤之后
+            List<RankedResult> vectorCandidates =
+                    rerankOrchestrator.filterByExcludeKeywords(vector, excludeKeywords);
+            List<RankedResult> bm25Candidates =
+                    rerankOrchestrator.filterByExcludeKeywords(bm25, excludeKeywords);
             List<RankedResult> vectorReranked = traceRerankToRanked(
                     query, vectorCandidates, rerankThreshold, rerankMaxDocs, rerankTimeoutMs);
             List<RankedResult> bm25Reranked = traceRerankToRanked(
                     query, bm25Candidates, rerankThreshold, rerankMaxDocs, rerankTimeoutMs);
             fusion = rerankOrchestrator.applyContentTypeWeighting(
                     rankFusion.fuseRanked(vectorReranked, bm25Reranked, retrieveTopK, rrfK), repKbId);
+            // ===== 父上下文扩展：放在精排 / 融合 / 降权之后，只扩展最终结果 =====
+            if (parentContextEnabled) {
+                fusion = parentContextExpander.expand(fusion);
+            }
             rerank = toRerankedResults(fusion, vectorReranked, bm25Reranked);
             rerankMs = System.currentTimeMillis() - start;
             rerankApplied = !(vectorReranked.isEmpty() && bm25Reranked.isEmpty());
@@ -478,6 +476,10 @@ public class RetrievalCoordinator {
                     rerankMaxDocs, rerankTimeoutMs);
             rerankMs = System.currentTimeMillis() - start;
             rerankApplied = !rerankInput.isEmpty();
+            // ===== 父上下文扩展：hybrid 才生效，放在精排 / 阈值过滤 / 降权之后 =====
+            if (needVector && needBm25 && parentContextEnabled) {
+                rerank = parentContextExpander.expandReranked(rerank);
+            }
             // rerank 列表保留完整精排结果（经阈值过滤），topN 截断仅作用于 final 列表（RecallTestService 侧）。
             // 这样前端可以在 rerank Tab 看到完整的精排排序分布，而主表 final 只展示 topN。
         } else if (needVector && needBm25) {
@@ -485,6 +487,10 @@ public class RetrievalCoordinator {
             fusion = rerankOrchestrator.reorderByRawScore(fusion);
             // ===== content_type 降权（对齐生产阶段5）：Rerank 关闭时，融合结果即最终结果 =====
             fusion = rerankOrchestrator.applyContentTypeWeighting(fusion, repKbId);
+            // ===== 父上下文扩展：放在重排序 / 降权之后，只扩展最终结果 =====
+            if (parentContextEnabled) {
+                fusion = parentContextExpander.expand(fusion);
+            }
         }
 
         return new RetrievalTrace(vector, bm25, fusion, rerank, vectorMs, bm25Ms, rerankMs,

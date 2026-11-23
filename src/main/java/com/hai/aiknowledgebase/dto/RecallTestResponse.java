@@ -39,6 +39,9 @@ public class RecallTestResponse {
     /** 本次是否实际执行了 Rerank 精排（候选为空或未开启时为 false） */
     private Boolean rerankApplied;
 
+    /** 本次实际生效的精排候选上限（请求覆盖 > 参数管理 > yml） */
+    private Integer rerankMaxDocs;
+
     /** 本次实际生效的分数口径：cosine / bm25_normalized / rrf / rerank_logits */
     private String scoreType;
 

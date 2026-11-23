@@ -230,8 +230,25 @@ public class RerankerService {
      * @param topN  返回前 N 个结果
      * @return 按分数降序排列的 Rerank 结果
      */
-    @Timed("Rerank 精排")
     public List<RerankResult> rerank(String query, List<String> docs, int topN) {
+        return rerank(query, docs, topN, maxDocs, timeoutMs);
+    }
+
+    /**
+     * 对候选文档进行 Rerank 精排（支持按作用域覆盖候选上限与超时）
+     *
+     * @param query     用户查询
+     * @param docs      候选文档列表
+     * @param topN      返回前 N 个结果
+     * @param maxDocs   单次精排最大候选数，≤0 时回退 yml 配置
+     * @param timeoutMs 单次精排超时时间（毫秒），≤0 时回退 yml 配置
+     * @return 按分数降序排列的 Rerank 结果
+     */
+    @Timed("Rerank 精排")
+    public List<RerankResult> rerank(String query, List<String> docs, int topN,
+                                     int maxDocs, long timeoutMs) {
+        int effectiveMaxDocs = maxDocs > 0 ? maxDocs : this.maxDocs;
+        long effectiveTimeoutMs = timeoutMs > 0 ? timeoutMs : this.timeoutMs;
         if (!initialized) {
             log.debug("Reranker 未初始化，跳过精排");
             return fallbackResults(docs, topN);
@@ -242,12 +259,12 @@ public class RerankerService {
         }
 
         // 限制候选数量
-        List<String> candidateDocs = docs.size() > maxDocs
-                ? docs.subList(0, maxDocs)
+        List<String> candidateDocs = docs.size() > effectiveMaxDocs
+                ? docs.subList(0, effectiveMaxDocs)
                 : docs;
 
         try {
-            List<RerankResult> results = rerankWithTimeout(query, candidateDocs);
+            List<RerankResult> results = rerankWithTimeout(query, candidateDocs, effectiveTimeoutMs);
             results.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
             return results.size() <= topN ? results : results.subList(0, topN);
         } catch (Exception e) {
@@ -259,7 +276,7 @@ public class RerankerService {
     /**
      * 带超时的 Rerank 执行
      */
-    private List<RerankResult> rerankWithTimeout(String query, List<String> docs) {
+    private List<RerankResult> rerankWithTimeout(String query, List<String> docs, long timeoutMs) {
         CompletableFuture<List<RerankResult>> future = CompletableFuture.supplyAsync(
                 () -> {
                     try {
@@ -380,5 +397,19 @@ public class RerankerService {
      */
     public double getMinScore() {
         return thresholdsConfig.getReranker().getMinScore();
+    }
+
+    /**
+     * yml 兜底的单次精排最大候选数
+     */
+    public int getMaxDocs() {
+        return maxDocs;
+    }
+
+    /**
+     * yml 兜底的单次精排超时时间（毫秒）
+     */
+    public long getTimeoutMs() {
+        return timeoutMs;
     }
 }

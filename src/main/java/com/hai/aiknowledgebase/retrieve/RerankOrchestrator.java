@@ -52,12 +52,23 @@ public class RerankOrchestrator {
      * @return 按精排分排列的结果列表
      */
     public List<RankedResult> rerank(String query, List<RankedResult> candidates) {
+        return rerank(query, candidates, 0, 0);
+    }
+
+    /**
+     * <h3>Cross-Encoder 精排（支持按作用域覆盖候选上限与超时）</h3>
+     *
+     * @param maxDocs   单次精排最大候选数，≤0 时使用 yml 兜底配置
+     * @param timeoutMs 单次精排超时时间（毫秒），≤0 时使用 yml 兜底配置
+     */
+    public List<RankedResult> rerank(String query, List<RankedResult> candidates,
+                                     int maxDocs, long timeoutMs) {
         List<String> docTexts = candidates.stream()
                 .map(r -> r.getSegment().text())
                 .collect(Collectors.toList());
 
         List<RerankerService.RerankResult> rerankResults =
-                rerankerService.rerank(query, docTexts, candidates.size());
+                rerankerService.rerank(query, docTexts, candidates.size(), maxDocs, timeoutMs);
 
         List<RankedResult> reranked = new ArrayList<>();
         for (RerankerService.RerankResult rr : rerankResults) {

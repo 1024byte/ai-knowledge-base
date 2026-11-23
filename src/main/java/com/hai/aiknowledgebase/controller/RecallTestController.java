@@ -82,6 +82,11 @@ public class RecallTestController {
         if (request.getMaxCandidates() < 1 || request.getMaxCandidates() > 500) {
             throw new BusinessException(400, "maxCandidates 必须在 1~500 之间");
         }
+        // 精排候选上限：留空表示使用参数管理 rerank.maxDocs
+        if (request.getRerankMaxDocs() != null
+                && (request.getRerankMaxDocs() < 1 || request.getRerankMaxDocs() > 300)) {
+            throw new BusinessException(400, "rerankMaxDocs 必须在 1~300 之间");
+        }
         if (request.getTopN() == null) {
             request.setTopN(request.getTopK());
         }

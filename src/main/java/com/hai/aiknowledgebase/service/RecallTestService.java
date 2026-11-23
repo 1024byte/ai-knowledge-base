@@ -71,6 +71,8 @@ public class RecallTestService {
         int maxCandidates = request.getMaxCandidates() == null ? 100 : request.getMaxCandidates();
         int topN = request.getTopN() == null ? topK : request.getTopN();
         String rerankStage = request.getRerankStage() == null ? "fuse_rerank" : request.getRerankStage();
+        // 精排候选上限：0 表示不覆盖，使用参数管理 rerank.maxDocs
+        int rerankMaxDocs = request.getRerankMaxDocs() == null ? 0 : request.getRerankMaxDocs();
         double rerankThreshold = request.getRerankThreshold() == null
                 ? paramValueProvider.getDouble("rerank.minScore",
                         (request.getKbIds() == null || request.getKbIds().isEmpty())
@@ -97,7 +99,7 @@ public class RecallTestService {
         // 3. 复用生产检索编排，一次性拿到向量/BM25/融合/精排四路观测结果
         RetrievalTrace trace = retrievalCoordinator.retrieveWithTrace(
                 query, strategy, topK, threshold, kbIds, documentIds, rrfK, enableRerank, rerankThreshold,
-                excludeKeywords, candidateMultiplier, maxCandidates, topN, rerankStage);
+                excludeKeywords, candidateMultiplier, maxCandidates, topN, rerankStage, rerankMaxDocs);
 
         // 4. 数据补全：以片段主键为锚点反查 documentId / source / kbName
         CompletionContext context = buildCompletionContext(trace);
@@ -149,6 +151,7 @@ public class RecallTestService {
                 .bm25Ms(trace.getBm25Ms())
                 .rerankMs(trace.getRerankMs())
                 .rerankApplied(trace.isRerankApplied())
+                .rerankMaxDocs(trace.getRerankMaxDocs())
                 .scoreType(scoreType)
                 .tokens(tokens)
                 .results(RecallTestResponse.Results.builder()

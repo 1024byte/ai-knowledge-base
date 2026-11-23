@@ -149,8 +149,13 @@ public class RetrievalCoordinator {
                 "rerank.minScore", repKbId, rerankerService.getMinScore());
         boolean parentContextEnabled = paramValueProvider.getBoolean(
                 "retrieval.parentContextEnabled", repKbId, true);
-        log.info("开始检索，用户查询: {} | topK: {} | minScore: {} | 扩展词: {} | 排除词: {} | kbIds: {} | 代表kbId: {} | rerankEnabled: {} | parentContextEnabled: {}",
-                userQuery, topK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds, repKbId, rerankEnabled, parentContextEnabled);
+        // 精排候选上限与超时：参数管理可热更，yml 兜底
+        int rerankMaxDocs = paramValueProvider.getInt(
+                "rerank.maxDocs", repKbId, rerankerService.getMaxDocs());
+        long rerankTimeoutMs = paramValueProvider.getInt(
+                "rerank.timeoutMs", repKbId, (int) rerankerService.getTimeoutMs());
+        log.info("开始检索，用户查询: {} | topK: {} | minScore: {} | 扩展词: {} | 排除词: {} | kbIds: {} | 代表kbId: {} | rerankEnabled: {} | parentContextEnabled: {} | rerankMaxDocs: {} | rerankTimeoutMs: {}",
+                userQuery, topK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds, repKbId, rerankEnabled, parentContextEnabled, rerankMaxDocs, rerankTimeoutMs);
 
         // ===== 阶段1：混合检索（主路径）=====
         // 按参数指纹拆库分组检索：指纹相同的知识库合并为一次检索，
@@ -179,7 +184,7 @@ public class RetrievalCoordinator {
             rerankApplied = true;
             log.info("开始 Rerank 精排，候选片段数: {}", allResults.size());
 
-            allResults = rerankOrchestrator.rerank(userQuery, allResults);
+            allResults = rerankOrchestrator.rerank(userQuery, allResults, rerankMaxDocs, rerankTimeoutMs);
 
             log.info("Rerank 精排完成，Top-3 分数: {}",
                     allResults.stream().limit(3)
@@ -349,13 +354,14 @@ public class RetrievalCoordinator {
      * @param maxCandidates       候选池上限（开启 Rerank 时生效）
      * @param topN                最终返回数量（开启 Rerank 时在精排过滤后截取）
      * @param rerankStage         Rerank 挂载阶段：fuse_rerank（默认）/ rerank_fuse（实验）
+     * @param rerankMaxDocsOverride 本次测试的精排候选上限覆盖（≤0 表示使用参数管理 rerank.maxDocs）
      */
     public RetrievalTrace retrieveWithTrace(String query, String strategy, int topK, double threshold,
                                             Set<Long> kbIds, Set<Long> documentIds,
                                             int rrfK, boolean enableRerank, double rerankThreshold,
                                             List<String> excludeKeywords,
                                             int candidateMultiplier, int maxCandidates, int topN,
-                                            String rerankStage) {
+                                            String rerankStage, int rerankMaxDocsOverride) {
         boolean needVector = !"bm25".equals(strategy);
         boolean needBm25 = !"vector".equals(strategy);
         // 候选池：开启 Rerank 时先扩大召回，精排后再截取 topN；未开启时保持原 topK 行为
@@ -368,6 +374,13 @@ public class RetrievalCoordinator {
         Long repKbId = representativeKbId(kbIds);
         boolean parentContextEnabled = paramValueProvider.getBoolean(
                 "retrieval.parentContextEnabled", repKbId, true);
+        // 精排候选上限与超时：请求覆盖 > 参数管理 > yml 兜底
+        int rerankMaxDocs = rerankMaxDocsOverride > 0
+                ? rerankMaxDocsOverride
+                : paramValueProvider.getInt(
+                        "rerank.maxDocs", repKbId, rerankerService.getMaxDocs());
+        long rerankTimeoutMs = paramValueProvider.getInt(
+                "rerank.timeoutMs", repKbId, (int) rerankerService.getTimeoutMs());
 
         List<RankedResult> vector = new ArrayList<>();
         List<RankedResult> bm25 = new ArrayList<>();
@@ -432,8 +445,10 @@ public class RetrievalCoordinator {
             List<RankedResult> bm25Candidates = parentContextEnabled
                     ? parentContextExpander.expand(bm25) : bm25;
             bm25Candidates = rerankOrchestrator.filterByExcludeKeywords(bm25Candidates, excludeKeywords);
-            List<RankedResult> vectorReranked = traceRerankToRanked(query, vectorCandidates, rerankThreshold);
-            List<RankedResult> bm25Reranked = traceRerankToRanked(query, bm25Candidates, rerankThreshold);
+            List<RankedResult> vectorReranked = traceRerankToRanked(
+                    query, vectorCandidates, rerankThreshold, rerankMaxDocs, rerankTimeoutMs);
+            List<RankedResult> bm25Reranked = traceRerankToRanked(
+                    query, bm25Candidates, rerankThreshold, rerankMaxDocs, rerankTimeoutMs);
             fusion = rerankOrchestrator.applyContentTypeWeighting(
                     rankFusion.fuseRanked(vectorReranked, bm25Reranked, retrieveTopK, rrfK), repKbId);
             rerank = toRerankedResults(fusion, vectorReranked, bm25Reranked);
@@ -459,7 +474,8 @@ public class RetrievalCoordinator {
                 applyWeighting = false;
             }
             long start = System.currentTimeMillis();
-            rerank = traceRerank(query, rerankInput, rerankThreshold, repKbId, applyWeighting);
+            rerank = traceRerank(query, rerankInput, rerankThreshold, repKbId, applyWeighting,
+                    rerankMaxDocs, rerankTimeoutMs);
             rerankMs = System.currentTimeMillis() - start;
             rerankApplied = !rerankInput.isEmpty();
             // rerank 列表保留完整精排结果（经阈值过滤），topN 截断仅作用于 final 列表（RecallTestService 侧）。
@@ -471,7 +487,8 @@ public class RetrievalCoordinator {
             fusion = rerankOrchestrator.applyContentTypeWeighting(fusion, repKbId);
         }
 
-        return new RetrievalTrace(vector, bm25, fusion, rerank, vectorMs, bm25Ms, rerankMs, rerankApplied);
+        return new RetrievalTrace(vector, bm25, fusion, rerank, vectorMs, bm25Ms, rerankMs,
+                rerankApplied, rerankMaxDocs);
     }
 
     private List<RankedResult> traceVectorRetrieve(String query, int topK, Set<Long> kbIds,
@@ -516,7 +533,8 @@ public class RetrievalCoordinator {
 
     private List<RerankedResult> traceRerank(String query, List<RankedResult> candidates,
                                              double rerankThreshold, Long repKbId,
-                                             boolean applyContentTypeWeighting) {
+                                             boolean applyContentTypeWeighting,
+                                             int maxDocs, long timeoutMs) {
         if (!rerankerService.isAvailable()) {
             log.error("召回测试-Rerank重排序失败: Reranker 不可用");
             throw new BusinessException(500, "Rerank 重排序失败");
@@ -529,7 +547,7 @@ public class RetrievalCoordinator {
                     .map(r -> r.getSegment().text())
                     .collect(Collectors.toList());
             List<RerankerService.RerankResult> rerankResults =
-                    rerankerService.rerank(query, docTexts, docTexts.size());
+                    rerankerService.rerank(query, docTexts, docTexts.size(), maxDocs, timeoutMs);
             List<RerankedResult> items = new ArrayList<>();
             for (RerankerService.RerankResult rr : rerankResults) {
                 if (rr.getScore() < rerankThreshold) {
@@ -555,7 +573,8 @@ public class RetrievalCoordinator {
      * 精排单路候选并返回带精排分的结果列表（供 rerank_fuse 实验模式做二次 RRF）。
      */
     private List<RankedResult> traceRerankToRanked(String query, List<RankedResult> candidates,
-                                                   double rerankThreshold) {
+                                                   double rerankThreshold,
+                                                   int maxDocs, long timeoutMs) {
         if (!rerankerService.isAvailable()) {
             log.error("召回测试-Rerank重排序失败: Reranker 不可用");
             throw new BusinessException(500, "Rerank 重排序失败");
@@ -568,7 +587,7 @@ public class RetrievalCoordinator {
                     .map(r -> r.getSegment().text())
                     .collect(Collectors.toList());
             List<RerankerService.RerankResult> rerankResults =
-                    rerankerService.rerank(query, docTexts, docTexts.size());
+                    rerankerService.rerank(query, docTexts, docTexts.size(), maxDocs, timeoutMs);
             List<RankedResult> reranked = new ArrayList<>();
             for (RerankerService.RerankResult rr : rerankResults) {
                 if (rr.getScore() < rerankThreshold) {

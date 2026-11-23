@@ -59,6 +59,12 @@ public class RecallTestRequest {
     @Builder.Default
     private Integer maxCandidates = 100;
 
+    /**
+     * 本次测试的精排候选上限，范围 1~300。
+     * 留空表示使用参数管理 rerank.maxDocs（全局/KB），仅影响本次测试，不写库、不影响生产。
+     */
+    private Integer rerankMaxDocs;
+
     /** 最终返回数量，默认等于 topK；开启 Rerank 时在精排过滤后截取 */
     private Integer topN;
 

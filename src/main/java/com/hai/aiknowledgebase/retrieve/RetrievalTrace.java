@@ -20,13 +20,15 @@ public class RetrievalTrace {
     private final Long rerankMs;
     /** 本次是否实际执行了 Rerank 精排（候选非空且精排成功） */
     private final boolean rerankApplied;
+    /** 本次实际生效的精排候选上限（请求覆盖 > 参数管理 > yml） */
+    private final int rerankMaxDocs;
 
     public RetrievalTrace(List<RankedResult> vector,
                           List<RankedResult> bm25,
                           List<RankedResult> fusion,
                           List<RerankedResult> rerank,
                           Long vectorMs, Long bm25Ms, Long rerankMs,
-                          boolean rerankApplied) {
+                          boolean rerankApplied, int rerankMaxDocs) {
         this.vector = vector;
         this.bm25 = bm25;
         this.fusion = fusion;
@@ -35,6 +37,7 @@ public class RetrievalTrace {
         this.bm25Ms = bm25Ms;
         this.rerankMs = rerankMs;
         this.rerankApplied = rerankApplied;
+        this.rerankMaxDocs = rerankMaxDocs;
     }
 
     public List<RankedResult> getVector() { return vector; }
@@ -45,4 +48,5 @@ public class RetrievalTrace {
     public Long getBm25Ms() { return bm25Ms; }
     public Long getRerankMs() { return rerankMs; }
     public boolean isRerankApplied() { return rerankApplied; }
+    public int getRerankMaxDocs() { return rerankMaxDocs; }
 }

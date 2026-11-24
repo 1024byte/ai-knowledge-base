@@ -3,6 +3,7 @@ package com.hai.aiknowledgebase.queryrewrite;
 import com.hai.aiknowledgebase.annotation.Timed;
 import com.hai.aiknowledgebase.config.ThresholdsConfig;
 import com.hai.aiknowledgebase.dto.*;
+import com.hai.aiknowledgebase.service.ParamValueProvider;
 import com.hai.aiknowledgebase.service.QueryRewriteConfigLoader;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
@@ -72,7 +73,10 @@ public class QueryRewriteService{
 
     private final ThresholdsConfig thresholdsConfig;
 
-    /** 全局改写开关，默认 true。设为 false 则所有查询直接返回原始文本 */
+    /** 参数值读取器：查询改写开关支持参数管理热更 */
+    private final ParamValueProvider paramValueProvider;
+
+    /** 全局改写开关兜底值（yml），运行时以参数管理 queryRewrite.enabled 优先 */
     @Value("${query-rewrite.enabled:true}")
     private boolean enabled;
 
@@ -86,10 +90,14 @@ public class QueryRewriteService{
     @Timed("查询改写")
     public QueryRewriteResult rewrite(RewriteRequest request){
 
-        // Step 0: 全局开关检查
-        if (!enabled) {
+        // Step 0: 全局开关检查（参数管理热更优先，yml 兜底）；forceEnable 可绕过总开关（仅调参场景）
+        boolean rewriteEnabled = paramValueProvider.getBoolean("queryRewrite.enabled", enabled);
+        if (!rewriteEnabled && !Boolean.TRUE.equals(request.getForceEnable())) {
             log.info("全局改写开关已关闭，直接返回原始查询: {}", request.getQuery());
             return buildNoneResult(request.getQuery());
+        }
+        if (!rewriteEnabled) {
+            log.info("forceEnable 已开启，绕过全局改写开关执行改写: {}", request.getQuery());
         }
 
         String query = request.getQuery();
@@ -122,7 +130,8 @@ public class QueryRewriteService{
         // Step 3: 本地 LLM 改写（替代 L1 规则 + L2 NLP）
         if (localLLMRewriter != null && localLLMRewriter.isAvailable()) {
             List<String> historyTexts = extractHistoryTexts(history);
-            QueryRewriteResult llmResult = localLLMRewriter.rewrite(currentQuery, historyTexts);
+            QueryRewriteResult llmResult = localLLMRewriter.rewrite(
+                    currentQuery, historyTexts, Boolean.TRUE.equals(request.getBypassCache()));
             return enrichWithStrategy(llmResult, strategy);
         }
 

@@ -50,14 +50,19 @@ class QueryRewriteServiceTest {
     @Mock
     private LocalLLMRewriter localLLMRewriter;
 
+    @Mock
+    private ParamValueProvider paramValueProvider;
+
     @InjectMocks
     private QueryRewriteService queryRewriteService;
 
     @BeforeEach
     void setUp() {
         ReflectionTestUtils.setField(queryRewriteService, "enabled", true);
-        ReflectionTestUtils.setField(queryRewriteService, "l1ConfidenceThreshold", 0.85);
         ReflectionTestUtils.setField(queryRewriteService, "localLLMRewriter", null);
+
+        // 参数管理开关默认打开，跟随 yml 兜底值
+        lenient().when(paramValueProvider.getBoolean(eq("queryRewrite.enabled"), anyBoolean())).thenReturn(true);
 
         lenient().when(configLoader.getFixedMapping()).thenReturn(new HashMap<>());
         lenient().when(configLoader.getFixedMappingConfidence()).thenReturn(new HashMap<>());
@@ -87,6 +92,7 @@ class QueryRewriteServiceTest {
         @DisplayName("禁用时应直接返回原始查询")
         void disabledReturnsOriginalQuery() {
             ReflectionTestUtils.setField(queryRewriteService, "enabled", false);
+            when(paramValueProvider.getBoolean(eq("queryRewrite.enabled"), anyBoolean())).thenReturn(false);
 
             QueryRewriteResult result = queryRewriteService.rewrite(
                     RewriteRequest.builder().query("测试查询").build());
@@ -173,7 +179,7 @@ class QueryRewriteServiceTest {
                     .build();
 
             when(localLLMRewriter.isAvailable()).thenReturn(true);
-            when(localLLMRewriter.rewrite(anyString(), anyList())).thenReturn(llmResult);
+            when(localLLMRewriter.rewrite(anyString(), anyList(), anyBoolean())).thenReturn(llmResult);
 
             RewriteRequest request = RewriteRequest.builder()
                     .query("它是什么")

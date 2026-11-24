@@ -44,7 +44,7 @@ thresholds:
   retrieval:
     vector-min-score: 0.7         # 向量检索最低余弦相似度阈值（0.0~1.0），低于此值视为无关
   reranker:
-    min-score: -3.5               # [-10, 10] Rerank 最低分数阈值（Cross-Encoder 输出），低于此分不送入 LLM
+    min-score: -4.5               # [-10, 10] Rerank 最低分数阈值（Cross-Encoder 输出），低于此分不送入 LLM
   chunking:
     semantic: 0.6                 # 语义切分默认阈值（句子与累积向量相似度低于此值时触发切分）
     technical: 0.7                # 技术文档语义切分阈值

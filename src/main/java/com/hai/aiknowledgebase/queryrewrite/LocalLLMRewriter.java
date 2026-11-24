@@ -5,6 +5,7 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import com.hai.aiknowledgebase.config.ThresholdsConfig;
 import com.hai.aiknowledgebase.dto.QueryRewriteResult;
 import com.hai.aiknowledgebase.dto.RewritePath;
+import com.hai.aiknowledgebase.service.ParamValueProvider;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.ollama.OllamaChatModel;
@@ -62,6 +63,8 @@ public class LocalLLMRewriter {
 
     private final EmbeddingModel embeddingModel;
     private final ThresholdsConfig thresholdsConfig;
+    /** 参数值读取器：改写开关 / 超时 / 保真度阈值支持参数管理热更 */
+    private final ParamValueProvider paramValueProvider;
 
     @Value("${query-rewrite.local-llm.rewrite-timeout-ms:10000}")
     private long rewriteTimeoutMs;
@@ -80,17 +83,20 @@ public class LocalLLMRewriter {
 
     public LocalLLMRewriter(EmbeddingModel embeddingModel,
                                @Qualifier("rewriteTaskExecutor") ThreadPoolTaskExecutor rewriteTaskExecutor,
-                               ThresholdsConfig thresholdsConfig) {
+                               ThresholdsConfig thresholdsConfig,
+                               ParamValueProvider paramValueProvider) {
         this.embeddingModel = embeddingModel;
         this.rewriteTaskExecutor = rewriteTaskExecutor;
         this.thresholdsConfig = thresholdsConfig;
+        this.paramValueProvider = paramValueProvider;
     }
 
     /**
      * 判断本地 LLM 改写是否可用
      */
     public boolean isAvailable() {
-        return enabled && localRewriteModel != null;
+        return localRewriteModel != null
+                && paramValueProvider.getBoolean("queryRewrite.llm.enabled", enabled);
     }
 
     /**
@@ -101,15 +107,30 @@ public class LocalLLMRewriter {
      * @return 改写结果
      */
     public QueryRewriteResult rewrite(String query, List<String> history) {
+        return rewrite(query, history, false);
+    }
+
+    /**
+     * 执行查询改写
+     *
+     * @param query       原始查询
+     * @param history     对话历史（可选，用于指代消解上下文）
+     * @param bypassCache 是否绕过改写缓存：召回测试调参时需跳过缓存，
+     *                    否则同一 query 在缓存有效期内不会重新计算保真度
+     * @return 改写结果
+     */
+    public QueryRewriteResult rewrite(String query, List<String> history, boolean bypassCache) {
         if (!isAvailable()) {
             return fallback(query);
         }
 
-        // 1. 检查缓存
-        QueryRewriteResult cached = cache.getIfPresent(query);
-        if (cached != null) {
-            log.debug("改写缓存命中: {} → {}", query, cached.getRewrittenQuery());
-            return cached;
+        // 1. 检查缓存（调参场景可绕过）
+        if (!bypassCache) {
+            QueryRewriteResult cached = cache.getIfPresent(query);
+            if (cached != null) {
+                log.debug("改写缓存命中: {} → {}", query, cached.getRewrittenQuery());
+                return cached;
+            }
         }
 
         // 2. 构建改写 Prompt
@@ -141,7 +162,9 @@ public class LocalLLMRewriter {
                 ? String.join(" ", parseResult.subQueries)
                 : rewritten;
         double fidelity = computeFidelity(query, fidelityText);
-        double fidelityThreshold = thresholdsConfig.getQueryRewrite().getFidelity();
+        // 保真度阈值：参数管理热更优先，yml（ThresholdsConfig）兜底
+        double fidelityThreshold = paramValueProvider.getDouble(
+                "queryRewrite.fidelityMinScore", thresholdsConfig.getQueryRewrite().getFidelity());
         if (fidelity < fidelityThreshold) {
             log.info("改写保真度不足 ({} < {})，回退到原查询: {} → {}",
                     String.format("%.3f", fidelity), fidelityThreshold, query, rewritten);
@@ -180,6 +203,8 @@ public class LocalLLMRewriter {
     }
 
     private String callWithTimeout(String prompt) {
+        // 超时时间：参数管理热更优先，yml 兜底
+        long timeoutMs = paramValueProvider.getInt("queryRewrite.llmTimeoutMs", (int) rewriteTimeoutMs);
         Future<String> future = rewriteTaskExecutor.submit(() ->
                 localRewriteModel.chat(
                         dev.langchain4j.data.message.SystemMessage.from(REWRITE_SYSTEM_PROMPT),
@@ -187,10 +212,10 @@ public class LocalLLMRewriter {
                 ).aiMessage().text()
         );
         try {
-            return future.get(rewriteTimeoutMs, TimeUnit.MILLISECONDS);
+            return future.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
             future.cancel(true);
-            log.warn("本地 LLM 改写超时 ({}ms)", rewriteTimeoutMs);
+            log.warn("本地 LLM 改写超时 ({}ms)", timeoutMs);
             throw new RuntimeException("改写超时", e);
         } catch (Exception e) {
             throw new RuntimeException("改写失败", e);

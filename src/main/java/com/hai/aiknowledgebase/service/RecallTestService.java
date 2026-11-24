@@ -1,14 +1,18 @@
 package com.hai.aiknowledgebase.service;
 
 import com.hai.aiknowledgebase.config.ThresholdsConfig;
+import com.hai.aiknowledgebase.dto.QueryRewriteResult;
 import com.hai.aiknowledgebase.dto.RecallTestRequest;
 import com.hai.aiknowledgebase.dto.RecallTestResponse;
+import com.hai.aiknowledgebase.dto.RewriteRequest;
+import com.hai.aiknowledgebase.dto.RewriteStrategyEnum;
 import com.hai.aiknowledgebase.entity.KnowledgeBase;
 import com.hai.aiknowledgebase.entity.KnowledgeDocument;
 import com.hai.aiknowledgebase.entity.KnowledgeDocumentChunk;
 import com.hai.aiknowledgebase.mapper.KnowledgeBaseMapper;
 import com.hai.aiknowledgebase.mapper.KnowledgeDocumentChunkMapper;
 import com.hai.aiknowledgebase.mapper.KnowledgeDocumentMapper;
+import com.hai.aiknowledgebase.queryrewrite.QueryRewriteService;
 import com.hai.aiknowledgebase.retrieve.RankedResult;
 import com.hai.aiknowledgebase.retrieve.RerankedResult;
 import com.hai.aiknowledgebase.retrieve.RetrievalCoordinator;
@@ -48,6 +52,7 @@ import java.util.stream.Collectors;
 public class RecallTestService {
 
     private final RetrievalCoordinator retrievalCoordinator;
+    private final QueryRewriteService queryRewriteService;
     private final ChineseTokenizerService tokenizerService;
     private final KnowledgeDocumentChunkMapper chunkMapper;
     private final KnowledgeDocumentMapper documentMapper;
@@ -84,19 +89,57 @@ public class RecallTestService {
                 ? null
                 : new HashSet<>(request.getDocumentIds());
 
-        // 排除关键词（对齐生产链路阶段2，空表示不过滤）
-        List<String> excludeKeywords = (request.getExcludeKeywords() == null || request.getExcludeKeywords().isEmpty())
-                ? null
-                : new ArrayList<>(request.getExcludeKeywords());
+        // 查询改写：请求显式指定优先，否则跟随参数管理 queryRewrite.enabled
+        boolean enableRewrite = request.getEnableRewrite() != null
+                ? request.getEnableRewrite()
+                : paramValueProvider.getBoolean("queryRewrite.enabled", false);
+        // 仅当用户显式传 enableRewrite=true 时，绕过全局总开关强制执行改写（调参对照场景）
+        boolean forceRewrite = Boolean.TRUE.equals(request.getEnableRewrite());
+        String searchQuery = query;
+        Long rewriteMs = null;
+        String rewritePath = "NONE";
+        double rewriteConfidence = 0.0;
+        List<String> rewriteSubQueries = new ArrayList<>();
+        List<String> rewriteExcludeKeywords = new ArrayList<>();
+        if (enableRewrite) {
+            long rewriteStart = System.currentTimeMillis();
+            // 调参场景绕过改写缓存，保证保真度阈值变更后可立即观测
+            QueryRewriteResult rewriteResult = queryRewriteService.rewrite(RewriteRequest.builder()
+                    .query(query)
+                    .strategy(RewriteStrategyEnum.SIMPLE_REWRITE)
+                    .bypassCache(true)
+                    .forceEnable(forceRewrite)
+                    .build());
+            rewriteMs = System.currentTimeMillis() - rewriteStart;
+            if (rewriteResult.getRewrittenQuery() != null && !rewriteResult.getRewrittenQuery().isBlank()) {
+                searchQuery = rewriteResult.getRewrittenQuery();
+            }
+            rewritePath = rewriteResult.getPath() != null ? rewriteResult.getPath().name() : "NONE";
+            rewriteConfidence = rewriteResult.getConfidence();
+            if (rewriteResult.getSubQueries() != null) {
+                rewriteSubQueries = new ArrayList<>(rewriteResult.getSubQueries());
+            }
+            if (rewriteResult.getExcludeKeywords() != null) {
+                rewriteExcludeKeywords = new ArrayList<>(rewriteResult.getExcludeKeywords());
+            }
+        }
 
-        // 2. BM25 分词结果（vector 策略返回空数组）
+        // 排除关键词：请求手填 ∪ 改写产出（对齐生产链路阶段2，空表示不过滤）
+        Set<String> mergedExclude = new LinkedHashSet<>();
+        if (request.getExcludeKeywords() != null) {
+            mergedExclude.addAll(request.getExcludeKeywords());
+        }
+        mergedExclude.addAll(rewriteExcludeKeywords);
+        List<String> excludeKeywords = mergedExclude.isEmpty() ? null : new ArrayList<>(mergedExclude);
+
+        // 2. BM25 分词结果（vector 策略返回空数组；分词口径与实际检索 query 一致）
         List<String> tokens = "vector".equals(strategy)
                 ? new ArrayList<>()
-                : new ArrayList<>(new LinkedHashSet<>(tokenizerService.tokenize(query, true)));
+                : new ArrayList<>(new LinkedHashSet<>(tokenizerService.tokenize(searchQuery, true)));
 
         // 3. 复用生产检索编排，一次性拿到向量/BM25/融合/精排四路观测结果
         RetrievalTrace trace = retrievalCoordinator.retrieveWithTrace(
-                query, strategy, topK, threshold, kbIds, documentIds, rrfK, enableRerank, rerankThreshold,
+                searchQuery, strategy, topK, threshold, kbIds, documentIds, rrfK, enableRerank, rerankThreshold,
                 excludeKeywords, candidateMultiplier, maxCandidates, topN, rerankStage, rerankMaxDocs);
 
         // 4. 数据补全：以片段主键为锚点反查 documentId / source / kbName
@@ -137,13 +180,20 @@ public class RecallTestService {
 
         long totalMs = System.currentTimeMillis() - totalStart;
 
-        log.info("召回测试完成: query={}, strategy={}, 向量命中={}, BM25命中={}, 融合={}, 重排={}, 精排生效={}, 分数口径={}, 总耗时={}ms",
-                query, strategy, trace.getVector().size(), trace.getBm25().size(),
-                fusionItems.size(), rerankItems.size(), trace.isRerankApplied(), scoreType, totalMs);
+        log.info("召回测试完成: query={}, 改写={}, 检索query={}, strategy={}, 向量命中={}, BM25命中={}, 融合={}, 重排={}, 精排生效={}, 分数口径={}, 改写耗时={}ms, 总耗时={}ms",
+                query, enableRewrite, searchQuery, strategy, trace.getVector().size(), trace.getBm25().size(),
+                fusionItems.size(), rerankItems.size(), trace.isRerankApplied(), scoreType, rewriteMs, totalMs);
 
         return RecallTestResponse.builder()
                 .query(query)
                 .strategy(strategy)
+                .rewrittenQuery(searchQuery)
+                .rewriteApplied(enableRewrite)
+                .rewriteMs(rewriteMs)
+                .rewritePath(rewritePath)
+                .rewriteConfidence(rewriteConfidence)
+                .rewriteSubQueries(rewriteSubQueries)
+                .rewriteExcludeKeywords(rewriteExcludeKeywords)
                 .totalMs(totalMs)
                 .vectorMs(trace.getVectorMs())
                 .bm25Ms(trace.getBm25Ms())

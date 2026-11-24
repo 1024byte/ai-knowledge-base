@@ -216,10 +216,10 @@ public class RetrievalCoordinator {
     /**
      * <h3>混合检索（带向量相关性阈值，支持显式 RRF 平滑系数）</h3>
      *
-     * <p>显式传入 {@code rrfK}，供拆库按参数指纹分组检索时，
-     * 不同参数分组的知识库使用各自的 RRF 平滑系数，避免多库混查的参数歧义。</p>
+     * <p>显式传入 {@code rrfK}，由调用方按参数管理值解析后传入。</p>
      *
-     * <p>并行发起向量路径与关键词路径检索；混合检索关闭或关键词索引为空时降级为纯向量检索。</p>
+     * <p>并行发起向量路径与关键词路径检索；混合检索关闭或关键词索引为空时降级为纯向量检索。
+     * 混合检索开关支持参数管理热更，yml 值仅作兜底。</p>
      *
      * @param query          用户查询文本
      * @param topK           返回结果数量上限
@@ -231,8 +231,11 @@ public class RetrievalCoordinator {
     public List<RankedResult> hybridSearchRanked(String query, int topK, double minVectorScore,
                                                  Set<Long> kbIds, int rrfK) {
         // 降级判断：如果混合检索关闭或关键词索引为空，直接走纯向量检索
-        if (!rankFusion.isHybridEnabled() || chunkIndexManager.getKeywordIndex().size() == 0) {
-            log.info("混合检索已关闭或关键词索引为空，降级为纯向量检索");
+        // 开关按参数管理热更，yml 值仅作兜底
+        boolean hybridEnabled = paramValueProvider.getBoolean(
+                "retrieval.hybridEnabled", rankFusion.isHybridEnabled());
+        if (!hybridEnabled || chunkIndexManager.getKeywordIndex().size() == 0) {
+            log.info("混合检索已关闭（hybridEnabled={}）或关键词索引为空，降级为纯向量检索", hybridEnabled);
             return vectorRetriever.vectorSearchRanked(query, topK, kbIds).stream()
                     .filter(r -> r.getScore() >= minVectorScore)
                     .collect(Collectors.toList());

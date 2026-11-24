@@ -20,6 +20,12 @@ public class RecallTestRequest {
     /** 测试问题，最多 200 字 */
     private String query;
 
+    /**
+     * 是否启用查询改写：null=跟随参数管理 queryRewrite.enabled；true/false=本次强制覆盖。
+     * <p>开启后先改写再检索，改写结果在响应中回显；召回测试无对话历史，指代消解不会触发。</p>
+     */
+    private Boolean enableRewrite;
+
     /** 待检索知识库 ID 列表，至少 1 个 */
     private List<Long> kbIds;
 

@@ -24,6 +24,29 @@ public class RecallTestResponse {
     /** 本次检索策略 */
     private String strategy;
 
+    /** 实际用于检索的查询（改写开启时为改写结果，否则等于 query） */
+    private String rewrittenQuery;
+
+    /** 本次是否执行了查询改写流程 */
+    private Boolean rewriteApplied;
+
+    /** 查询改写耗时（毫秒），未执行为 null */
+    private Long rewriteMs;
+
+    /** 命中的改写路径：LLM_REWRITE / L1_RULE / NONE */
+    private String rewritePath;
+
+    /** 改写置信度（保真度）0.0~1.0，未执行为 0 */
+    private Double rewriteConfidence;
+
+    /** 改写产出的子查询（仅展示，本次未展开检索） */
+    @Builder.Default
+    private List<String> rewriteSubQueries = new ArrayList<>();
+
+    /** 改写产出的排除关键词（已合并进本次检索过滤） */
+    @Builder.Default
+    private List<String> rewriteExcludeKeywords = new ArrayList<>();
+
     /** 总耗时（毫秒） */
     private Long totalMs;
 

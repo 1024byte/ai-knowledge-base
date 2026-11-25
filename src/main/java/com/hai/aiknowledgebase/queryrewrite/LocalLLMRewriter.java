@@ -43,20 +43,19 @@ import java.util.concurrent.*;
 public class LocalLLMRewriter {
 
     public static final String REWRITE_SYSTEM_PROMPT = """
-            你是一个查询改写助手，你的任务是将用户查询改写为更适合知识库检索的形式。
-            禁止回答问题、禁止生成解释、禁止输出任何非改写结果的内容。
+            你是一个严谨的查询改写助手。你的任务是将用户查询改写为适合检索的短句。
+            绝对禁止回答问题！绝对禁止生成解释！绝对禁止输出 markdown 格式！
+            只允许输出改写后的文本，不要包含任何多余字符。
 
-            规则：
-            1. 对比类问题（含"对比/区别/差别/不同/差异/vs"等）必须拆分为多个子查询，用 | 分隔
-               拆分时每个比较对象单独成子查询，每个比较维度单独成子查询，最后追加对比子查询
-               例如："A和B在X和Y上的区别" → "A的X | A的Y | B的X | B的Y | A和B在X和Y上的对比"
-            2. 并列多问问题（含"以及/还有/另外"等）必须拆分为多个子查询，用 | 分隔
-            3. 展开缩写和简称（如"专升本"→"专升本考试"）
-            4. 补充隐含上下文（如"它的配置"→根据上下文补充具体对象）
-            5. 保留原始查询的核心语义，不要添加原文没有的信息
-            6. 如果查询简单且无需拆分，直接返回原文
+            严格遵守以下三条铁律：
+            1. 【防吞词】：必须原封不动地保留原句中的所有名词（特别是并列的人或物）。例如原句是“A、B或者C”，改写后必须包含A、B、C，严禁只保留A。
+            2. 【禁拆分】：遇到用“和、与、或者”连接多个事物的单句（如“A和B的区别”除外），绝对不准拆分子查询，原样改写输出即可。
+            3. 【只拆对比】：只有当用户明确问“对比、区别、不同”时，才允许用 "|" 拆分。例如：“A和B的区别” → “A的特点 | B的特点 | A和B的区别对比”。
 
-            禁止任何解释、禁止任何回答、禁止markdown格式。只返回改写结果。""";
+            其他要求：
+            - 不要超过 3 个子查询。
+            - 保持原意，展开已知的常见缩写。
+            """;
 
     @Autowired(required = false)
     private OllamaChatModel localRewriteModel;
@@ -157,10 +156,10 @@ public class LocalLLMRewriter {
         }
 
         // 5. 保真度校验
-        // 分解场景：用全部子查询拼接文本计算保真度，避免单个子查询与原查询语义范围不匹配
-        String fidelityText = parseResult.subQueries.size() > 1
-                ? String.join(" ", parseResult.subQueries)
-                : rewritten;
+        // 分解场景：用主查询 + 子查询拼接文本计算保真度（parseResult.subQueries 现在不含主查询）
+        String fidelityText = parseResult.subQueries.isEmpty()
+                ? rewritten
+                : rewritten + " " + String.join(" ", parseResult.subQueries);
         double fidelity = computeFidelity(query, fidelityText);
         // 保真度阈值：参数管理热更优先，yml（ThresholdsConfig）兜底
         double fidelityThreshold = paramValueProvider.getDouble(
@@ -171,10 +170,16 @@ public class LocalLLMRewriter {
             return fallback(query);
         }
 
+        // 5.5 子查询语义多样性校验：丢弃过度拆分
+        List<String> finalSubQueries = parseResult.subQueries;
+        if (!finalSubQueries.isEmpty() && !validateSubQueryDiversity(finalSubQueries)) {
+            finalSubQueries = Collections.emptyList();
+        }
+
         // 6. 构建结果
         QueryRewriteResult result = QueryRewriteResult.builder()
                 .rewrittenQuery(rewritten)
-                .subQueries(parseResult.subQueries)
+                .subQueries(finalSubQueries)
                 .expandKeywords(extractExpandKeywords(rewritten))
                 .excludeKeywords(Collections.emptyList())
                 .confidence(fidelity)
@@ -183,7 +188,7 @@ public class LocalLLMRewriter {
 
         cache.put(query, result);
         log.info("本地 LLM 改写: {} → {} (子查询: {}, 保真度: {})",
-                query, rewritten, parseResult.subQueries.size(), String.format("%.3f", fidelity));
+                query, rewritten, finalSubQueries.size(), String.format("%.3f", fidelity));
         return result;
     }
 
@@ -303,12 +308,22 @@ public class LocalLLMRewriter {
         return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-8);
     }
 
+    /** 子查询硬上限：超过则丢弃拆分，回退为单查询 */
+    private static final int MAX_SUB_QUERIES = 5;
+    /** 子查询语义多样性阈值：任意两个子查询 embedding cosine > 此值视为重复，需去重 */
+    private static final double SUB_QUERY_DIVERSITY_THRESHOLD = 0.85;
+
     /**
      * 从 LLM 返回的文本中解析子查询（| 分隔）
      *
-     * <p>LLM 按 Prompt 约定用 | 分隔多个子查询时，
-     * 第一个作为主查询（rewrittenQuery），其余作为子查询列表（subQueries）。
-     * 如果没有 | 分隔符，整个文本作为唯一查询，subQueries 为空。</p>
+     * <p>解析后执行三层校验：</p>
+     * <ol>
+     *   <li>文本去重：完全相同的子查询只保留一份</li>
+     *   <li>数量上限：超过 {@link #MAX_SUB_QUERIES} 则丢弃拆分，回退为单查询</li>
+     *   <li>主查询与子查询分离：subQueries 列表只存真正的子查询，不包含主查询</li>
+     * </ol>
+     *
+     * <p>语义多样性校验需要额外 embedding 调用，放在调用方（rewrite 方法）中进行。</p>
      */
     private SubQueryParseResult parseSubQueries(String llmResponse) {
         String trimmed = llmResponse.trim();
@@ -317,20 +332,69 @@ public class LocalLLMRewriter {
         }
 
         String[] parts = trimmed.split("\\|");
-        List<String> subQueries = new ArrayList<>();
-        for (int i = 0; i < parts.length; i++) {
-            String part = parts[i].trim();
-            if (!part.isEmpty()) {
-                subQueries.add(part);
+        // 文本去重（保持顺序）
+        LinkedHashSet<String> dedup = new LinkedHashSet<>();
+        for (String part : parts) {
+            String p = part.trim();
+            if (!p.isEmpty()) {
+                dedup.add(p);
             }
         }
 
-        if (subQueries.isEmpty()) {
+        if (dedup.isEmpty()) {
             return new SubQueryParseResult(trimmed, Collections.emptyList());
         }
 
-        String mainQuery = subQueries.get(0);
+        List<String> uniqueList = new ArrayList<>(dedup);
+
+        // 超过上限：丢弃拆分，全部内容拼成一个单查询
+        if (uniqueList.size() > MAX_SUB_QUERIES) {
+            log.info("子查询数量({})超过上限({})，丢弃拆分回退单查询", uniqueList.size(), MAX_SUB_QUERIES);
+            return new SubQueryParseResult(String.join(" | ", uniqueList), Collections.emptyList());
+        }
+
+        String mainQuery = uniqueList.get(0);
+        // subQueries 只存真正的子查询（去掉主查询）
+        List<String> subQueries = uniqueList.size() > 1
+                ? uniqueList.subList(1, uniqueList.size())
+                : Collections.emptyList();
+
         return new SubQueryParseResult(mainQuery, subQueries);
+    }
+
+    /**
+     * 子查询语义多样性校验
+     *
+     * <p>对所有子查询两两计算 embedding cosine similarity，
+     * 若存在高度重复（> {@link #SUB_QUERY_DIVERSITY_THRESHOLD}）的子查询，
+     * 说明 LLM 过度拆分，此时丢弃子查询列表，仅保留主查询。</p>
+     *
+     * @return true 表示子查询语义多样可采纳；false 表示存在重复应丢弃
+     */
+    private boolean validateSubQueryDiversity(List<String> subQueries) {
+        if (subQueries == null || subQueries.size() < 2) {
+            return true;
+        }
+        try {
+            List<float[]> vectors = new ArrayList<>(subQueries.size());
+            for (String sq : subQueries) {
+                vectors.add(embeddingModel.embed(sq).content().vector());
+            }
+            for (int i = 0; i < vectors.size(); i++) {
+                for (int j = i + 1; j < vectors.size(); j++) {
+                    double sim = cosineSimilarity(vectors.get(i), vectors.get(j));
+                    if (sim > SUB_QUERY_DIVERSITY_THRESHOLD) {
+                        log.info("子查询语义重复 ({:.3f} > {:.2f})，丢弃拆分: \"{}\" vs \"{}\"",
+                                sim, SUB_QUERY_DIVERSITY_THRESHOLD,
+                                subQueries.get(i), subQueries.get(j));
+                        return false;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("子查询语义校验失败，保守采纳: {}", e.getMessage());
+        }
+        return true;
     }
 
     /**

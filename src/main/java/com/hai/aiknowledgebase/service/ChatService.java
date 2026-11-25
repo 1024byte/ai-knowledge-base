@@ -277,10 +277,14 @@ public class ChatService {
 
         // 步骤1：混合检索（支持多子查询分别检索 + 合并去重）
         List<RankedResult> rankedResults;
-        if (subQueries != null && !subQueries.isEmpty()) {// 多子查询检索：分别对每个子查询进行检索，合并结果并重新排序
-            rankedResults = multiQueryRetrieve(subQueries, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);//多子查询检索
-                       log.info("多子查询检索: {} 个子查询, 合并后 {} 个片段", subQueries.size(), rankedResults.size());
+        boolean multiQueryEnabled = paramValueProvider.getBoolean("queryRewrite.multiQueryEnabled", true);
+        if (multiQueryEnabled && subQueries != null && !subQueries.isEmpty()) {
+            rankedResults = multiQueryRetrieve(subQueries, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
+            log.info("多子查询检索: {} 个子查询, 合并后 {} 个片段", subQueries.size(), rankedResults.size());
         } else {
+            if (subQueries != null && !subQueries.isEmpty() && !multiQueryEnabled) {
+                log.info("多子查询检索已禁用，回退单查询: {} 个子查询被忽略", subQueries.size());
+            }
             rankedResults = retrievalCoordinator.retrieveSegments(searchQuery, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
             log.info("检索到 {} 个相关文档片段", rankedResults.size());
         }
@@ -385,10 +389,14 @@ public class ChatService {
                         subQueries != null ? subQueries.size() : 0);
 
                 List<RankedResult> rankedResults;
-                if (subQueries != null && !subQueries.isEmpty()) {
+                boolean multiQueryEnabled = paramValueProvider.getBoolean("queryRewrite.multiQueryEnabled", true);
+                if (multiQueryEnabled && subQueries != null && !subQueries.isEmpty()) {
                     rankedResults = multiQueryRetrieve(subQueries, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
                     log.info("多子查询检索(stream): {} 个子查询, 合并后 {} 个片段", subQueries.size(), rankedResults.size());
                 } else {
+                    if (subQueries != null && !subQueries.isEmpty() && !multiQueryEnabled) {
+                        log.info("多子查询检索已禁用(stream)，回退单查询: {} 个子查询被忽略", subQueries.size());
+                    }
                     rankedResults = retrievalCoordinator.retrieveSegments(searchQuery, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
                     log.info("检索到(stream) {} 个相关文档片段", rankedResults.size());
                 }

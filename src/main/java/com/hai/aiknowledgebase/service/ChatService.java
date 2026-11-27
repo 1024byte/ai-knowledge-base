@@ -279,7 +279,7 @@ public class ChatService {
         List<RankedResult> rankedResults;
         boolean multiQueryEnabled = paramValueProvider.getBoolean("queryRewrite.multiQueryEnabled", true);
         if (multiQueryEnabled && subQueries != null && !subQueries.isEmpty()) {
-            rankedResults = multiQueryRetrieve(subQueries, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
+            rankedResults = multiQueryRetrieve(searchQuery, subQueries, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
             log.info("多子查询检索: {} 个子查询, 合并后 {} 个片段", subQueries.size(), rankedResults.size());
         } else {
             if (subQueries != null && !subQueries.isEmpty() && !multiQueryEnabled) {
@@ -391,7 +391,7 @@ public class ChatService {
                 List<RankedResult> rankedResults;
                 boolean multiQueryEnabled = paramValueProvider.getBoolean("queryRewrite.multiQueryEnabled", true);
                 if (multiQueryEnabled && subQueries != null && !subQueries.isEmpty()) {
-                    rankedResults = multiQueryRetrieve(subQueries, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
+                    rankedResults = multiQueryRetrieve(searchQuery, subQueries, effectiveTopK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds);
                     log.info("多子查询检索(stream): {} 个子查询, 合并后 {} 个片段", subQueries.size(), rankedResults.size());
                 } else {
                     if (subQueries != null && !subQueries.isEmpty() && !multiQueryEnabled) {
@@ -953,45 +953,17 @@ public class ChatService {
     }
 
     /**
-     * 多子查询检索：并行执行各子查询的混合检索，合并去重后按分数降序排列
+     * 多子查询检索：委托检索协调器完成「各子查询混合检索 → 合并去重 → 统一精排」
      *
-     * <p>每个子查询分配 topK/subQueries.size() 个结果配额，
-     * 通过文本内容去重（避免同一片段被重复计入），
-     * 并行执行以降低多子查询场景的总延迟，最终按分数降序排列返回。</p>
+     * <p>每个子查询分配 topK/subQueries.size() 个召回配额，合并后按片段文本去重，
+     * 只执行一次 Rerank 精排与后处理，避免重复精排放大延迟。
+     * 回滚开关为参数管理 retrieval.multiQuerySingleRerank。</p>
      */
     private List<RankedResult> multiQueryRetrieve(
-            List<String> subQueries, int totalTopK, double minScore,
+            String rerankQuery, List<String> subQueries, int totalTopK, double minScore,
             List<String> expandKeywords, List<String> excludeKeywords, Set<Long> kbIds) {
-        int perQueryTopK = Math.max(3, totalTopK / subQueries.size());
-
-        List<CompletableFuture<List<RankedResult>>> futures = new ArrayList<>();
-        for (String subQuery : subQueries) {
-            futures.add(CompletableFuture.supplyAsync(
-                    () -> retrievalCoordinator.retrieveSegments(subQuery, perQueryTopK, minScore, expandKeywords, excludeKeywords, kbIds),
-                    chatTaskExecutor));
-        }
-
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-
-        Set<String> seenTexts = new LinkedHashSet<>();
-        List<RankedResult> merged = new ArrayList<>();
-        for (CompletableFuture<List<RankedResult>> future : futures) {
-            try {
-                List<RankedResult> results = future.join();
-                for (RankedResult r : results) {
-                    if (seenTexts.add(r.getSegment().text())) {
-                        merged.add(r);
-                    }
-                }
-            } catch (Exception e) {
-                log.warn("子查询检索失败，跳过: {}", e.getMessage());
-            }
-        }
-
-        merged.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
-        log.debug("多子查询检索合并: {} 路并行, 去重后={}",
-                subQueries.size(), merged.size());
-        return merged;
+        return retrievalCoordinator.retrieveSegmentsMultiQuery(
+                rerankQuery, subQueries, totalTopK, minScore, expandKeywords, excludeKeywords, kbIds);
     }
 
     /**

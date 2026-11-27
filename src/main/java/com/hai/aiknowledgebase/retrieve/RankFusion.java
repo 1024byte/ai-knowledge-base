@@ -2,7 +2,6 @@ package com.hai.aiknowledgebase.retrieve;
 
 import dev.langchain4j.data.segment.TextSegment;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.HashMap;
@@ -31,33 +30,34 @@ import java.util.stream.Collectors;
 public class RankFusion {
 
     /**
-     * RRF 算法的平滑参数 k。
-     * 公式：score = Σ 1/(k + rank_i)
-     * k 越大，排名差异对分数的影响越小，融合更平滑。
-     * 默认值 60，是学术界和工业界验证的最佳实践值。
+     * RRF 平滑系数 k 的兜底默认值。
+     * 公式：score = Σ 1/(k + rank_i)；k 越大排名差异影响越小、融合越平滑。
+     * 默认值 60 是学术界和工业界验证的最佳实践值。
+     * 运行时以参数管理的 {@code retrieval.rrfK} 为准，本常量仅在参数未命中时兜底。
      */
-    @Value("${hybrid-search.rrf.k:60}")
-    private int rrfK = 60;
-
-    /** 混合检索总开关，可通过配置文件关闭以节省资源 */
-    @Value("${hybrid-search.enabled:true}")
-    private boolean hybridEnabled = true;
+    private static final int DEFAULT_RRF_K = 60;
 
     /**
-     * 查询混合检索是否启用。
+     * 混合检索总开关的兜底默认值。
+     * 运行时以参数管理的 {@code retrieval.hybridEnabled} 为准，本常量仅在参数未命中时兜底。
+     */
+    private static final boolean DEFAULT_HYBRID_ENABLED = true;
+
+    /**
+     * 查询混合检索是否启用（兜底默认值）。
      *
      * @return true 表示启用混合检索，false 表示仅使用向量检索
      */
     public boolean isHybridEnabled() {
-        return hybridEnabled;
+        return DEFAULT_HYBRID_ENABLED;
     }
 
     /**
-     * 获取 RRF 平滑系数的配置默认值（yml 兜底）。
+     * 获取 RRF 平滑系数的兜底默认值。
      * 供上层按参数动态读取时作为 fallback 使用。
      */
     public int getDefaultRrfK() {
-        return rrfK;
+        return DEFAULT_RRF_K;
     }
 
     /**

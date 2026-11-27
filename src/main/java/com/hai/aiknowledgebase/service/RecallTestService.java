@@ -64,6 +64,23 @@ public class RecallTestService {
      * 执行一次召回测试。
      */
     public RecallTestResponse run(RecallTestRequest request) {
+        return run(request, Collections.emptyMap());
+    }
+
+    /**
+     * 在参数快照作用域内执行一次召回测试（检索评测专用）。
+     *
+     * <p>快照非空时，本次执行全程读取快照参数而非实时参数管理值，
+     * 保证「运行期间修改参数不影响本次评测」；空快照与 {@link #run(RecallTestRequest)} 完全等价。</p>
+     *
+     * @param request        召回测试请求（配置快照展开后的完整字段）
+     * @param paramOverrides 参数快照 key=paramKey，value=生效值
+     */
+    public RecallTestResponse run(RecallTestRequest request, Map<String, String> paramOverrides) {
+        return ParamOverrideScope.callWith(paramOverrides, () -> doRun(request));
+    }
+
+    private RecallTestResponse doRun(RecallTestRequest request) {
         long totalStart = System.currentTimeMillis();
 
         String query = request.getQuery();

@@ -31,6 +31,16 @@ public class AsyncConfig {
     }
 
     /**
+     * 检索扇出专用虚拟线程执行器
+     * - 子查询检索、向量/BM25 分路均为阻塞 IO，虚拟线程不占用平台线程池
+     * - 避免与 chatTaskExecutor（核心 3）争用导致排队
+     */
+    @Bean(name = "retrievalVirtualExecutor", destroyMethod = "close")
+    public java.util.concurrent.ExecutorService retrievalVirtualExecutor() {
+        return java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
+    }
+
+    /**
      * 查询改写专用线程池
      * - 核心线程 2：改写耗时短（秒级），不需要太多线程
      * - 最大线程 3：应对少量并发
@@ -85,6 +95,25 @@ public class AsyncConfig {
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(60);
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * 检索评测专用线程池
+     * - 单线程串行执行 Case，避免评测任务并发争抢检索与本地 LLM 资源
+     * - 队列 1 仅容纳取消后等待提交的下一 Run；业务层仍以唯一活跃 Run 为准
+     * - AbortPolicy 快速拒绝，由 EvalRunService 转为业务错误
+     */
+    @Bean(name = "evalTaskExecutor")
+    public ThreadPoolTaskExecutor evalTaskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(1);
+        executor.setQueueCapacity(1);
+        executor.setThreadNamePrefix("Eval-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(false);
         executor.initialize();
         return executor;
     }

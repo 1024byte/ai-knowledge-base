@@ -58,17 +58,23 @@ public class RerankerService {
     @Value("${reranker.model-path:models/bge-reranker-v2-m3}")
     private String modelPath;
 
-    /** Rerank 超时时间（毫秒），CPU 推理 batch 模式通常需要 2~8 秒 */
-    @Value("${reranker.timeout-ms:10000}")
-    private long timeoutMs;
-
-    /** 单次 Rerank 最大文档数（防止超长输入导致 OOM） */
-    @Value("${reranker.max-docs:30}")
-    private int maxDocs;
-
-    /** 模型最大序列长度 */
+    /** 模型最大序列长度（启动期烤入 tokenizer，无法热更，故保留 yml） */
     @Value("${reranker.max-seq-length:512}")
     private int maxSeqLength;
+
+    /** Rerank 超时时间兜底默认值（毫秒），运行时以参数 rerank.timeoutMs 为准 */
+    private static final long DEFAULT_TIMEOUT_MS = 15000;
+
+    /** 单次 Rerank 最大文档数兜底默认值（防 OOM），运行时以参数 rerank.maxDocs 为准 */
+    private static final int DEFAULT_MAX_DOCS = 30;
+
+    /**
+     * 送入精排前单条文本最大字符数的兜底默认值（字符维度，非 token），0 表示不截断。
+     * 运行时以参数 {@code rerank.docMaxChars} 为准。
+     * 与 {@link #maxSeqLength} 不是同一维度：后者由 tokenizer 在 token 层面截断，
+     * 本配置用于提前压低 batch 的最大字符长度。
+     */
+    private static final int DEFAULT_DOC_MAX_CHARS = 512;
 
     /** GPU 设备 ID（-1 表示使用 CPU，>=0 表示使用指定 GPU） */
     @Value("${reranker.gpu-device-id:-1}")
@@ -76,8 +82,12 @@ public class RerankerService {
 
     private final ThresholdsConfig thresholdsConfig;
 
-    public RerankerService(ThresholdsConfig thresholdsConfig) {
+    /** 参数管理读取器：用于热更 rerank.docMaxChars（评测期间可被参数快照冻结） */
+    private final ParamValueProvider paramValueProvider;
+
+    public RerankerService(ThresholdsConfig thresholdsConfig, ParamValueProvider paramValueProvider) {
         this.thresholdsConfig = thresholdsConfig;
+        this.paramValueProvider = paramValueProvider;
     }
 
     private HuggingFaceTokenizer tokenizer;
@@ -193,7 +203,7 @@ public class RerankerService {
         long start = System.currentTimeMillis();
         try {
             List<String> warmupDocs = List.of("预热文本");
-            doRerank("预热查询", warmupDocs);
+            doRerank("预热查询", warmupDocs, 0);
             log.info("GPU 预热完成，耗时: {}ms", System.currentTimeMillis() - start);
         } catch (Exception e) {
             log.warn("GPU 预热异常: {}", e.getMessage());
@@ -231,7 +241,7 @@ public class RerankerService {
      * @return 按分数降序排列的 Rerank 结果
      */
     public List<RerankResult> rerank(String query, List<String> docs, int topN) {
-        return rerank(query, docs, topN, maxDocs, timeoutMs);
+        return rerank(query, docs, topN, DEFAULT_MAX_DOCS, DEFAULT_TIMEOUT_MS);
     }
 
     /**
@@ -240,15 +250,15 @@ public class RerankerService {
      * @param query     用户查询
      * @param docs      候选文档列表
      * @param topN      返回前 N 个结果
-     * @param maxDocs   单次精排最大候选数，≤0 时回退 yml 配置
-     * @param timeoutMs 单次精排超时时间（毫秒），≤0 时回退 yml 配置
+     * @param maxDocs   单次精排最大候选数，≤0 时回退兜底默认值
+     * @param timeoutMs 单次精排超时时间（毫秒），≤0 时回退兜底默认值
      * @return 按分数降序排列的 Rerank 结果
      */
     @Timed("Rerank 精排")
     public List<RerankResult> rerank(String query, List<String> docs, int topN,
                                      int maxDocs, long timeoutMs) {
-        int effectiveMaxDocs = maxDocs > 0 ? maxDocs : this.maxDocs;
-        long effectiveTimeoutMs = timeoutMs > 0 ? timeoutMs : this.timeoutMs;
+        int effectiveMaxDocs = maxDocs > 0 ? maxDocs : DEFAULT_MAX_DOCS;
+        long effectiveTimeoutMs = timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS;
         if (!initialized) {
             log.debug("Reranker 未初始化，跳过精排");
             return fallbackResults(docs, topN);
@@ -263,8 +273,12 @@ public class RerankerService {
                 ? docs.subList(0, effectiveMaxDocs)
                 : docs;
 
+        // 单条候选文本截断（字符维度，0 表示不截断）。必须在调用线程读取，
+        // 否则在 reranker-worker 线程内读取会丢失评测的 ParamOverrideScope 快照。
+        int docMaxChars = paramValueProvider.getInt("rerank.docMaxChars", DEFAULT_DOC_MAX_CHARS);
+
         try {
-            List<RerankResult> results = rerankWithTimeout(query, candidateDocs, effectiveTimeoutMs);
+            List<RerankResult> results = rerankWithTimeout(query, candidateDocs, effectiveTimeoutMs, docMaxChars);
             results.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
             return results.size() <= topN ? results : results.subList(0, topN);
         } catch (Exception e) {
@@ -276,11 +290,12 @@ public class RerankerService {
     /**
      * 带超时的 Rerank 执行
      */
-    private List<RerankResult> rerankWithTimeout(String query, List<String> docs, long timeoutMs) {
+    private List<RerankResult> rerankWithTimeout(String query, List<String> docs, long timeoutMs,
+                                                 int docMaxChars) {
         CompletableFuture<List<RerankResult>> future = CompletableFuture.supplyAsync(
                 () -> {
                     try {
-                        return doRerank(query, docs);
+                        return doRerank(query, docs, docMaxChars);
                     } catch (Exception e) {
                         log.warn("Rerank 推理失败，已降级返回原始顺序: {}", e.getMessage());
                         throw new RuntimeException("Rerank 推理失败", e);
@@ -311,7 +326,7 @@ public class RerankerService {
      *   <li>拆分 logits 为各文档的相关性分数</li>
      * </ol>
      */
-    private List<RerankResult> doRerank(String query, List<String> docs) throws Exception {
+    private List<RerankResult> doRerank(String query, List<String> docs, int docMaxChars) throws Exception {
         long t0 = System.currentTimeMillis();
         int batchSize = docs.size();
 
@@ -321,7 +336,11 @@ public class RerankerService {
         int maxLen = 0;
 
         for (int i = 0; i < batchSize; i++) {
-            var encoding = tokenizer.encode(query, docs.get(i), true, false);
+            String doc = docs.get(i);
+            if (docMaxChars > 0 && doc != null && doc.length() > docMaxChars) {
+                doc = doc.substring(0, docMaxChars);
+            }
+            var encoding = tokenizer.encode(query, doc, true, false);
             allInputIds[i] = encoding.getIds();
             allAttentionMasks[i] = encoding.getAttentionMask();
             maxLen = Math.max(maxLen, allInputIds[i].length);
@@ -358,8 +377,8 @@ public class RerankerService {
             }
             output.close();
 
-        log.info("Rerank batch 推理完成: batchSize={}, maxLen={}, tokenize={}ms, inference={}ms, total={}ms",
-                    batchSize, maxLen, t1 - t0, t2 - t1, t2 - t0);
+        log.info("Rerank batch 推理完成: batchSize={}, maxLen={}, docMaxChars={}, tokenize={}ms, inference={}ms, total={}ms",
+                    batchSize, maxLen, docMaxChars, t1 - t0, t2 - t1, t2 - t0);
             return results;
         } finally {
             inputIdsTensor.close();
@@ -400,16 +419,16 @@ public class RerankerService {
     }
 
     /**
-     * yml 兜底的单次精排最大候选数
+     * 兜底默认的单次精排最大候选数
      */
     public int getMaxDocs() {
-        return maxDocs;
+        return DEFAULT_MAX_DOCS;
     }
 
     /**
-     * yml 兜底的单次精排超时时间（毫秒）
+     * 兜底默认的单次精排超时时间（毫秒）
      */
     public long getTimeoutMs() {
-        return timeoutMs;
+        return DEFAULT_TIMEOUT_MS;
     }
 }

@@ -296,12 +296,12 @@ ai-knowledge-base/
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `document.chunk.min-tokens` | 400 | 最小切片大小 |
-| `document.chunk.max-tokens` | 800 | 最大切片大小 |
-| `document.chunk.overlap-ratio` | 0.2 | 切片重叠比例 |
+| `chunk.minTokens`（参数管理） | 400 | 最小切片大小（原 `document.chunk.min-tokens`，已迁移至参数管理，支持热更） |
+| `chunk.maxTokens`（参数管理） | 800 | 最大切片大小（原 `document.chunk.max-tokens`，已迁移至参数管理，支持热更） |
+| `chunk.overlapTokens`（参数管理） | 160 | 切片重叠 token 数（原 `document.chunk.overlap-tokens`，已迁移至参数管理，支持热更） |
 | `document.upload.max-size-mb` | 200 | 上传文件大小上限 |
-| `hybrid-search.enabled` | true | 混合检索开关 |
-| `hybrid-search.rrf.k` | 60 | RRF 融合常数 |
+| `retrieval.hybridEnabled`（参数管理） | true | 混合检索开关（原 `hybrid-search.enabled`，已迁移至参数管理，支持热更） |
+| `retrieval.rrfK`（参数管理） | 60 | RRF 融合常数（原 `hybrid-search.rrf.k`，已迁移至参数管理，支持热更） |
 | `query-rewrite.enabled` | true | 查询改写开关 |
 | `query-rewrite.l1.confidence-threshold` | 0.85 | L1 规则置信度阈值 |
 

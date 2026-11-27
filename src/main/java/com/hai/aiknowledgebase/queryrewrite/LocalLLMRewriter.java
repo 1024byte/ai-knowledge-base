@@ -308,8 +308,10 @@ public class LocalLLMRewriter {
         return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-8);
     }
 
-    /** 子查询硬上限：超过则丢弃拆分，回退为单查询 */
-    private static final int MAX_SUB_QUERIES = 5;
+    /** 子查询硬上限：参数管理值超过该值时仍收敛到该值 */
+    private static final int HARD_MAX_SUB_QUERIES = 5;
+    /** 子查询默认上限（参数管理 queryRewrite.maxSubQueries 的兜底值） */
+    private static final int DEFAULT_MAX_SUB_QUERIES = 3;
     /** 子查询语义多样性阈值：任意两个子查询 embedding cosine > 此值视为重复，需去重 */
     private static final double SUB_QUERY_DIVERSITY_THRESHOLD = 0.85;
 
@@ -319,7 +321,8 @@ public class LocalLLMRewriter {
      * <p>解析后执行三层校验：</p>
      * <ol>
      *   <li>文本去重：完全相同的子查询只保留一份</li>
-     *   <li>数量上限：超过 {@link #MAX_SUB_QUERIES} 则丢弃拆分，回退为单查询</li>
+     *   <li>数量上限：超过参数管理 {@code queryRewrite.maxSubQueries}（兜底 3，硬上限 5）
+     *       则丢弃拆分，回退为单查询</li>
      *   <li>主查询与子查询分离：subQueries 列表只存真正的子查询，不包含主查询</li>
      * </ol>
      *
@@ -347,9 +350,14 @@ public class LocalLLMRewriter {
 
         List<String> uniqueList = new ArrayList<>(dedup);
 
+        // 数量上限：参数管理可调，收敛到 [1, HARD_MAX_SUB_QUERIES]
+        int maxSubQueries = paramValueProvider.getInt(
+                "queryRewrite.maxSubQueries", DEFAULT_MAX_SUB_QUERIES);
+        maxSubQueries = Math.max(1, Math.min(maxSubQueries, HARD_MAX_SUB_QUERIES));
+
         // 超过上限：丢弃拆分，全部内容拼成一个单查询
-        if (uniqueList.size() > MAX_SUB_QUERIES) {
-            log.info("子查询数量({})超过上限({})，丢弃拆分回退单查询", uniqueList.size(), MAX_SUB_QUERIES);
+        if (uniqueList.size() > maxSubQueries) {
+            log.info("子查询数量({})超过上限({})，丢弃拆分回退单查询", uniqueList.size(), maxSubQueries);
             return new SubQueryParseResult(String.join(" | ", uniqueList), Collections.emptyList());
         }
 

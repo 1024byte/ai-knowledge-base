@@ -61,11 +61,9 @@ thresholds:
     l2: 0.80                      # L2 拼音匹配纠错置信度阈值
 
 # 文档配置
+# 注：document.chunk 的 min/max/overlap-tokens 已迁移至参数管理（param_config.sql → chunk.*），
+#     支持热更；知识库未单独配置 chunkLength/overlapLength 时取此处全局默认。
 document:
-  chunk:
-    min-tokens: 400
-    max-tokens: 800
-    overlap-tokens: 160
   parser:
     max-output-size-mb: 200      # Python 进程输出上限，超过则终止解析
   upload:
@@ -98,11 +96,8 @@ corrector:
   l3:
     timeout-ms: 2000                 # L3 LLM 超时时间（毫秒）
 
-# 混合检索配置（并行双路召回 + RRF 融合）
-hybrid-search:
-  enabled: true                      # 总开关：true=向量+关键词双路召回，false=仅向量检索
-  rrf:
-    k: 60                            # RRF 常数 k，值越大排名差异越平滑（推荐 60）
+# 混合检索配置（已迁移至参数管理）
+# 总开关 / RRF 常数 k 由参数 retrieval.hybridEnabled / retrieval.rrfK 控制，支持热更，故此处不再保留。
 
 # 嵌入模型配置
 embedding:
@@ -110,12 +105,12 @@ embedding:
 
 
 # Cross-Encoder Rerank 精排配置
+# 注：rerank.maxDocs / rerank.timeoutMs / rerank.docMaxChars 已迁移至参数管理（param_config.sql → rerank.*），
+#     支持热更；此处仅保留启动期定型、无法热更的参数。
 reranker:
-  enabled: true                     # 总开关：true=启用 Rerank 精排，false=跳过
+  enabled: true                     # 启动期总开关：false 则不加载 ONNX 模型（需重启生效）；运行时是否调用精排由参数 rerank.enabled 控制
   model-path: models/bge-reranker-v2-m3  # ONNX 模型目录（含 model.onnx + tokenizer.json）
-  timeout-ms: 15000                  # 兜底默认值，运行时以参数 rerank.timeoutMs 为准（毫秒）
-  max-docs: 30                       # 兜底默认值，运行时以参数 rerank.maxDocs 为准（防止 OOM，勿设为 5）
-  max-seq-length: 512                # 模型最大序列长度
+  max-seq-length: 512                # 模型最大序列长度（token 维度，启动期烤入 tokenizer，无法热更）
   gpu-device-id: 0                 # GPU 设备 ID：-1=CPU 推理，>=0=指定 GPU（需安装 CUDA 12.x + cuDNN 9.x）
 
 # Chat Prompt Token 预算控制

@@ -11,7 +11,6 @@ import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.TokenCountEstimator;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -28,16 +27,13 @@ import java.util.Map;
 @Service
 public class DocumentChunkerService implements DocumentSplitter {
 
-    @Value("${document.chunk.min-tokens:400}")
-    private int minTokens;
-
-    @Value("${document.chunk.max-tokens:800}")
-    private int maxTokens;
-
-    @Value("${document.chunk.overlap-tokens:160}")
-    private int overlapTokens;
+    /** 参数管理未命中（如未执行 param_config.sql）时的代码兜底默认值 */
+    private static final int FALLBACK_MIN_TOKENS = 400;
+    private static final int FALLBACK_MAX_TOKENS = 800;
+    private static final int FALLBACK_OVERLAP_TOKENS = 160;
 
     private final ThresholdsConfig thresholdsConfig;
+    private final ParamValueProvider paramValueProvider;
 
     // 复用估算器实例（无状态，可共享）
     private final TokenCountEstimator  tokenCountEstimator;
@@ -55,12 +51,14 @@ public class DocumentChunkerService implements DocumentSplitter {
                                   EmbeddingModel embeddingModel,
                                   DocumentRouter documentRouter,
                                   GenericDocumentChunker genericDocumentChunker,
-                                  ThresholdsConfig thresholdsConfig) {
+                                  ThresholdsConfig thresholdsConfig,
+                                  ParamValueProvider paramValueProvider) {
         this.tokenCountEstimator = tokenEstimator;
         this.embeddingModel = embeddingModel;
         this.documentRouter = documentRouter;
         this.genericDocumentChunker = genericDocumentChunker;
         this.thresholdsConfig = thresholdsConfig;
+        this.paramValueProvider = paramValueProvider;
     }
 
     /**
@@ -161,9 +159,9 @@ public class DocumentChunkerService implements DocumentSplitter {
 
     private MarkdownDocumentChunker createChunker() {
         return new MarkdownDocumentChunker(
-                minTokens,
-                maxTokens,
-                overlapTokens,
+                paramValueProvider.getInt("chunk.minTokens", FALLBACK_MIN_TOKENS),
+                paramValueProvider.getInt("chunk.maxTokens", FALLBACK_MAX_TOKENS),
+                paramValueProvider.getInt("chunk.overlapTokens", FALLBACK_OVERLAP_TOKENS),
                 tokenCountEstimator ,
                 embeddingModel,
                 thresholdsConfig.getChunking().getSemantic()

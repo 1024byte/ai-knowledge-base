@@ -1,5 +1,7 @@
 package com.hai.aiknowledgebase.retrieve;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
@@ -16,6 +18,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
@@ -40,6 +43,12 @@ public class VectorRetriever {
 
     /** 片段索引管理器，提供禁用/未完成向量化片段集合用于过滤 */
     private final ChunkIndexManager chunkIndexManager;
+
+    /** 查询向量短 TTL 缓存：多子查询/重复提问时避免重复调用 embedding 模型 */
+    private final Cache<String, Embedding> embeddingCache = Caffeine.newBuilder()
+            .maximumSize(1000)
+            .expireAfterWrite(10, TimeUnit.MINUTES)
+            .build();
 
     /**
      * <h3>纯向量检索</h3>
@@ -109,8 +118,9 @@ public class VectorRetriever {
         }
 
         try {
-            // 2. 嵌入（可考虑超时）
-            Embedding queryEmbedding = embeddingModel.embed(query).content();
+            // 2. 嵌入（短 TTL 缓存，避免多子查询重复调用模型）
+            Embedding queryEmbedding = embeddingCache.get(query,
+                    q -> embeddingModel.embed(q).content());
 
             // 3. 构建请求：多取一部分（3 倍 topK），以补偿后续禁用片段过滤造成的数量缩减
             int fetchSize = Math.max(topK * 3, 30);

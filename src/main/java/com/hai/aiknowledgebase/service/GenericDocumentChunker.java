@@ -4,7 +4,6 @@ import com.hai.aiknowledgebase.common.SplitStrategy;
 import com.hai.aiknowledgebase.common.TextTokenUtils;
 import dev.langchain4j.model.TokenCountEstimator;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -36,16 +35,17 @@ public class GenericDocumentChunker {
     /** 硬切时最大 token 的下限保护，防止死循环 */
     private static final int MIN_HARD_SPLIT_TOKENS = 4;
 
+    /** 参数管理未命中（如未执行 param_config.sql）时的代码兜底默认值 */
+    private static final int FALLBACK_MIN_TOKENS = 400;
+    private static final int FALLBACK_MAX_TOKENS = 800;
+    private static final int FALLBACK_OVERLAP_TOKENS = 160;
+
     private final TokenCountEstimator tokenEstimator;
+    private final ParamValueProvider paramValueProvider;
 
-    @Value("${document.chunk.min-tokens:200}")
-    private int minTokens;
-
-    @Value("${document.chunk.max-tokens:800}")
-    private int maxTokens;
-
-    public GenericDocumentChunker(TokenCountEstimator tokenEstimator) {
+    public GenericDocumentChunker(TokenCountEstimator tokenEstimator, ParamValueProvider paramValueProvider) {
         this.tokenEstimator = tokenEstimator;
+        this.paramValueProvider = paramValueProvider;
     }
 
     /**
@@ -56,14 +56,19 @@ public class GenericDocumentChunker {
         if (content == null || content.isBlank()) {
             return List.of();
         }
-        int configMaxTokens = (chunkLength != null && chunkLength > 0) ? chunkLength : maxTokens;
-        int effectiveOverlapTokens = (overlapLength != null && overlapLength > 0) ? overlapLength : 0;
+        // 全局兜底从参数管理读取（热更，仅作用于新入库文档）；知识库级 chunkLength/overlapLength 优先覆盖
+        int defaultMax = paramValueProvider.getInt("chunk.maxTokens", FALLBACK_MAX_TOKENS);
+        int defaultMin = paramValueProvider.getInt("chunk.minTokens", FALLBACK_MIN_TOKENS);
+        int defaultOverlap = paramValueProvider.getInt("chunk.overlapTokens", FALLBACK_OVERLAP_TOKENS);
+
+        int configMaxTokens = (chunkLength != null && chunkLength > 0) ? chunkLength : defaultMax;
+        int effectiveOverlapTokens = (overlapLength != null && overlapLength > 0) ? overlapLength : defaultOverlap;
 
         // 关键：切片阶段目标 = maxTokens - overlapTokens，为重叠预留空间
         int reserved = Math.max(0, effectiveOverlapTokens);
         int candidate = configMaxTokens - reserved;
         // 保底：不能小于 minTokens；若配置不合理（overlap >= max），退化为 max 的一半
-        int effectiveMinTokens = Math.min(minTokens, configMaxTokens);
+        int effectiveMinTokens = Math.min(defaultMin, configMaxTokens);
         if (candidate < effectiveMinTokens) {
             candidate = Math.max(effectiveMinTokens, configMaxTokens / 2);
         }

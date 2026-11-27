@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
 import java.util.stream.Collectors;
 
 /**
@@ -76,6 +77,9 @@ public class RetrievalCoordinator {
     /** Rerank 编排器：精排 / 阈值过滤 / 排除词过滤 / 降权 / 跨库重排 */
     private final RerankOrchestrator rerankOrchestrator;
 
+    /** 检索扇出执行器（虚拟线程），避免子查询嵌套并行争用 chatTaskExecutor */
+    private final ExecutorService retrievalVirtualExecutor;
+
     /** 向量检索最低余弦相似度阈值，由 ThresholdsConfig 统一管理 */
     private double getMinVectorScore() {
         return thresholdsConfig.getRetrieval().getVectorMinScore();
@@ -125,8 +129,6 @@ public class RetrievalCoordinator {
         // 动态参数全部按全局作用域读取（param 优先，yml/硬编码兜底）
         boolean rerankEnabled = paramValueProvider.getBoolean(
                 "rerank.enabled", rerankerService.isEnabled());
-        double rerankMinScore = paramValueProvider.getDouble(
-                "rerank.minScore", rerankerService.getMinScore());
         boolean parentContextEnabled = paramValueProvider.getBoolean(
                 "retrieval.parentContextEnabled", true);
         // 精排候选上限与超时：参数管理可热更，yml 兜底
@@ -148,6 +150,39 @@ public class RetrievalCoordinator {
 
         log.info("混合检索召回 {} 个片段", allResults.size());
 
+        // ===== 阶段2~6：排除词过滤 → Rerank → 阈值 → 降权 → 父上下文扩展 =====
+        // 抽为统一后处理，供生产单查询链路与多子查询统一精排链路复用，保证行为一致
+        return applyPostProcessing(allResults, userQuery, excludeKeywords);
+    }
+
+    /**
+     * <h3>统一后处理</h3>
+     *
+     * <p>顺序固定为：排除关键词过滤 → Cross-Encoder Rerank → 最终重排序 →
+     * 分数阈值过滤 → content_type 降权 → 父上下文扩展。</p>
+     *
+     * <p>父上下文扩展放在最后，避免 parent_text 过长被 Reranker 的 max-seq-length 截断，
+     * 同时只扩展最终结果，减少 token 与耗时。</p>
+     *
+     * @param allResults      候选片段（混合检索或跨子查询合并结果）
+     * @param query           用于精排的查询文本
+     * @param excludeKeywords 排除关键词
+     * @return 后处理后的最终结果
+     */
+    private List<RankedResult> applyPostProcessing(List<RankedResult> allResults, String query,
+                                                   List<String> excludeKeywords) {
+        boolean rerankEnabled = paramValueProvider.getBoolean(
+                "rerank.enabled", rerankerService.isEnabled());
+        double rerankMinScore = paramValueProvider.getDouble(
+                "rerank.minScore", rerankerService.getMinScore());
+        boolean parentContextEnabled = paramValueProvider.getBoolean(
+                "retrieval.parentContextEnabled", true);
+        int rerankMaxDocs = paramValueProvider.getInt(
+                "rerank.maxDocs", rerankerService.getMaxDocs());
+        int rerankCandidateCount = paramValueProvider.getInt("rerank.candidateCount", 0);
+        long rerankTimeoutMs = paramValueProvider.getInt(
+                "rerank.timeoutMs", (int) rerankerService.getTimeoutMs());
+
         // ===== 阶段2：排除关键词过滤 =====
         // 对片段分词后精确匹配排除词（避免子串误杀，如排除"Java"误杀"JavaScript"）
         allResults = rerankOrchestrator.filterByExcludeKeywords(allResults, excludeKeywords);
@@ -156,14 +191,13 @@ public class RetrievalCoordinator {
         boolean rerankApplied = false;
         if (rerankEnabled && rerankerService.isAvailable() && !allResults.isEmpty()) {
             rerankApplied = true;
+            allResults = limitRerankCandidates(allResults,
+                    resolveRerankCandidateLimit(rerankCandidateCount, rerankMaxDocs), "生产检索");
             log.info("开始 Rerank 精排，候选片段数: {}", allResults.size());
 
-            allResults = rerankOrchestrator.rerank(userQuery, allResults, rerankMaxDocs, rerankTimeoutMs);
+            allResults = rerankOrchestrator.rerank(query, allResults, rerankMaxDocs, rerankTimeoutMs);
 
-            log.info("Rerank 精排完成，Top-3 分数: {}",
-                    allResults.stream().limit(3)
-                            .map(r -> String.format("%.4f", r.getScore()))
-                            .collect(Collectors.joining(", ")));
+            log.info("Rerank 精排完成，Top-3 分数: {}", top3Scores(allResults));
         } else if (rerankEnabled && !rerankerService.isAvailable()) {
             log.warn("rerank.enabled 已开启但 Reranker 模型未加载（yml reranker.enabled=false 或初始化失败），跳过精排");
         }
@@ -178,10 +212,7 @@ public class RetrievalCoordinator {
         } else {
             allResults = rerankOrchestrator.reorderByRawScore(allResults);
         }
-        log.info("分数重排序完成，Top-3 分数: {}",
-                allResults.stream().limit(3)
-                        .map(r -> String.format("%.4f", r.getScore()))
-                        .collect(Collectors.joining(", ")));
+        log.info("分数重排序完成，Top-3 分数: {}", top3Scores(allResults));
 
         // ===== 阶段4：分数阈值过滤 =====
         allResults = rerankOrchestrator.filterByMinScore(allResults, rerankMinScore);
@@ -191,9 +222,6 @@ public class RetrievalCoordinator {
         allResults = rerankOrchestrator.applyContentTypeWeighting(allResults, null);
 
         // ===== 阶段6：父上下文扩展 =====
-        // 放在精排 / 阈值过滤 / 降权之后，只对最终结果扩展：
-        // 避免 parent_text 过长被 Reranker 的 max-seq-length 截断，导致精排看不到真正命中的 chunk；
-        // 同时只扩展最终结果，减少 token 与耗时。
         if (parentContextEnabled) {
             allResults = parentContextExpander.expand(allResults);
         } else {
@@ -202,6 +230,256 @@ public class RetrievalCoordinator {
 
         log.info("最终返回 {} 个片段", allResults.size());
         return allResults;
+    }
+
+    private String top3Scores(List<RankedResult> results) {
+        return results.stream().limit(3)
+                .map(r -> String.format("%.4f", r.getScore()))
+                .collect(Collectors.joining(", "));
+    }
+
+    /**
+     * 计算实际送入精排的候选上限：{@code rerank.candidateCount} 与 {@code rerank.maxDocs} 取小。
+     *
+     * <p>{@code candidateCount ≤ 0} 表示不额外限制，仅受 maxDocs 约束；
+     * 两者都无效时返回 {@link Integer#MAX_VALUE}，等价于不截断。</p>
+     */
+    private int resolveRerankCandidateLimit(int candidateCount, int maxDocs) {
+        if (candidateCount <= 0) {
+            return maxDocs > 0 ? maxDocs : Integer.MAX_VALUE;
+        }
+        return maxDocs > 0 ? Math.min(candidateCount, maxDocs) : candidateCount;
+    }
+
+    /**
+     * 按粗排顺序截断精排候选，仅影响送入 Cross-Encoder 的数量，不改变召回结果本身。
+     */
+    private List<RankedResult> limitRerankCandidates(List<RankedResult> candidates, int limit,
+                                                     String stage) {
+        if (limit <= 0 || candidates.size() <= limit) {
+            return candidates;
+        }
+        log.info("精排候选截断[{}]: {} -> {}（rerank.candidateCount 与 rerank.maxDocs 取小）",
+                stage, candidates.size(), limit);
+        return new ArrayList<>(candidates.subList(0, limit));
+    }
+
+    // ==================== 多子查询检索（合并后统一精排） ====================
+
+    /**
+     * <h3>多子查询检索（合并去重后统一 Rerank）</h3>
+     *
+     * <p>与 {@link #retrieveSegments(String, int, double, List, List, Set)} 的差异：
+     * 每个子查询只执行「混合检索 + RRF 融合」，合并去重后统一执行一次排除词过滤、Rerank、
+     * 阈值过滤、降权与父上下文扩展。</p>
+     *
+     * <p>动机：Rerank 由单线程执行器串行处理，旧实现每子查询各精排一次，
+     * 延迟随子查询数线性放大，且每个 batch 过小导致 ONNX 固定开销占比过高。</p>
+     *
+     * <p>回滚：参数 {@code retrieval.multiQuerySingleRerank=false} 时回退旧行为
+     * （每子查询各自完整链路）。</p>
+     *
+     * @param rerankQuery     主查询，作为统一精排的 query
+     * @param subQueries      子查询列表
+     * @param totalTopK       最终返回上限（各子查询按 totalTopK/N 分配召回配额）
+     * @param minScore        向量最低相似度，≤0 时使用参数管理值
+     * @param expandKeywords  扩展关键词（已废弃，仅保持签名一致）
+     * @param excludeKeywords 排除关键词
+     * @param kbIds           知识库范围
+     * @return 合并去重并统一精排后的结果
+     */
+    @Timed("多子查询检索+Rerank")
+    public List<RankedResult> retrieveSegmentsMultiQuery(String rerankQuery, List<String> subQueries,
+                                                         int totalTopK, double minScore,
+                                                         List<String> expandKeywords,
+                                                         List<String> excludeKeywords,
+                                                         Set<Long> kbIds) {
+        if (kbIds != null && kbIds.isEmpty()) {
+            return new ArrayList<>();
+        }
+        if (subQueries == null || subQueries.isEmpty()) {
+            return retrieveSegments(rerankQuery, totalTopK, minScore, expandKeywords, excludeKeywords, kbIds);
+        }
+
+        double effectiveMinScore = (minScore > 0) ? minScore
+                : paramValueProvider.getDouble("retrieval.vectorMinScore", getMinVectorScore());
+        boolean singleRerank = paramValueProvider.getBoolean(
+                "retrieval.multiQuerySingleRerank", true);
+        if (!singleRerank) {
+            log.info("multiQuerySingleRerank=false，回退为每子查询完整链路（旧行为）");
+            return legacyMultiQueryRetrieve(subQueries, totalTopK, effectiveMinScore,
+                    expandKeywords, excludeKeywords, kbIds);
+        }
+
+        int perQueryTopK = Math.max(3, totalTopK / subQueries.size());
+        int rrfK = paramValueProvider.getInt("retrieval.rrfK", rankFusion.getDefaultRrfK());
+        log.info("多子查询统一精排: {} 个子查询 | perQueryTopK={} | 精排query={}",
+                subQueries.size(), perQueryTopK, rerankQuery);
+
+        // ===== 阶段1：每子查询只做混合检索 + RRF（不精排、不做后处理）=====
+        List<CompletableFuture<TimedResult>> futures = new ArrayList<>(subQueries.size());
+        for (String subQuery : subQueries) {
+            futures.add(CompletableFuture.supplyAsync(() -> {
+                long start = System.currentTimeMillis();
+                List<RankedResult> results =
+                        hybridSearchInline(subQuery, perQueryTopK, effectiveMinScore, kbIds, rrfK);
+                return new TimedResult(results, System.currentTimeMillis() - start);
+            }, retrievalVirtualExecutor));
+        }
+
+        // 合并去重：同一片段被多个子查询命中时保留分数更高的一份
+        // 同时记录各子查询的召回键集合与耗时，供分路归因（不影响检索行为）
+        Map<String, RankedResult> merged = new LinkedHashMap<>();
+        List<Set<String>> recalledKeys = new ArrayList<>(subQueries.size());
+        List<Long> recallMs = new ArrayList<>(subQueries.size());
+        for (int i = 0; i < futures.size(); i++) {
+            Set<String> keys = new HashSet<>();
+            long elapsed = -1L;
+            try {
+                TimedResult timed = futures.get(i).join();
+                elapsed = timed.elapsedMs;
+                for (RankedResult r : timed.value) {
+                    keys.add(attributionKey(r));
+                    merged.merge(segmentKey(r), r,
+                            (existing, incoming) -> incoming.getScore() > existing.getScore() ? incoming : existing);
+                }
+            } catch (Exception e) {
+                log.warn("子查询检索失败，跳过: subQuery={}, error={}", subQueries.get(i), e.getMessage());
+            }
+            recalledKeys.add(keys);
+            recallMs.add(elapsed);
+        }
+
+        List<RankedResult> candidates = new ArrayList<>(merged.values());
+        candidates.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
+        log.info("子查询合并去重后候选数: {}", candidates.size());
+
+        List<RankedResult> finalResults = applyPostProcessing(candidates, rerankQuery, excludeKeywords);
+        logSubQueryAttribution(subQueries, recalledKeys, recallMs, finalResults, candidates.size());
+        return finalResults;
+    }
+
+    /**
+     * 分路归因日志：每个子查询召回了多少、其中多少是它独有的、耗时多少、
+     * 最终结果里有多少条来自它（含独占贡献）。
+     *
+     * <p>仅用于观测，帮助判断"子查询是否真的有贡献"，不参与任何排序或过滤。</p>
+     */
+    private void logSubQueryAttribution(List<String> subQueries, List<Set<String>> recalledKeys,
+                                        List<Long> recallMs, List<RankedResult> finalResults,
+                                        int candidateCount) {
+        // key → 召回该片段的子查询下标集合
+        Map<String, Set<Integer>> keyOwners = new HashMap<>();
+        for (int i = 0; i < recalledKeys.size(); i++) {
+            for (String key : recalledKeys.get(i)) {
+                keyOwners.computeIfAbsent(key, k -> new HashSet<>()).add(i);
+            }
+        }
+
+        int[] contributed = new int[subQueries.size()];
+        int[] exclusiveContributed = new int[subQueries.size()];
+        int unattributed = 0;
+        for (RankedResult r : finalResults) {
+            Set<Integer> owners = keyOwners.get(attributionKey(r));
+            if (owners == null || owners.isEmpty()) {
+                unattributed++;
+                continue;
+            }
+            for (int owner : owners) {
+                contributed[owner]++;
+                if (owners.size() == 1) {
+                    exclusiveContributed[owner]++;
+                }
+            }
+        }
+
+        for (int i = 0; i < subQueries.size(); i++) {
+            int exclusiveRecall = 0;
+            for (String key : recalledKeys.get(i)) {
+                Set<Integer> owners = keyOwners.get(key);
+                if (owners != null && owners.size() == 1) {
+                    exclusiveRecall++;
+                }
+            }
+            log.info("子查询分路归因: idx={} | 召回={} | 独占召回={} | 检索耗时={}ms | 最终贡献={} | 独占贡献={} | subQuery={}",
+                    i + 1, recalledKeys.get(i).size(), exclusiveRecall, recallMs.get(i),
+                    contributed[i], exclusiveContributed[i], subQueries.get(i));
+        }
+        log.info("子查询归因汇总: 子查询数={} | 合并候选={} | 最终返回={} | 无法归因={}",
+                subQueries.size(), candidateCount, finalResults.size(), unattributed);
+    }
+
+    /**
+     * 归因键：优先 chunk_id（父上下文扩展会替换文本但保留 metadata），
+     * 缺失时回退到文本键，保证扩展前后仍可对齐。
+     */
+    private String attributionKey(RankedResult result) {
+        if (result.getSegment() != null) {
+            String chunkId = chunkKey(result.getSegment());
+            if (chunkId != null) {
+                return "chunk:" + chunkId;
+            }
+        }
+        return "text:" + segmentKey(result);
+    }
+
+    /**
+     * 回滚路径：每子查询各自执行完整链路（混合检索 + 精排 + 后处理），再合并去重。
+     */
+    private List<RankedResult> legacyMultiQueryRetrieve(List<String> subQueries, int totalTopK,
+                                                        double minScore, List<String> expandKeywords,
+                                                        List<String> excludeKeywords, Set<Long> kbIds) {
+        int perQueryTopK = Math.max(3, totalTopK / subQueries.size());
+        List<CompletableFuture<List<RankedResult>>> futures = new ArrayList<>(subQueries.size());
+        for (String subQuery : subQueries) {
+            futures.add(CompletableFuture.supplyAsync(
+                    () -> retrieveSegments(subQuery, perQueryTopK, minScore, expandKeywords, excludeKeywords, kbIds),
+                    retrievalVirtualExecutor));
+        }
+
+        Map<String, RankedResult> merged = new LinkedHashMap<>();
+        for (int i = 0; i < futures.size(); i++) {
+            try {
+                for (RankedResult r : futures.get(i).join()) {
+                    merged.putIfAbsent(segmentKey(r), r);
+                }
+            } catch (Exception e) {
+                log.warn("子查询检索失败，跳过: subQuery={}, error={}", subQueries.get(i), e.getMessage());
+            }
+        }
+
+        List<RankedResult> result = new ArrayList<>(merged.values());
+        result.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
+        return result;
+    }
+
+    /**
+     * 混合检索（当前线程内顺序执行向量路与 BM25 路）。
+     *
+     * <p>供多子查询路径使用：子查询之间已经并行，内部再嵌套异步会争用线程池；
+     * 两路顺序执行仅增加一次 ANN/BM25 的耗时，避免嵌套并行带来的饥饿风险。</p>
+     */
+    private List<RankedResult> hybridSearchInline(String query, int topK, double minVectorScore,
+                                                  Set<Long> kbIds, int rrfK) {
+        boolean hybridEnabled = paramValueProvider.getBoolean(
+                "retrieval.hybridEnabled", rankFusion.isHybridEnabled());
+        if (!hybridEnabled || chunkIndexManager.getKeywordIndex().size() == 0) {
+            return vectorRetriever.vectorSearchRanked(query, topK, kbIds).stream()
+                    .filter(r -> r.getScore() >= minVectorScore)
+                    .collect(Collectors.toList());
+        }
+
+        List<RankedResult> vectorResults = vectorRetriever.vectorSearchRanked(query, topK, kbIds).stream()
+                .filter(r -> r.getScore() >= minVectorScore)
+                .collect(Collectors.toList());
+        List<RankedResult> keywordResults = keywordRetriever.keywordSearchRanked(query, topK, kbIds);
+        return rankFusion.reciprocalRankFusion(vectorResults, keywordResults, topK, rrfK);
+    }
+
+    /** 去重键：优先片段文本；文本缺失时退化为对象标识，避免不同片段被误合并 */
+    private String segmentKey(RankedResult result) {
+        String text = (result.getSegment() == null) ? null : result.getSegment().text();
+        return (text != null) ? text : String.valueOf(System.identityHashCode(result));
     }
 
     /**
@@ -311,6 +589,7 @@ public class RetrievalCoordinator {
         int rerankMaxDocs = rerankMaxDocsOverride > 0
                 ? rerankMaxDocsOverride
                 : paramValueProvider.getInt("rerank.maxDocs", rerankerService.getMaxDocs());
+        int rerankCandidateCount = paramValueProvider.getInt("rerank.candidateCount", 0);
         long rerankTimeoutMs = paramValueProvider.getInt(
                 "rerank.timeoutMs", (int) rerankerService.getTimeoutMs());
 
@@ -369,6 +648,9 @@ public class RetrievalCoordinator {
                     rerankOrchestrator.filterByExcludeKeywords(vector, excludeKeywords);
             List<RankedResult> bm25Candidates =
                     rerankOrchestrator.filterByExcludeKeywords(bm25, excludeKeywords);
+            int candidateLimit = resolveRerankCandidateLimit(rerankCandidateCount, rerankMaxDocs);
+            vectorCandidates = limitRerankCandidates(vectorCandidates, candidateLimit, "rerank_fuse-向量路");
+            bm25Candidates = limitRerankCandidates(bm25Candidates, candidateLimit, "rerank_fuse-BM25路");
             List<RankedResult> vectorReranked = traceRerankToRanked(
                     query, vectorCandidates, rerankThreshold, rerankMaxDocs, rerankTimeoutMs);
             List<RankedResult> bm25Reranked = traceRerankToRanked(
@@ -401,6 +683,8 @@ public class RetrievalCoordinator {
                 rerankInput = bm25;
                 applyWeighting = false;
             }
+            rerankInput = limitRerankCandidates(rerankInput,
+                    resolveRerankCandidateLimit(rerankCandidateCount, rerankMaxDocs), "召回测试");
             long start = System.currentTimeMillis();
             rerank = traceRerank(query, rerankInput, rerankThreshold, applyWeighting,
                     rerankMaxDocs, rerankTimeoutMs);

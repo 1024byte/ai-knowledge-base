@@ -113,6 +113,14 @@ reranker:
   max-seq-length: 512                # 模型最大序列长度（token 维度，启动期烤入 tokenizer，无法热更）
   gpu-device-id: 0                 # GPU 设备 ID：-1=CPU 推理，>=0=指定 GPU（需安装 CUDA 12.x + cuDNN 9.x）
 
+# 模型配置中心（Chat / 改写 / Rerank 热切换）
+# 说明：模型的实际配置存于数据库 model_config 表（执行 sql/model_config.sql 初始化）；
+#       此处仅保留全局刷新间隔与 Key 加密主密钥。
+model:
+  config:
+    reload-ms: 30000                 # 配置快照刷新间隔（毫秒）；保存/激活时也会立即刷新
+  secret-key: ${MODEL_CONFIG_SECRET:MY/nnr1WBceKh6QlyoQeYntHd89etXHuRtyAaQuc4uM=} # AES-GCM 主密钥，用于加密存储 API Key；留空则只能用环境变量引用
+
 # Chat Prompt Token 预算控制
 chat:
   prompt:

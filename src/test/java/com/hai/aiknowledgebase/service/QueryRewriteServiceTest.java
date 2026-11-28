@@ -2,7 +2,7 @@ package com.hai.aiknowledgebase.service;
 
 import com.hai.aiknowledgebase.dto.*;
 import com.hai.aiknowledgebase.queryrewrite.*;
-import dev.langchain4j.model.openai.OpenAiChatModel;
+import com.hai.aiknowledgebase.model.ChatModelProvider;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -42,7 +42,7 @@ class QueryRewriteServiceTest {
     private QueryRouter queryRouter;
 
     @Mock
-    private OpenAiChatModel chatModel;
+    private ChatModelProvider chatModelProvider;
 
     @Mock
     private L1RuleBasedTransformer l1RuleBasedTransformer;

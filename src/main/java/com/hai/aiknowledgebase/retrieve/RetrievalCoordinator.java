@@ -3,9 +3,10 @@ package com.hai.aiknowledgebase.retrieve;
 import com.hai.aiknowledgebase.annotation.Timed;
 import com.hai.aiknowledgebase.config.ThresholdsConfig;
 import com.hai.aiknowledgebase.exception.BusinessException;
+import com.hai.aiknowledgebase.model.RerankResult;
+import com.hai.aiknowledgebase.model.Reranker;
 import com.hai.aiknowledgebase.service.ParamValueProvider;
 import com.hai.aiknowledgebase.service.ParentContextExpander;
-import com.hai.aiknowledgebase.service.RerankerService;
 import dev.langchain4j.data.segment.TextSegment;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -62,8 +63,8 @@ public class RetrievalCoordinator {
     /** 片段索引管理器，用于判断关键词索引是否为空 */
     private final ChunkIndexManager chunkIndexManager;
 
-    /** Cross-Encoder Rerank 服务，对检索结果精排 */
-    private final RerankerService rerankerService;
+    /** 精排提供者（本地 ONNX / 云端按配置分发），对检索结果精排 */
+    private final Reranker reranker;
 
     /** 父上下文扩展器，用入库时预计算的 parent_text 替换 chunk 文本 */
     private final ParentContextExpander parentContextExpander;
@@ -128,14 +129,14 @@ public class RetrievalCoordinator {
                 : paramValueProvider.getDouble("retrieval.vectorMinScore", getMinVectorScore());
         // 动态参数全部按全局作用域读取（param 优先，yml/硬编码兜底）
         boolean rerankEnabled = paramValueProvider.getBoolean(
-                "rerank.enabled", rerankerService.isEnabled());
+                "rerank.enabled", reranker.isEnabled());
         boolean parentContextEnabled = paramValueProvider.getBoolean(
                 "retrieval.parentContextEnabled", true);
         // 精排候选上限与超时：参数管理可热更，yml 兜底
         int rerankMaxDocs = paramValueProvider.getInt(
-                "rerank.maxDocs", rerankerService.getMaxDocs());
+                "rerank.maxDocs", reranker.getMaxDocs());
         long rerankTimeoutMs = paramValueProvider.getInt(
-                "rerank.timeoutMs", (int) rerankerService.getTimeoutMs());
+                "rerank.timeoutMs", (int) reranker.getTimeoutMs());
         log.info("开始检索，用户查询: {} | topK: {} | minScore: {} | 扩展词: {} | 排除词: {} | kbIds: {} | rerankEnabled: {} | parentContextEnabled: {} | rerankMaxDocs: {} | rerankTimeoutMs: {}",
                 userQuery, topK, effectiveMinScore, expandKeywords, excludeKeywords, kbIds, rerankEnabled, parentContextEnabled, rerankMaxDocs, rerankTimeoutMs);
 
@@ -172,16 +173,16 @@ public class RetrievalCoordinator {
     private List<RankedResult> applyPostProcessing(List<RankedResult> allResults, String query,
                                                    List<String> excludeKeywords) {
         boolean rerankEnabled = paramValueProvider.getBoolean(
-                "rerank.enabled", rerankerService.isEnabled());
+                "rerank.enabled", reranker.isEnabled());
         double rerankMinScore = paramValueProvider.getDouble(
-                "rerank.minScore", rerankerService.getMinScore());
+                "rerank.minScore", reranker.getMinScore());
         boolean parentContextEnabled = paramValueProvider.getBoolean(
                 "retrieval.parentContextEnabled", true);
         int rerankMaxDocs = paramValueProvider.getInt(
-                "rerank.maxDocs", rerankerService.getMaxDocs());
+                "rerank.maxDocs", reranker.getMaxDocs());
         int rerankCandidateCount = paramValueProvider.getInt("rerank.candidateCount", 0);
         long rerankTimeoutMs = paramValueProvider.getInt(
-                "rerank.timeoutMs", (int) rerankerService.getTimeoutMs());
+                "rerank.timeoutMs", (int) reranker.getTimeoutMs());
 
         // ===== 阶段2：排除关键词过滤 =====
         // 对片段分词后精确匹配排除词（避免子串误杀，如排除"Java"误杀"JavaScript"）
@@ -189,7 +190,7 @@ public class RetrievalCoordinator {
 
         // ===== 阶段3：Cross-Encoder Rerank 精排 =====
         boolean rerankApplied = false;
-        if (rerankEnabled && rerankerService.isAvailable() && !allResults.isEmpty()) {
+        if (rerankEnabled && reranker.isAvailable() && !allResults.isEmpty()) {
             rerankApplied = true;
             allResults = limitRerankCandidates(allResults,
                     resolveRerankCandidateLimit(rerankCandidateCount, rerankMaxDocs), "生产检索");
@@ -198,7 +199,7 @@ public class RetrievalCoordinator {
             allResults = rerankOrchestrator.rerank(query, allResults, rerankMaxDocs, rerankTimeoutMs);
 
             log.info("Rerank 精排完成，Top-3 分数: {}", top3Scores(allResults));
-        } else if (rerankEnabled && !rerankerService.isAvailable()) {
+        } else if (rerankEnabled && !reranker.isAvailable()) {
             log.warn("rerank.enabled 已开启但 Reranker 模型未加载（yml reranker.enabled=false 或初始化失败），跳过精排");
         }
 
@@ -588,10 +589,10 @@ public class RetrievalCoordinator {
         // 精排候选上限与超时：请求覆盖 > 全局参数 > yml 兜底
         int rerankMaxDocs = rerankMaxDocsOverride > 0
                 ? rerankMaxDocsOverride
-                : paramValueProvider.getInt("rerank.maxDocs", rerankerService.getMaxDocs());
+                : paramValueProvider.getInt("rerank.maxDocs", reranker.getMaxDocs());
         int rerankCandidateCount = paramValueProvider.getInt("rerank.candidateCount", 0);
         long rerankTimeoutMs = paramValueProvider.getInt(
-                "rerank.timeoutMs", (int) rerankerService.getTimeoutMs());
+                "rerank.timeoutMs", (int) reranker.getTimeoutMs());
 
         List<RankedResult> vector = new ArrayList<>();
         List<RankedResult> bm25 = new ArrayList<>();
@@ -755,7 +756,7 @@ public class RetrievalCoordinator {
                                              double rerankThreshold,
                                              boolean applyContentTypeWeighting,
                                              int maxDocs, long timeoutMs) {
-        if (!rerankerService.isAvailable()) {
+        if (!reranker.isAvailable()) {
             log.error("召回测试-Rerank重排序失败: Reranker 不可用");
             throw new BusinessException(500, "Rerank 重排序失败");
         }
@@ -766,10 +767,10 @@ public class RetrievalCoordinator {
             List<String> docTexts = candidates.stream()
                     .map(r -> r.getSegment().text())
                     .collect(Collectors.toList());
-            List<RerankerService.RerankResult> rerankResults =
-                    rerankerService.rerank(query, docTexts, docTexts.size(), maxDocs, timeoutMs);
+            List<RerankResult> rerankResults =
+                    reranker.rerank(query, docTexts, docTexts.size(), maxDocs, timeoutMs);
             List<RerankedResult> items = new ArrayList<>();
-            for (RerankerService.RerankResult rr : rerankResults) {
+            for (RerankResult rr : rerankResults) {
                 if (rr.getScore() < rerankThreshold) {
                     continue;
                 }
@@ -795,7 +796,7 @@ public class RetrievalCoordinator {
     private List<RankedResult> traceRerankToRanked(String query, List<RankedResult> candidates,
                                                    double rerankThreshold,
                                                    int maxDocs, long timeoutMs) {
-        if (!rerankerService.isAvailable()) {
+        if (!reranker.isAvailable()) {
             log.error("召回测试-Rerank重排序失败: Reranker 不可用");
             throw new BusinessException(500, "Rerank 重排序失败");
         }
@@ -806,10 +807,10 @@ public class RetrievalCoordinator {
             List<String> docTexts = candidates.stream()
                     .map(r -> r.getSegment().text())
                     .collect(Collectors.toList());
-            List<RerankerService.RerankResult> rerankResults =
-                    rerankerService.rerank(query, docTexts, docTexts.size(), maxDocs, timeoutMs);
+            List<RerankResult> rerankResults =
+                    reranker.rerank(query, docTexts, docTexts.size(), maxDocs, timeoutMs);
             List<RankedResult> reranked = new ArrayList<>();
-            for (RerankerService.RerankResult rr : rerankResults) {
+            for (RerankResult rr : rerankResults) {
                 if (rr.getScore() < rerankThreshold) {
                     continue;
                 }

@@ -26,6 +26,7 @@ import com.hai.aiknowledgebase.mapper.EvalRunMapper;
 import com.hai.aiknowledgebase.mapper.KnowledgeBaseMapper;
 import com.hai.aiknowledgebase.mapper.UserMapper;
 import com.hai.aiknowledgebase.mapper.handler.JsonbTypeHandler;
+import com.hai.aiknowledgebase.model.ModelConfigService;
 import com.hai.aiknowledgebase.security.SecurityUtils;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -69,6 +70,7 @@ public class EvalRunService {
     private final ParamValueProvider paramValueProvider;
     private final ThresholdsConfig thresholdsConfig;
     private final EvalRunExecutor runExecutor;
+    private final ModelConfigService modelConfigService;
 
     private final ObjectMapper objectMapper = JsonbTypeHandler.mapper();
 
@@ -104,7 +106,7 @@ public class EvalRunService {
                 .successCount(0)
                 .failedCount(0)
                 .configSnapshot(config)
-                .paramSnapshot(new HashMap<>(paramService.resolveAll(null)))
+                .paramSnapshot(buildParamSnapshot())
                 .createdBy(SecurityUtils.getCurrentUserId())
                 .createdByName(SecurityUtils.getCurrentUsername())
                 .createdAt(LocalDateTime.now())
@@ -125,6 +127,19 @@ public class EvalRunService {
             throw new BusinessException(500, "评测启动失败: " + errorMessage(e));
         }
         return run.getId();
+    }
+
+    /**
+     * 构建评测参数快照：检索参数 + 当前生效的模型配置 ID。
+     *
+     * <p>加入 {@code model.*.id} 伪参数后，运行期间的模型选择被冻结，
+     * 避免同一批 Case 横跨两套模型导致指标不可比。</p>
+     */
+    private Map<String, String> buildParamSnapshot() {
+        Map<String, String> snapshot = new HashMap<>(paramService.resolveAll(null));
+        modelConfigService.activeIdSnapshot()
+                .forEach((type, id) -> snapshot.put("model." + type + ".id", id));
+        return snapshot;
     }
 
     public Map<String, Object> list(Long datasetId, Long kbId, String state,

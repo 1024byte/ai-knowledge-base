@@ -2,6 +2,8 @@ package com.hai.aiknowledgebase.service;
 
 import com.hai.aiknowledgebase.annotation.Timed;
 import com.hai.aiknowledgebase.config.ThresholdsConfig;
+import com.hai.aiknowledgebase.model.RerankResult;
+import com.hai.aiknowledgebase.model.Reranker;
 import ai.djl.huggingface.tokenizers.HuggingFaceTokenizer;
 import ai.onnxruntime.OnnxTensor;
 import ai.onnxruntime.OrtEnvironment;
@@ -48,7 +50,7 @@ import java.util.concurrent.TimeoutException;
  */
 @Slf4j
 @Service
-public class RerankerService {
+public class RerankerService implements Reranker {
 
     /** Rerank 总开关 */
     @Value("${reranker.enabled:false}")
@@ -208,28 +210,6 @@ public class RerankerService {
         } catch (Exception e) {
             log.warn("GPU 预热异常: {}", e.getMessage());
         }
-    }
-
-    /**
-     * Rerank 结果包装类
-     */
-    public static class RerankResult {
-        /** 文档在原始列表中的索引 */
-        private final int index;
-        /** 文档文本 */
-        private final String text;
-        /** Rerank 分数（Cross-Encoder 输出的相关性分数） */
-        private final double score;
-
-        public RerankResult(int index, String text, double score) {
-            this.index = index;
-            this.text = text;
-            this.score = score;
-        }
-
-        public int getIndex() { return index; }
-        public String getText() { return text; }
-        public double getScore() { return score; }
     }
 
     /**

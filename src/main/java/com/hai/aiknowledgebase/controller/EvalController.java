@@ -15,7 +15,7 @@ import com.hai.aiknowledgebase.retrieve.RankedResult;
 import com.hai.aiknowledgebase.retrieve.RerankOrchestrator;
 import com.hai.aiknowledgebase.retrieve.RetrievalCoordinator;
 import com.hai.aiknowledgebase.retrieve.VectorRetriever;
-import com.hai.aiknowledgebase.service.RerankerService;
+import com.hai.aiknowledgebase.model.Reranker;
 import dev.langchain4j.data.segment.TextSegment;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -35,7 +35,7 @@ public class EvalController {
     /** 向量检索原语：vector_only 模式使用 */
     private final VectorRetriever vectorRetriever;
     private final QueryRewriteService queryRewriteService;
-    private final RerankerService rerankerService;
+    private final Reranker reranker;
     /** Rerank 编排器：排除词过滤 / 精排 / 阈值过滤 */
     private final RerankOrchestrator rerankOrchestrator;
     private final ThresholdsConfig thresholdsConfig;
@@ -123,7 +123,7 @@ public class EvalController {
 
         // 阶段3：Rerank 精排（复用 RerankOrchestrator）
         List<RankedResult> rerankedResults = filteredResults;
-        if (doRerank && rerankerService.isAvailable() && !filteredResults.isEmpty()) {
+        if (doRerank && reranker.isAvailable() && !filteredResults.isEmpty()) {
             rerankedResults = rerankOrchestrator.rerank(searchQuery, filteredResults);
         }
         builder.rerank(toStageResult(rerankedResults));

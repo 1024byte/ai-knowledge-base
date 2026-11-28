@@ -28,8 +28,7 @@ import dev.langchain4j.model.TokenCountEstimator;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.model.openai.OpenAiChatModel;
-import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
+import com.hai.aiknowledgebase.model.ChatModelProvider;
 import dev.langchain4j.model.output.Response;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingSearchResult;
@@ -54,8 +53,7 @@ import java.util.stream.Collectors;
 @Service
 public class ChatService {
 
-    private final OpenAiChatModel chatModel;
-    private final OpenAiStreamingChatModel streamingChatModel;
+    private final ChatModelProvider chatModelProvider;
     private final EmbeddingStore<TextSegment> embeddingStore;
     private final EmbeddingModel embeddingModel;
     private final ChatHistoryMapper chatHistoryMapper;
@@ -112,8 +110,7 @@ public class ChatService {
             - 资料部分覆盖问题 → 先回答有依据的部分，再说明"文档未提及xxx方面"
             """;
 
-    public ChatService(OpenAiChatModel chatModel,
-                       OpenAiStreamingChatModel streamingChatModel,
+    public ChatService(ChatModelProvider chatModelProvider,
                        EmbeddingStore<TextSegment> embeddingStore,
                        EmbeddingModel embeddingModel,
                        ChatHistoryMapper chatHistoryMapper,
@@ -124,8 +121,7 @@ public class ChatService {
                        @Qualifier("chatTaskExecutor") ThreadPoolTaskExecutor chatTaskExecutor,
                        KbPermissionService kbPermissionService,
                        ParamValueProvider paramValueProvider) {
-        this.chatModel = chatModel;
-        this.streamingChatModel = streamingChatModel;
+        this.chatModelProvider = chatModelProvider;
         this.embeddingStore = embeddingStore;
         this.embeddingModel = embeddingModel;
         this.chatHistoryMapper = chatHistoryMapper;
@@ -447,7 +443,7 @@ public class ChatService {
                 long startTime = System.currentTimeMillis();
                 log.info("LLM 流式调用开始");
 
-                streamingChatModel.chat(allMessages, new StreamingChatResponseHandler() {
+                chatModelProvider.streaming().chat(allMessages, new StreamingChatResponseHandler() {
                     @Override
                     public void onPartialResponse(String token) {
 //                        log.info("SSE token -> {}", token);
@@ -842,7 +838,7 @@ public class ChatService {
     private String callLLM(List<ChatMessage> messages) {
         long start = System.currentTimeMillis();
         log.info("LLM 调用 | 发送内容: {}", messages);
-        ChatResponse response = chatModel.chat(messages);
+        ChatResponse response = chatModelProvider.chat().chat(messages);
 
         log.info("[Timed] LLM 生成 | 耗时: {}ms", System.currentTimeMillis() - start);
         return response.aiMessage().text();
@@ -919,7 +915,7 @@ public class ChatService {
                     问题：%s
                     假设性回答：""", query);
 
-            return chatModel.chat(
+            return chatModelProvider.chat().chat(
                     SystemMessage.from("你是一个知识库助手。根据问题生成一段假设性回答用于检索。"),
                     UserMessage.from(prompt)
             ).aiMessage().text();

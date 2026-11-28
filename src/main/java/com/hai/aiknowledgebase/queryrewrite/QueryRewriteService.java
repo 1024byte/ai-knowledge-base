@@ -7,7 +7,7 @@ import com.hai.aiknowledgebase.service.ParamValueProvider;
 import com.hai.aiknowledgebase.service.QueryRewriteConfigLoader;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
-import dev.langchain4j.model.openai.OpenAiChatModel;
+import com.hai.aiknowledgebase.model.ChatModelProvider;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -66,8 +66,8 @@ public class QueryRewriteService{
     /** 按需改写路由分类器：根据查询特征选择改写策略 */
     private final QueryRouter queryRouter;
 
-    /** LLM 聊天模型：用于指代消解（DeepSeek via OpenAI 兼容接口） */
-    private final OpenAiChatModel chatModel;
+    /** 对话模型提供者：用于指代消解（支持运行时切换供应商） */
+    private final ChatModelProvider chatModelProvider;
 
     // ==================== 配置属性 ====================
 
@@ -255,7 +255,7 @@ public class QueryRewriteService{
                 最新用户查询：%s
                 消解后查询：""", historyText, query);
 
-        return chatModel.chat(
+        return chatModelProvider.chat().chat(
                 SystemMessage.from("你是一个指代消解助手。只返回消解后的查询文本，不要任何解释。"),
                 UserMessage.from(prompt)
         ).aiMessage().text();

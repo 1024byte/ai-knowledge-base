@@ -1,8 +1,9 @@
 package com.hai.aiknowledgebase.retrieve;
 
+import com.hai.aiknowledgebase.model.RerankResult;
+import com.hai.aiknowledgebase.model.Reranker;
 import com.hai.aiknowledgebase.service.ChineseTokenizerService;
 import com.hai.aiknowledgebase.service.ParamValueProvider;
-import com.hai.aiknowledgebase.service.RerankerService;
 import dev.langchain4j.data.segment.TextSegment;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -32,8 +33,8 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class RerankOrchestrator {
 
-    /** Cross-Encoder Rerank 服务，对检索结果精排 */
-    private final RerankerService rerankerService;
+    /** 精排提供者（本地 ONNX / 云端 DashScope 按配置分发） */
+    private final Reranker reranker;
 
     /** 参数值读取器，按作用域动态读取 content_type 权重 */
     private final ParamValueProvider paramValueProvider;
@@ -67,11 +68,11 @@ public class RerankOrchestrator {
                 .map(r -> r.getSegment().text())
                 .collect(Collectors.toList());
 
-        List<RerankerService.RerankResult> rerankResults =
-                rerankerService.rerank(query, docTexts, candidates.size(), maxDocs, timeoutMs);
+        List<RerankResult> rerankResults =
+                reranker.rerank(query, docTexts, candidates.size(), maxDocs, timeoutMs);
 
         List<RankedResult> reranked = new ArrayList<>();
-        for (RerankerService.RerankResult rr : rerankResults) {
+        for (RerankResult rr : rerankResults) {
             RankedResult original = candidates.get(rr.getIndex());
             reranked.add(new RankedResult(original.getSegment(), rr.getScore()));
         }

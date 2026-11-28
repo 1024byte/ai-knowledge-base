@@ -79,4 +79,12 @@ public final class JsonbHandlers {
             });
         }
     }
+
+    /** Map&lt;String, Object&gt;：模型配置的供应商特有参数 */
+    public static class ObjectMap extends JsonbTypeHandler<Map<String, Object>> {
+        public ObjectMap() {
+            super(new TypeReference<>() {
+            });
+        }
+    }
 }

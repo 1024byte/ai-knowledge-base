@@ -8,7 +8,7 @@ import com.hai.aiknowledgebase.dto.RewritePath;
 import com.hai.aiknowledgebase.service.ParamValueProvider;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.model.ollama.OllamaChatModel;
+import com.hai.aiknowledgebase.model.ChatModelProvider;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -55,10 +55,10 @@ public class LocalLLMRewriter {
             其他要求：
             - 不要超过 3 个子查询。
             - 保持原意，展开已知的常见缩写。
+            - 【不截断】：改写结果必须完整覆盖原句信息，禁止缩短或截断题干，禁止丢掉"以下哪些/什么/如何"等问句成分。
             """;
 
-    @Autowired(required = false)
-    private OllamaChatModel localRewriteModel;
+    private final ChatModelProvider chatModelProvider;
 
     private final EmbeddingModel embeddingModel;
     private final ThresholdsConfig thresholdsConfig;
@@ -83,18 +83,22 @@ public class LocalLLMRewriter {
     public LocalLLMRewriter(EmbeddingModel embeddingModel,
                                @Qualifier("rewriteTaskExecutor") ThreadPoolTaskExecutor rewriteTaskExecutor,
                                ThresholdsConfig thresholdsConfig,
-                               ParamValueProvider paramValueProvider) {
+                               ParamValueProvider paramValueProvider,
+                               ChatModelProvider chatModelProvider) {
         this.embeddingModel = embeddingModel;
         this.rewriteTaskExecutor = rewriteTaskExecutor;
         this.thresholdsConfig = thresholdsConfig;
         this.paramValueProvider = paramValueProvider;
+        this.chatModelProvider = chatModelProvider;
     }
 
     /**
-     * 判断本地 LLM 改写是否可用
+     * 判断是否配置了改写模型并可执行改写。
+     *
+     * <p>只校验配置与开关，不探测模型服务是否可达；调用失败会在 rewrite 中回退到原查询。</p>
      */
     public boolean isAvailable() {
-        return localRewriteModel != null
+        return chatModelProvider.isRewriteConfigured()
                 && paramValueProvider.getBoolean("queryRewrite.llm.enabled", enabled);
     }
 
@@ -132,10 +136,25 @@ public class LocalLLMRewriter {
             }
         }
 
-        // 2. 构建改写 Prompt
+        // 2. 完整问句直接使用原查询：小模型改写这类查询时容易截断题干，收益为负
+        if (isSelfContainedQuestion(query)) {
+            log.info("查询已是完整问句，跳过 LLM 改写: {}", query);
+            QueryRewriteResult direct = QueryRewriteResult.builder()
+                    .rewrittenQuery(query)
+                    .subQueries(Collections.emptyList())
+                    .expandKeywords(Collections.emptyList())
+                    .excludeKeywords(Collections.emptyList())
+                    .confidence(1.0)
+                    .path(RewritePath.NONE)
+                    .build();
+            cache.put(query, direct);
+            return direct;
+        }
+
+        // 3. 构建改写 Prompt
         String prompt = buildPrompt(query, history);
 
-        // 3. 调用本地 LLM（带超时）
+        // 4. 调用本地 LLM（带超时）
         String rewritten;
         try {
             rewritten = callWithTimeout(prompt);
@@ -144,23 +163,20 @@ public class LocalLLMRewriter {
             return fallback(query);
         }
 
-        // 4. 后处理 + 子查询提取
+        // 5. 后处理 + 子查询提取
         SubQueryParseResult parseResult = parseSubQueries(rewritten);
         rewritten = postProcess(parseResult.mainQuery, query);
 
-        // 4.5 回答式输出检测：小模型可能无视指令直接回答问题，而非改写
+        // 5.5 回答式输出检测：小模型可能无视指令直接回答问题，而非改写
         if (isAnswerInsteadOfRewrite(rewritten, query)) {
             log.warn("本地 LLM 未按要求改写(疑似直接回答)，回退到原查询: {} → {}",
                     query, rewritten.substring(0, Math.min(80, rewritten.length())));
             return fallback(query);
         }
 
-        // 5. 保真度校验
-        // 分解场景：用主查询 + 子查询拼接文本计算保真度（parseResult.subQueries 现在不含主查询）
-        String fidelityText = parseResult.subQueries.isEmpty()
-                ? rewritten
-                : rewritten + " " + String.join(" ", parseResult.subQueries);
-        double fidelity = computeFidelity(query, fidelityText);
+        // 6. 保真度校验
+        // 只校验主查询：若把子查询拼进来计算，主查询被截断时会被子查询补齐，掩盖截断问题
+        double fidelity = computeFidelity(query, rewritten);
         // 保真度阈值：参数管理热更优先，yml（ThresholdsConfig）兜底
         double fidelityThreshold = paramValueProvider.getDouble(
                 "queryRewrite.fidelityMinScore", thresholdsConfig.getQueryRewrite().getFidelity());
@@ -170,7 +186,7 @@ public class LocalLLMRewriter {
             return fallback(query);
         }
 
-        // 5.5 子查询语义多样性校验：丢弃过度拆分
+        // 6.5 子查询语义多样性校验：丢弃过度拆分
         List<String> finalSubQueries = parseResult.subQueries;
         if (!finalSubQueries.isEmpty() && !validateSubQueryDiversity(finalSubQueries)) {
             finalSubQueries = Collections.emptyList();
@@ -194,6 +210,25 @@ public class LocalLLMRewriter {
 
     // ==================== 私有方法 ====================
 
+    /**
+     * 判断查询是否已是自洽的完整问句。
+     *
+     * <p>完整问句（尤其考题题干、带"哪些/如何"的长问句）改写收益低，
+     * 小模型反而容易截断题干，因此直接使用原查询。</p>
+     */
+    private boolean isSelfContainedQuestion(String query) {
+        if (query == null || query.length() < 20) {
+            return false;
+        }
+        // 明确要求对比/辨析的查询仍交给 LLM 拆分
+        if (query.contains("对比") || query.contains("区别") || query.contains("不同") || query.contains("差异")) {
+            return false;
+        }
+        return query.contains("哪些") || query.contains("什么") || query.contains("为什么")
+                || query.contains("如何") || query.contains("怎样") || query.contains("怎么")
+                || query.contains("是否") || query.contains("多少") || query.contains("请问");
+    }
+
     private String buildPrompt(String query, List<String> history) {
         StringBuilder sb = new StringBuilder();
         if (history != null && !history.isEmpty()) {
@@ -211,7 +246,7 @@ public class LocalLLMRewriter {
         // 超时时间：参数管理热更优先，yml 兜底
         long timeoutMs = paramValueProvider.getInt("queryRewrite.llmTimeoutMs", (int) rewriteTimeoutMs);
         Future<String> future = rewriteTaskExecutor.submit(() ->
-                localRewriteModel.chat(
+                chatModelProvider.rewrite().chat(
                         dev.langchain4j.data.message.SystemMessage.from(REWRITE_SYSTEM_PROMPT),
                         dev.langchain4j.data.message.UserMessage.from(prompt)
                 ).aiMessage().text()
